@@ -24,7 +24,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libxkbcommon-dev libwayland-dev libxrandr-dev libxi-dev \
             libxcursor-dev libgl1-mesa-dev libgtk-3-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev pkg-config
+            libxcb-shape0-dev libxcb-xfixes0-dev pkg-config xvfb
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -32,7 +32,7 @@ jobs:
         with:
           workspaces: rust-workspace
       - name: Run workspace unit & integration tests
-        run: cargo test --manifest-path rust-workspace/Cargo.toml --workspace
+        run: xvfb-run cargo test --manifest-path rust-workspace/Cargo.toml --workspace
       - name: Check forja3d on wasm32
         run: cargo check --manifest-path rust-workspace/Cargo.toml -p forja3d --no-default-features --target wasm32-unknown-unknown
       - name: Check forja3d-physics on wasm32
@@ -77,7 +77,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libxkbcommon-dev libwayland-dev libxrandr-dev libxi-dev \
             libxcursor-dev libgl1-mesa-dev libgtk-3-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev pkg-config
+            libxcb-shape0-dev libxcb-xfixes0-dev pkg-config xvfb
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-gnu
