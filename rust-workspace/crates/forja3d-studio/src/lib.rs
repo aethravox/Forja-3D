@@ -103,10 +103,7 @@ pub struct StudioApp {
     cached_rust_src: String,
     cached_obj_src: String,
     pending_import: Arc<Mutex<Option<(String, Vec<u8>, Option<std::path::PathBuf>)>>>,
-    import_modal_open: bool,
-    import_modal_filter: String,
-    import_modal_files: Vec<(String, std::path::PathBuf, u64)>,
-    import_path_draft: String,
+    pending_status: Arc<Mutex<Option<String>>>,
     status_note: String,
     pub lang_table: langes::LangTable,
     gl_renderer: Arc<Mutex<Option<GlViewportRenderer>>>,
@@ -163,10 +160,7 @@ impl StudioApp {
             cached_rust_src,
             cached_obj_src,
             pending_import: Arc::new(Mutex::new(None)),
-            import_modal_open: false,
-            import_modal_filter: String::from(".glb,.gltf,.f3d"),
-            import_modal_files: Vec::new(),
-            import_path_draft: String::new(),
+            pending_status: Arc::new(Mutex::new(None)),
             status_note: String::from("Arrastra el gizmo X/Y/Z para editar"),
             lang_table: langes::LangTable::parse_text(
                 "[es]\ntitle = \"Forja3D Studio\"\nexport = \"Exportar\"\nphysics = \"Física\"\n[en]\ntitle = \"Forja3D Studio\"\nexport = \"Export\"\nphysics = \"Physics\"",
@@ -2173,6 +2167,10 @@ impl eframe::App for StudioApp {
         if let Some((name, bytes, base_dir)) = picked {
             self.import_model_bytes(Some(&name), &bytes, base_dir.as_deref());
         }
+        let pending_note = self.pending_status.lock().ok().and_then(|mut g| g.take());
+        if let Some(note) = pending_note {
+            self.status_note = note;
+        }
 
         // Handle drag & drop (.glb/.gltf/.f3d) files (Desktop + WebAssembly)
         let dropped = ui.ctx().input(|i| i.raw.dropped_files.clone());
@@ -2311,8 +2309,6 @@ impl eframe::App for StudioApp {
                     self.render_viewport_3d(ui, false);
                 });
         }
-
-        self.render_import_modal(ui.ctx());
     }
 }
 
@@ -2376,156 +2372,58 @@ impl StudioApp {
         }
         #[cfg(target_os = "android")]
         {
-            let _ = ctx;
-            self.import_modal_filter = accept.to_string();
-            self.refresh_import_modal_files();
-            self.import_modal_open = true;
-        }
-    }
+            let _ = accept;
+            let pending = Arc::clone(&self.pending_import);
+            let pending_status = Arc::clone(&self.pending_status);
+            let ctx_clone = ctx.clone();
 
-    fn refresh_import_modal_files(&mut self) {
-        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
-        #[cfg(target_os = "android")]
-        {
-            let root = android_storage_root();
-            let imports = root.join("imports");
-            let exports = root.join("exports");
-            let _ = std::fs::create_dir_all(&imports);
-            let _ = std::fs::create_dir_all(&exports);
-            dirs.push(imports);
-            dirs.push(exports);
-            dirs.push(std::path::PathBuf::from("/storage/emulated/0/Download/Forja3D"));
-            dirs.push(std::path::PathBuf::from("/storage/emulated/0/Download"));
-            dirs.push(std::path::PathBuf::from("/storage/emulated/0/Documents"));
-        }
-        let exts: Vec<&str> = self
-            .import_modal_filter
-            .split(',')
-            .map(|s| s.trim().trim_start_matches('.'))
-            .filter(|s| !s.is_empty())
-            .collect();
-        let mut found = Vec::new();
-        for dir in dirs {
-            if let Ok(entries) = std::fs::read_dir(&dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if !path.is_file() {
-                        continue;
-                    }
-                    let ext = path
-                        .extension()
-                        .and_then(|s| s.to_str())
-                        .map(|s| s.to_ascii_lowercase())
-                        .unwrap_or_default();
-                    if !exts.is_empty() && !exts.iter().any(|e| *e == ext) {
-                        continue;
-                    }
-                    let name = path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("archivo")
-                        .to_string();
-                    let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    found.push((name, path, size));
-                }
-            }
-        }
-        found.sort_by(|a, b| a.0.cmp(&b.0));
-        self.import_modal_files = found;
-    }
-
-    fn render_import_modal(&mut self, ctx: &egui::Context) {
-        if !self.import_modal_open {
-            return;
-        }
-        let mut open = self.import_modal_open;
-        let mut selected_to_load: Option<std::path::PathBuf> = None;
-        let mut do_refresh = false;
-
-        egui::Window::new("Importar modelo (Android)")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_width(340.0)
-            .show(ctx, |ui| {
-                #[cfg(target_os = "android")]
-                let imports_dir = android_storage_root().join("imports");
-                #[cfg(not(target_os = "android"))]
-                let imports_dir = std::path::PathBuf::from(".");
-
-                ui.label(
-                    egui::RichText::new("Copia tus .glb, .gltf o .f3d en:")
-                        .size(11.5)
-                        .color(egui::Color32::from_gray(180)),
-                );
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        egui::RichText::new(imports_dir.display().to_string())
-                            .monospace()
-                            .size(10.5)
-                            .color(egui::Color32::from_rgb(251, 191, 36)),
-                    );
-                    if ui.button("Copiar ruta").clicked() {
-                        ctx.copy_text(imports_dir.display().to_string());
-                        self.status_note = String::from("Ruta de importación copiada");
-                    }
-                    if ui.button("Refrescar").clicked() {
-                        do_refresh = true;
-                    }
-                });
-
-                ui.add_space(6.0);
-                ui.separator();
-                ui.label(egui::RichText::new("Archivos detectados:").strong());
-                egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-                    if self.import_modal_files.is_empty() {
-                        ui.label(
-                            egui::RichText::new("No se encontraron archivos en Descargas ni en la carpeta de la app.")
-                                .size(11.5)
-                                .color(egui::Color32::from_gray(150)),
-                        );
-                    } else {
-                        for (name, path, size) in &self.import_modal_files {
-                            let label = format!("{name} ({:.1} KB)", *size as f32 / 1024.0);
-                            if ui.add_sized([ui.available_width(), 34.0], egui::Button::new(label)).clicked() {
-                                selected_to_load = Some(path.clone());
+            let res = robius_file_picker::FileDialog::new()
+                .set_title("Importar modelo (.glb / .gltf / .f3d)")
+                .set_mime_type("*/*")
+                .pick_file(move |result| {
+                    match result {
+                        Ok(Some(picked)) => {
+                            let name = picked
+                                .file_name()
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or("modelo.glb")
+                                .to_string();
+                            match picked.read_bytes() {
+                                Ok(bytes) => {
+                                    if let Ok(mut guard) = pending.lock() {
+                                        *guard = Some((name, bytes, None));
+                                    }
+                                }
+                                Err(err) => {
+                                    if let Ok(mut guard) = pending_status.lock() {
+                                        *guard = Some(format!("No se pudo leer el archivo: {err}"));
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            if let Ok(mut guard) = pending_status.lock() {
+                                *guard = Some(String::from("Importación cancelada"));
+                            }
+                        }
+                        Err(err) => {
+                            if let Ok(mut guard) = pending_status.lock() {
+                                *guard = Some(format!(
+                                    "No se pudo abrir el gestor de archivos: {err:?}"
+                                ));
                             }
                         }
                     }
+                    ctx_clone.request_repaint();
                 });
 
-                ui.add_space(6.0);
-                ui.separator();
-                ui.label(egui::RichText::new("O abre una ruta directa:").size(11.5));
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.import_path_draft)
-                            .hint_text("/storage/emulated/0/Download/modelo.glb")
-                            .desired_width(210.0),
-                    );
-                    if ui.button("Cargar").clicked() && !self.import_path_draft.trim().is_empty() {
-                        selected_to_load = Some(std::path::PathBuf::from(self.import_path_draft.trim()));
-                    }
-                });
-            });
-
-        self.import_modal_open = open;
-        if do_refresh {
-            self.refresh_import_modal_files();
-        }
-        if let Some(path) = selected_to_load {
-            match std::fs::read(&path) {
-                Ok(bytes) => {
-                    let name = path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("modelo.glb")
-                        .to_string();
-                    self.import_model_bytes(Some(&name), &bytes, path.parent());
-                    self.import_modal_open = false;
+            match res {
+                Ok(()) => {
+                    self.status_note = String::from("Abriendo gestor de archivos...");
                 }
                 Err(err) => {
-                    self.status_note = format!("No se pudo leer '{}': {err}", path.display());
+                    self.status_note =
+                        format!("No se pudo abrir el gestor de archivos: {err:?}");
                 }
             }
         }

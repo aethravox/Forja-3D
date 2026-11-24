@@ -814,10 +814,10 @@ fn ray_box(
             let mut t1 = (min[axis] - origin[axis]) * inv;
             let mut t2 = (max[axis] - origin[axis]) * inv;
             let mut n1 = [0.0; 3];
-            n1[axis] = if inv >= 0.0 { -1.0 } else { 1.0 };
+            n1[axis] = -1.0;
             if t1 > t2 {
                 core::mem::swap(&mut t1, &mut t2);
-                n1[axis] = -n1[axis];
+                n1[axis] = 1.0;
             }
             if t1 > tmin {
                 tmin = t1;
