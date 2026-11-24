@@ -53,3 +53,9 @@ target_sdk_version = 34
 [package.metadata.android.application]
 label = "Forja3D Studio"
 theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+
+[package.metadata.android.signing.release]
+keystore = "release.keystore"
+keystore_password = "forja3d-ci"
+alias = "forja3d"
+key_password = "forja3d-ci"

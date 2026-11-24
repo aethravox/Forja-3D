@@ -189,9 +189,16 @@ jobs:
             "platforms;android-34" \
             "build-tools;34.0.0" \
             "ndk;26.1.10909125"
-      - name: Build & Sign Android APK
+      - name: Generate release keystore & Build Release APK
         run: |
-          cargo apk build --manifest-path rust-workspace/crates/forja3d-studio/Cargo.toml --lib
+          keytool -genkeypair -noprompt \
+            -keystore rust-workspace/crates/forja3d-studio/release.keystore \
+            -storepass forja3d-ci \
+            -keypass forja3d-ci \
+            -alias forja3d \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Forja3D, OU=Studio, O=Aethravox, L=Dev, S=Dev, C=US"
+          cargo apk build --manifest-path rust-workspace/crates/forja3d-studio/Cargo.toml --release --lib
           APK_PATH=$(find rust-workspace/target -name "*.apk" 2>/dev/null | head -n 1)
           if [ -z "$APK_PATH" ]; then
             APK_PATH=$(find rust-workspace -name "*.apk" 2>/dev/null | head -n 1)
