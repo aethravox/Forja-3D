@@ -141,7 +141,7 @@ jobs:
         run: cargo install cargo-apk
 
       - name: Build Android APK (Debug)
-        run: cargo apk build --manifest-path rust-workspace/crates/forja3d-studio/Cargo.toml
+        run: cargo apk build --manifest-path rust-workspace/Cargo.toml -p forja3d-studio --lib
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
