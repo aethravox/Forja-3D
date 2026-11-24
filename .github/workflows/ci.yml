@@ -45,8 +45,8 @@ jobs:
       - name: Check forja3d-studio wasm32 compilation
         run: cargo check --manifest-path rust-workspace/Cargo.toml -p forja3d-studio --lib --target wasm32-unknown-unknown
 
-  android-check:
-    name: Android (arm64-v8a) Check
+  android-build-apk:
+    name: Build Android APK (arm64-v8a)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -63,7 +63,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust-workspace
-          key: android-check-arm64
+          key: android-apk-arm64
 
       - name: Install Android SDK & NDK
         run: |
@@ -81,5 +81,14 @@ jobs:
             "build-tools;34.0.0" \
             "ndk;26.1.10909125"
 
-      - name: Check forja3d-studio Android compilation
-        run: cargo check --manifest-path rust-workspace/Cargo.toml -p forja3d-studio --lib --target aarch64-linux-android
+      - name: Install cargo-apk
+        run: cargo install cargo-apk
+
+      - name: Build Android APK
+        run: cargo apk build --manifest-path rust-workspace/crates/forja3d-studio/Cargo.toml --release
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Forja3D-Studio-Android-APK
+          path: rust-workspace/crates/forja3d-studio/target/android/apk/release/*.apk
