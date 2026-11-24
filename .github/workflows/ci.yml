@@ -191,7 +191,7 @@ jobs:
             "ndk;26.1.10909125"
       - name: Build & Sign Android APK
         run: |
-          cargo apk build --manifest-path rust-workspace/crates/forja3d-studio/Cargo.toml --release
+          cargo apk build --manifest-path rust-workspace/crates/forja3d-studio/Cargo.toml
           APK_PATH=$(find rust-workspace/crates/forja3d-studio/target -name "*.apk" | head -n 1)
           if [ -z "$APK_PATH" ]; then
             APK_PATH=$(find rust-workspace/target -name "*.apk" | head -n 1)
