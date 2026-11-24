@@ -95,7 +95,11 @@ pub struct StudioApp {
     cached_f3d_compact_bytes: Vec<u8>,
     cached_rust_src: String,
     cached_obj_src: String,
-    pending_import: Arc<Mutex<Option<(String, Vec<u8>)>>>,
+    pending_import: Arc<Mutex<Option<(String, Vec<u8>, Option<std::path::PathBuf>)>>>,
+    import_modal_open: bool,
+    import_modal_filter: String,
+    import_modal_files: Vec<(String, std::path::PathBuf, u64)>,
+    import_path_draft: String,
     status_note: String,
     gl_renderer: Arc<Mutex<Option<GlViewportRenderer>>>,
 }
@@ -146,6 +150,10 @@ impl StudioApp {
             cached_rust_src,
             cached_obj_src,
             pending_import: Arc::new(Mutex::new(None)),
+            import_modal_open: false,
+            import_modal_filter: String::from(".glb,.gltf,.f3d"),
+            import_modal_files: Vec::new(),
+            import_path_draft: String::new(),
             status_note: String::from("Arrastra el gizmo X/Y/Z para editar"),
             gl_renderer,
         }
@@ -399,14 +407,14 @@ impl StudioApp {
                 .on_hover_text("Importar archivo .glb / .gltf con el crate gltf")
                 .clicked()
             {
-                trigger_import_model(ui.ctx(), &self.pending_import, ".glb,.gltf", &mut self.status_note);
+                self.request_import(ui.ctx(), ".glb,.gltf");
             }
             if ui
                 .add_sized([92.0, btn_h], egui::Button::new("Abrir .f3d"))
-                .on_hover_text("Importar o arrastrar archivo .f3d / .glb / .gltf al lienzo")
+                .on_hover_text("Importar archivo .f3d / .glb / .gltf")
                 .clicked()
             {
-                trigger_import_model(ui.ctx(), &self.pending_import, ".f3d,.glb,.gltf", &mut self.status_note);
+                self.request_import(ui.ctx(), ".f3d,.glb,.gltf");
             }
         });
 
@@ -1205,6 +1213,13 @@ impl StudioApp {
 
     fn render_exporter(&mut self, ui: &mut egui::Ui, compact: bool) {
         ui.label(egui::RichText::new("Exportador e Importador").strong());
+        if compact && !self.status_note.is_empty() {
+            ui.label(
+                egui::RichText::new(&self.status_note)
+                    .size(11.5)
+                    .color(egui::Color32::from_rgb(251, 191, 36)),
+            );
+        }
 
         let btn_h = if compact { 34.0 } else { 24.0 };
         let tab_w = if compact { 96.0 } else { 98.0 };
@@ -1287,14 +1302,23 @@ impl StudioApp {
                 ui.horizontal_wrapped(|ui| {
                     if ui.add_sized([124.0, btn_h], egui::Button::new("Descargar .f3d")).clicked() {
                         let file = format!("{}.f3d", self.scene.model_name.to_lowercase());
-                        trigger_download(&file, &active_bytes_owned, "application/octet-stream");
-                        self.status_note = format!("Exportado {file} ({} B)", active_bytes_owned.len());
+                        match trigger_download(&file, &active_bytes_owned, "application/octet-stream") {
+                            Ok(Some(saved)) => {
+                                self.status_note = format!("Guardado: {saved}");
+                            }
+                            Ok(None) => {
+                                self.status_note = format!("Exportado {file} ({} B)", active_bytes_owned.len());
+                            }
+                            Err(err) => {
+                                self.status_note = err;
+                            }
+                        }
                     }
                     if ui.add_sized([110.0, btn_h], egui::Button::new("Importar .f3d")).clicked() {
-                        trigger_import_model(ui.ctx(), &self.pending_import, ".f3d,.glb,.gltf", &mut self.status_note);
+                        self.request_import(ui.ctx(), ".f3d,.glb,.gltf");
                     }
                     if ui.add_sized([126.0, btn_h], egui::Button::new("Importar GLB/GLTF")).clicked() {
-                        trigger_import_model(ui.ctx(), &self.pending_import, ".glb,.gltf", &mut self.status_note);
+                        self.request_import(ui.ctx(), ".glb,.gltf");
                     }
                     if ui.add_sized([148.0, btn_h], egui::Button::new("Probar from_bytes")).clicked() {
                         match Model::from_bytes(&active_bytes_owned) {
@@ -1348,8 +1372,11 @@ impl StudioApp {
                 ui.horizontal_wrapped(|ui| {
                     if ui.add_sized([124.0, btn_h], egui::Button::new("Descargar .rs")).clicked() {
                         let file = format!("{}.rs", self.scene.model_name.to_lowercase());
-                        trigger_download(&file, self.cached_rust_src.as_bytes(), "text/plain");
-                        self.status_note = format!("Exportado {file}");
+                        match trigger_download(&file, self.cached_rust_src.as_bytes(), "text/plain") {
+                            Ok(Some(saved)) => self.status_note = format!("Guardado: {saved}"),
+                            Ok(None) => self.status_note = format!("Exportado {file}"),
+                            Err(err) => self.status_note = err,
+                        }
                     }
                     if ui.add_sized([124.0, btn_h], egui::Button::new("Copiar .rs")).clicked() {
                         ui.ctx().copy_text(self.cached_rust_src.clone());
@@ -1391,8 +1418,11 @@ impl StudioApp {
                 ui.horizontal_wrapped(|ui| {
                     if ui.add_sized([124.0, btn_h], egui::Button::new("Descargar .obj")).clicked() {
                         let file = format!("{}.obj", self.scene.model_name.to_lowercase());
-                        trigger_download(&file, self.cached_obj_src.as_bytes(), "text/plain");
-                        self.status_note = format!("Exportado {file}");
+                        match trigger_download(&file, self.cached_obj_src.as_bytes(), "text/plain") {
+                            Ok(Some(saved)) => self.status_note = format!("Guardado: {saved}"),
+                            Ok(None) => self.status_note = format!("Exportado {file}"),
+                            Err(err) => self.status_note = err,
+                        }
                     }
                     if ui.add_sized([124.0, btn_h], egui::Button::new("Copiar .obj")).clicked() {
                         ui.ctx().copy_text(self.cached_obj_src.clone());
@@ -1782,8 +1812,8 @@ impl eframe::App for StudioApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Handle pending async file-picker (.glb/.gltf/.f3d) import
         let picked = self.pending_import.lock().ok().and_then(|mut g| g.take());
-        if let Some((name, bytes)) = picked {
-            self.import_model_bytes(Some(&name), &bytes, None);
+        if let Some((name, bytes, base_dir)) = picked {
+            self.import_model_bytes(Some(&name), &bytes, base_dir.as_deref());
         }
 
         // Handle drag & drop (.glb/.gltf/.f3d) files (Desktop + WebAssembly)
@@ -1802,7 +1832,7 @@ impl eframe::App for StudioApp {
                 wasm_bindgen_futures::spawn_local(async move {
                     if let Ok(bytes) = file.bytes_async().await {
                         if let Ok(mut guard) = pending.lock() {
-                            *guard = Some((name, bytes));
+                            *guard = Some((name, bytes, None));
                         }
                         ctx.request_repaint();
                     }
@@ -1923,6 +1953,8 @@ impl eframe::App for StudioApp {
                     self.render_viewport_3d(ui, false);
                 });
         }
+
+        self.render_import_modal(ui.ctx());
     }
 }
 
@@ -1937,11 +1969,220 @@ fn dist_point_to_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
     p.distance(proj)
 }
 
+#[cfg(target_os = "android")]
+static ANDROID_BASE_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "android")]
+fn android_storage_root() -> std::path::PathBuf {
+    ANDROID_BASE_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| std::path::PathBuf::from("/storage/emulated/0/Download/Forja3D"))
+}
+
+impl StudioApp {
+    fn request_import(&mut self, ctx: &egui::Context, accept: &str) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            trigger_import_model(ctx, &self.pending_import, accept, &mut self.status_note);
+        }
+        #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+        {
+            let _ = ctx;
+            let exts: Vec<&str> = accept
+                .split(',')
+                .map(|s| s.trim().trim_start_matches('.'))
+                .filter(|s| !s.is_empty())
+                .collect();
+            let picked = rfd::FileDialog::new()
+                .set_title("Importar modelo (.glb / .gltf / .f3d)")
+                .add_filter("Modelos 3D", &exts)
+                .pick_file();
+            if let Some(path) = picked {
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        let name = path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("modelo.glb")
+                            .to_string();
+                        self.import_model_bytes(Some(&name), &bytes, path.parent());
+                    }
+                    Err(err) => {
+                        self.status_note = format!("No se pudo leer el archivo: {err}");
+                    }
+                }
+            } else {
+                self.status_note = String::from("Importación cancelada");
+            }
+        }
+        #[cfg(target_os = "android")]
+        {
+            let _ = ctx;
+            self.import_modal_filter = accept.to_string();
+            self.refresh_import_modal_files();
+            self.import_modal_open = true;
+        }
+    }
+
+    fn refresh_import_modal_files(&mut self) {
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+        #[cfg(target_os = "android")]
+        {
+            let root = android_storage_root();
+            let imports = root.join("imports");
+            let exports = root.join("exports");
+            let _ = std::fs::create_dir_all(&imports);
+            let _ = std::fs::create_dir_all(&exports);
+            dirs.push(imports);
+            dirs.push(exports);
+            dirs.push(std::path::PathBuf::from("/storage/emulated/0/Download/Forja3D"));
+            dirs.push(std::path::PathBuf::from("/storage/emulated/0/Download"));
+            dirs.push(std::path::PathBuf::from("/storage/emulated/0/Documents"));
+        }
+        let exts: Vec<&str> = self
+            .import_modal_filter
+            .split(',')
+            .map(|s| s.trim().trim_start_matches('.'))
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut found = Vec::new();
+        for dir in dirs {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let ext = path
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    if !exts.is_empty() && !exts.iter().any(|e| *e == ext) {
+                        continue;
+                    }
+                    let name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("archivo")
+                        .to_string();
+                    let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    found.push((name, path, size));
+                }
+            }
+        }
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        self.import_modal_files = found;
+    }
+
+    fn render_import_modal(&mut self, ctx: &egui::Context) {
+        if !self.import_modal_open {
+            return;
+        }
+        let mut open = self.import_modal_open;
+        let mut selected_to_load: Option<std::path::PathBuf> = None;
+        let mut do_refresh = false;
+
+        egui::Window::new("Importar modelo (Android)")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(340.0)
+            .show(ctx, |ui| {
+                #[cfg(target_os = "android")]
+                let imports_dir = android_storage_root().join("imports");
+                #[cfg(not(target_os = "android"))]
+                let imports_dir = std::path::PathBuf::from(".");
+
+                ui.label(
+                    egui::RichText::new("Copia tus .glb, .gltf o .f3d en:")
+                        .size(11.5)
+                        .color(egui::Color32::from_gray(180)),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(imports_dir.display().to_string())
+                            .monospace()
+                            .size(10.5)
+                            .color(egui::Color32::from_rgb(251, 191, 36)),
+                    );
+                    if ui.button("Copiar ruta").clicked() {
+                        ctx.copy_text(imports_dir.display().to_string());
+                        self.status_note = String::from("Ruta de importación copiada");
+                    }
+                    if ui.button("Refrescar").clicked() {
+                        do_refresh = true;
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.label(egui::RichText::new("Archivos detectados:").strong());
+                egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                    if self.import_modal_files.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No se encontraron archivos en Descargas ni en la carpeta de la app.")
+                                .size(11.5)
+                                .color(egui::Color32::from_gray(150)),
+                        );
+                    } else {
+                        for (name, path, size) in &self.import_modal_files {
+                            let label = format!("{name} ({:.1} KB)", *size as f32 / 1024.0);
+                            if ui.add_sized([ui.available_width(), 34.0], egui::Button::new(label)).clicked() {
+                                selected_to_load = Some(path.clone());
+                            }
+                        }
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.label(egui::RichText::new("O abre una ruta directa:").size(11.5));
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.import_path_draft)
+                            .hint_text("/storage/emulated/0/Download/modelo.glb")
+                            .desired_width(210.0),
+                    );
+                    if ui.button("Cargar").clicked() && !self.import_path_draft.trim().is_empty() {
+                        selected_to_load = Some(std::path::PathBuf::from(self.import_path_draft.trim()));
+                    }
+                });
+            });
+
+        self.import_modal_open = open;
+        if do_refresh {
+            self.refresh_import_modal_files();
+        }
+        if let Some(path) = selected_to_load {
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("modelo.glb")
+                        .to_string();
+                    self.import_model_bytes(Some(&name), &bytes, path.parent());
+                    self.import_modal_open = false;
+                }
+                Err(err) => {
+                    self.status_note = format!("No se pudo leer '{}': {err}", path.display());
+                }
+            }
+        }
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
-fn trigger_download(filename: &str, data: &[u8], mime: &str) {
+fn trigger_download(filename: &str, data: &[u8], mime: &str) -> Result<Option<String>, String> {
     use eframe::wasm_bindgen::JsCast;
-    let Some(window) = eframe::web_sys::window() else { return };
-    let Some(document) = window.document() else { return };
+    let Some(window) = eframe::web_sys::window() else {
+        return Err(String::from("Sin ventana de navegador"));
+    };
+    let Some(document) = window.document() else {
+        return Err(String::from("Sin documento DOM"));
+    };
 
     let uint8 = js_sys::Uint8Array::from(data);
     let array = js_sys::Array::new();
@@ -1949,12 +2190,10 @@ fn trigger_download(filename: &str, data: &[u8], mime: &str) {
 
     let opts = eframe::web_sys::BlobPropertyBag::new();
     opts.set_type(mime);
-    let Ok(blob) = eframe::web_sys::Blob::new_with_u8_array_sequence_and_options(&array, &opts) else {
-        return;
-    };
-    let Ok(url) = eframe::web_sys::Url::create_object_url_with_blob(&blob) else {
-        return;
-    };
+    let blob = eframe::web_sys::Blob::new_with_u8_array_sequence_and_options(&array, &opts)
+        .map_err(|_| String::from("Error creando Blob de descarga"))?;
+    let url = eframe::web_sys::Url::create_object_url_with_blob(&blob)
+        .map_err(|_| String::from("Error creando URL temporal"))?;
     if let Ok(el) = document.create_element("a") {
         if let Ok(anchor) = el.dyn_into::<eframe::web_sys::HtmlAnchorElement>() {
             anchor.set_href(&url);
@@ -1963,17 +2202,50 @@ fn trigger_download(filename: &str, data: &[u8], mime: &str) {
         }
     }
     let _ = eframe::web_sys::Url::revoke_object_url(&url);
+    Ok(None)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn trigger_download(filename: &str, data: &[u8], _mime: &str) {
-    let _ = std::fs::write(filename, data);
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+fn trigger_download(filename: &str, data: &[u8], _mime: &str) -> Result<Option<String>, String> {
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("bin");
+    if let Some(path) = rfd::FileDialog::new()
+        .set_title("Guardar exportación de Forja3D")
+        .set_file_name(filename)
+        .add_filter("Archivo exportado", &[ext])
+        .save_file()
+    {
+        std::fs::write(&path, data).map_err(|e| format!("Error al guardar: {e}"))?;
+        Ok(Some(path.display().to_string()))
+    } else {
+        Err(String::from("Guardado cancelado"))
+    }
+}
+
+#[cfg(target_os = "android")]
+fn trigger_download(filename: &str, data: &[u8], _mime: &str) -> Result<Option<String>, String> {
+    let download_dir = std::path::PathBuf::from("/storage/emulated/0/Download/Forja3D");
+    if std::fs::create_dir_all(&download_dir).is_ok() {
+        let target = download_dir.join(filename);
+        if std::fs::write(&target, data).is_ok() {
+            return Ok(Some(target.display().to_string()));
+        }
+    }
+    let exports_dir = android_storage_root().join("exports");
+    std::fs::create_dir_all(&exports_dir)
+        .map_err(|e| format!("No se pudo crear carpeta de exportación: {e}"))?;
+    let target = exports_dir.join(filename);
+    std::fs::write(&target, data)
+        .map_err(|e| format!("Error escribiendo {}: {e}", target.display()))?;
+    Ok(Some(target.display().to_string()))
 }
 
 #[cfg(target_arch = "wasm32")]
 fn trigger_import_model(
     ctx: &egui::Context,
-    pending: &Arc<Mutex<Option<(String, Vec<u8>)>>>,
+    pending: &Arc<Mutex<Option<(String, Vec<u8>, Option<std::path::PathBuf>)>>>,
     accept: &str,
     status_note: &mut String,
 ) {
@@ -1999,7 +2271,7 @@ fn trigger_import_model(
             if let Ok(buf) = wasm_bindgen_futures::JsFuture::from(promise).await {
                 let bytes = js_sys::Uint8Array::new(&buf).to_vec();
                 if let Ok(mut guard) = pending_async.lock() {
-                    *guard = Some((name, bytes));
+                    *guard = Some((name, bytes, None));
                 }
                 ctx_async.request_repaint();
             }
@@ -2010,16 +2282,6 @@ fn trigger_import_model(
     onchange.forget();
     input.click();
     *status_note = format!("Selecciona un archivo ({accept})...");
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn trigger_import_model(
-    _ctx: &egui::Context,
-    _pending: &Arc<Mutex<Option<(String, Vec<u8>)>>>,
-    accept: &str,
-    status_note: &mut String,
-) {
-    *status_note = format!("Arrastra y suelta un archivo ({accept}) en la ventana");
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2054,6 +2316,11 @@ mod wasm_entry {
 #[cfg(target_os = "android")]
 #[no_mangle]
 pub extern "C" fn android_main(app: winit::platform::android::activity::AndroidApp) {
+    if let Some(root) = app.external_data_path().or_else(|| app.internal_data_path()) {
+        let _ = std::fs::create_dir_all(root.join("imports"));
+        let _ = std::fs::create_dir_all(root.join("exports"));
+        let _ = ANDROID_BASE_DIR.set(root);
+    }
     let options = eframe::NativeOptions {
         android_app: Some(app),
         depth_buffer: 24,
