@@ -191,15 +191,16 @@ jobs:
             "ndk;26.1.10909125"
       - name: Build & Sign Android APK
         run: |
-          cargo apk build --manifest-path rust-workspace/crates/forja3d-studio/Cargo.toml
-          APK_PATH=$(find rust-workspace/crates/forja3d-studio/target -name "*.apk" | head -n 1)
+          cargo apk build --manifest-path rust-workspace/crates/forja3d-studio/Cargo.toml --lib
+          APK_PATH=$(find rust-workspace/target -name "*.apk" 2>/dev/null | head -n 1)
           if [ -z "$APK_PATH" ]; then
-            APK_PATH=$(find rust-workspace/target -name "*.apk" | head -n 1)
+            APK_PATH=$(find rust-workspace -name "*.apk" 2>/dev/null | head -n 1)
           fi
           echo "Found APK at: $APK_PATH"
           test -n "$APK_PATH"
           cp "$APK_PATH" forja3d-studio-android-arm64.apk
           APKSIGNER="${ANDROID_SDK_ROOT}/build-tools/34.0.0/apksigner"
+          rm -f release.keystore
           keytool -genkeypair -noprompt \
             -keystore release.keystore \
             -storepass forja3d-ci \

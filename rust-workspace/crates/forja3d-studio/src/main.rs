@@ -1,7 +1,5 @@
-#![cfg(not(target_os = "android"))]
-
 fn main() -> eframe::Result<()> {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     {
         let native_options = eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()
@@ -16,8 +14,7 @@ fn main() -> eframe::Result<()> {
             Box::new(|cc| Ok(Box::new(forja3d_studio::StudioApp::new(cc)))),
         )
     }
-
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", target_os = "android"))]
     {
         Ok(())
     }
