@@ -11,8 +11,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  rust-tests:
-    name: Rust Tests, no_std & WASM Check
+  rust-tests-and-wasm:
+    name: Rust Tests & WebAssembly Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,16 +36,16 @@ jobs:
       - name: Run workspace unit & integration tests
         run: cargo test --manifest-path rust-workspace/Cargo.toml --workspace
 
-      - name: Check forja3d #![no_std] compatibility on wasm32
+      - name: Check forja3d #![no_std] on wasm32
         run: cargo check --manifest-path rust-workspace/Cargo.toml -p forja3d --no-default-features --target wasm32-unknown-unknown
 
-      - name: Check forja3d-physics #![no_std] compatibility on wasm32
+      - name: Check forja3d-physics #![no_std] on wasm32
         run: cargo check --manifest-path rust-workspace/Cargo.toml -p forja3d-physics --no-default-features --target wasm32-unknown-unknown
 
       - name: Check forja3d-studio wasm32 compilation
         run: cargo check --manifest-path rust-workspace/Cargo.toml -p forja3d-studio --lib --target wasm32-unknown-unknown
 
-  desktop-linux-build:
+  build-linux:
     name: Build Linux Desktop (x86_64)
     runs-on: ubuntu-latest
     steps:
@@ -64,12 +64,44 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust-workspace
-          key: desktop-linux-build
+          key: linux-desktop
 
-      - name: Build forja3d-studio desktop binary
+      - name: Build release binary
         run: cargo build --manifest-path rust-workspace/crates/forja3d-studio/Cargo.toml --release
 
-  android-build-apk:
+  build-macos:
+    name: Build macOS Desktop (Universal/Apple Silicon/Intel)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-workspace
+          key: macos-desktop
+
+      - name: Build release binary
+        run: cargo build --manifest-path rust-workspace/crates/forja3d-studio/Cargo.toml --release
+
+  build-windows:
+    name: Build Windows Desktop (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-workspace
+          key: windows-desktop
+
+      - name: Build release binary
+        run: cargo build --manifest-path rust-workspace/crates/forja3d-studio/Cargo.toml --release
+
+  build-android:
     name: Build Android APK (arm64-v8a)
     runs-on: ubuntu-latest
     steps:
@@ -87,7 +119,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust-workspace
-          key: android-apk-arm64
+          key: android-apk
 
       - name: Install Android SDK & NDK
         run: |
