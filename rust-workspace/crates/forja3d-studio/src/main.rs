@@ -1,3 +1,5 @@
+#![cfg(not(target_os = "android"))]
+
 fn main() -> eframe::Result<()> {
     #[cfg(not(target_arch = "wasm32"))]
     {
