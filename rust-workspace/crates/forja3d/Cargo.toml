@@ -1,0 +1,15 @@
+[package]
+name = "forja3d"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Zero-dependency 3D model binary format (.f3d), loader, procedural mesh builder, and .rs source code generator."
+keywords = ["3d", "mesh", "gamedev", "no-std", "codegen"]
+categories = ["game-development", "graphics", "encoding", "no-std"]
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = []
