@@ -52,7 +52,11 @@ pub fn import_gltf_or_glb(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| String::from("ModeloGLTF"));
 
-    Ok(SceneDocument { model_name, parts })
+    Ok(SceneDocument {
+        model_name,
+        parts,
+        ..SceneDocument::default()
+    })
 }
 
 fn collect_node(

@@ -16,6 +16,8 @@ rust-workspace/target/
 /tsconfig.json
 /vite.config.ts
 /src/
+/tailwind.config.js
+/postcss.config.js
 
 
 

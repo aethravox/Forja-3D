@@ -3,9 +3,11 @@ mod renderer;
 
 use eframe::egui;
 use forja3d::{
-    default_extrude_profile, default_lathe_profile, format::fnv1a_32, Model, PartSpec,
-    PrimitiveKind, RustExportTarget, SceneDocument, ShadingMode,
+    default_extrude_profile, default_lathe_profile, format::fnv1a_32, ColliderShape, Model,
+    PartSpec, PrimitiveKind, RigidBodyKind, RustExportTarget, SceneDocument, ShadingMode,
+    FLAG_COMPACT, FLAG_PHYSICS,
 };
+use forja3d_physics::{BodyHandle, PhysicsWorld};
 use renderer::{ray_intersects_aabb, GlViewportRenderer, OrbitCamera};
 use std::sync::{Arc, Mutex};
 
@@ -78,7 +80,12 @@ pub struct StudioApp {
     camera: OrbitCamera,
     wireframe: bool,
     show_grid: bool,
+    show_colliders: bool,
     snap_enabled: bool,
+    sim_world: Option<PhysicsWorld>,
+    sim_body: Option<BodyHandle>,
+    sim_offset: [f32; 3],
+    sim_last_time: Option<f64>,
     gizmo_mode: GizmoMode,
     active_gizmo_drag: Option<ActiveGizmoDrag>,
     undo_stack: Vec<HistoryEntry>,
@@ -101,6 +108,7 @@ pub struct StudioApp {
     import_modal_files: Vec<(String, std::path::PathBuf, u64)>,
     import_path_draft: String,
     status_note: String,
+    pub lang_table: langes::LangTable,
     gl_renderer: Arc<Mutex<Option<GlViewportRenderer>>>,
 }
 
@@ -132,7 +140,12 @@ impl StudioApp {
             camera: OrbitCamera::default(),
             wireframe: false,
             show_grid: true,
+            show_colliders: true,
             snap_enabled: false,
+            sim_world: None,
+            sim_body: None,
+            sim_offset: [0.0; 3],
+            sim_last_time: None,
             gizmo_mode: GizmoMode::Translate,
             active_gizmo_drag: None,
             undo_stack: Vec::new(),
@@ -155,6 +168,10 @@ impl StudioApp {
             import_modal_files: Vec::new(),
             import_path_draft: String::new(),
             status_note: String::from("Arrastra el gizmo X/Y/Z para editar"),
+            lang_table: langes::LangTable::parse_text(
+                "[es]\ntitle = \"Forja3D Studio\"\nexport = \"Exportar\"\nphysics = \"Física\"\n[en]\ntitle = \"Forja3D Studio\"\nexport = \"Export\"\nphysics = \"Physics\"",
+                "es",
+            ),
             gl_renderer,
         }
     }
@@ -211,7 +228,55 @@ impl StudioApp {
         }
     }
 
+    fn stop_physics_sim(&mut self) {
+        self.sim_world = None;
+        self.sim_body = None;
+        self.sim_offset = [0.0; 3];
+        self.sim_last_time = None;
+    }
+
+    fn start_physics_sim(&mut self, drop_y: f32) {
+        let mut world = PhysicsWorld::new();
+        let is_dynamic = self
+            .baked_model
+            .physics
+            .as_ref()
+            .map_or(true, |p| p.body_kind == RigidBodyKind::Dynamic);
+        let start_y = if is_dynamic { drop_y } else { 0.0 };
+        let handle = world.spawn_from_model(&self.baked_model, [0.0, start_y, 0.0]);
+        self.sim_world = Some(world);
+        self.sim_body = Some(handle);
+        self.sim_offset = [0.0, start_y, 0.0];
+        self.sim_last_time = None;
+        self.status_note = if is_dynamic {
+            String::from("Simulación física activa (forja3d-physics)")
+        } else {
+            String::from("Cuerpo no dinámico (cambia Tipo a Dinámico para caer)")
+        };
+    }
+
+    fn step_physics_sim(&mut self, ctx: &egui::Context) {
+        let Some(world) = self.sim_world.as_mut() else {
+            return;
+        };
+        let now = ctx.input(|i| i.time);
+        let dt = match self.sim_last_time {
+            Some(prev) => (now - prev) as f32,
+            None => 1.0 / 60.0,
+        };
+        self.sim_last_time = Some(now);
+        let dt = dt.clamp(0.001, 0.05);
+        world.step(dt);
+        if let Some(handle) = self.sim_body {
+            if let Some(body) = world.body(handle) {
+                self.sim_offset = body.position;
+            }
+        }
+        ctx.request_repaint();
+    }
+
     fn rebuild_outputs(&mut self) {
+        self.stop_physics_sim();
         let (baked, part_map) = self.scene.bake_with_part_map();
         self.baked_model = baked;
         self.part_map = part_map;
@@ -237,8 +302,13 @@ impl StudioApp {
             match Model::from_bytes(bytes) {
                 Ok(decoded) => {
                     self.push_undo();
-                    let was_compact = bytes.len() >= 8
-                        && (u16::from_le_bytes([bytes[6], bytes[7]]) & forja3d::FLAG_COMPACT) != 0;
+                    let flags = if bytes.len() >= 8 {
+                        u16::from_le_bytes([bytes[6], bytes[7]])
+                    } else {
+                        0
+                    };
+                    let was_compact = (flags & FLAG_COMPACT) != 0;
+                    let has_physics = (flags & FLAG_PHYSICS) != 0;
                     self.scene = SceneDocument::from_model(decoded);
                     self.selection = if self.scene.parts.is_empty() {
                         None
@@ -249,8 +319,9 @@ impl StudioApp {
                     self.camera.frame_bounds(self.baked_model.bounds());
                     let src = filename.unwrap_or(&self.scene.model_name);
                     let tag = if was_compact { "compacto" } else { "estándar" };
+                    let phys_tag = if has_physics { " + físicas" } else { "" };
                     self.status_note = format!(
-                        "Importado '{src}' ({tag}, {} piezas, {} tri)",
+                        "Importado '{src}' ({tag}{phys_tag}, {} piezas, {} tri)",
                         self.scene.parts.len(),
                         self.baked_model.triangle_count()
                     );
@@ -397,10 +468,7 @@ impl StudioApp {
                 self.load_preset(SceneDocument::preset_obelisk());
             }
             if ui.add_sized([70.0, btn_h], egui::Button::new("Vacío")).clicked() {
-                self.load_preset(SceneDocument {
-                    model_name: String::from("MiModelo"),
-                    parts: Vec::new(),
-                });
+                self.load_preset(SceneDocument::new("MiModelo"));
             }
             if ui
                 .add_sized([124.0, btn_h], egui::Button::new("Importar GLB/GLTF"))
@@ -646,6 +714,8 @@ impl StudioApp {
                 let mut discrete_dedup_toggle: Option<bool> = None;
                 let mut discrete_profile_replace: Option<(Vec<[f32; 2]>, Option<usize>, &'static str)> = None;
                 let mut new_group_assign: Option<Option<String>> = None;
+                let mut discrete_collider_change: Option<ColliderShape> = None;
+                let mut discrete_autofit_toggle: Option<bool> = None;
                 let mut selected_pt = self.selected_profile_pt;
                 let mut dragging_pt = self.dragging_profile_pt;
 
@@ -1148,6 +1218,85 @@ impl StudioApp {
                                 }
                             });
                     });
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Colisionador de pieza").strong());
+                    ui.horizontal_wrapped(|ui| {
+                        let is_none = matches!(part.collider, ColliderShape::None);
+                        let is_box = matches!(part.collider, ColliderShape::Box { .. });
+                        let is_sphere = matches!(part.collider, ColliderShape::Sphere { .. });
+                        let is_capsule = matches!(part.collider, ColliderShape::Capsule { .. });
+                        if ui.add_sized([68.0, btn_h], egui::Button::selectable(is_none, "Ninguno")).clicked() && !is_none {
+                            discrete_collider_change = Some(ColliderShape::None);
+                        }
+                        if ui.add_sized([54.0, btn_h], egui::Button::selectable(is_box, "Caja")).clicked() && !is_box {
+                            discrete_collider_change = Some(ColliderShape::Box { half_extents: [0.5; 3] });
+                        }
+                        if ui.add_sized([60.0, btn_h], egui::Button::selectable(is_sphere, "Esfera")).clicked() && !is_sphere {
+                            discrete_collider_change = Some(ColliderShape::Sphere { radius: 0.5 });
+                        }
+                        if ui.add_sized([68.0, btn_h], egui::Button::selectable(is_capsule, "Cápsula")).clicked() && !is_capsule {
+                            discrete_collider_change = Some(ColliderShape::Capsule { radius: 0.35, half_height: 0.4 });
+                        }
+                    });
+
+                    if !matches!(part.collider, ColliderShape::None) {
+                        let mut auto_fit = part.collider_auto_fit;
+                        if ui.checkbox(&mut auto_fit, "Auto-ajustar a geometría").changed() {
+                            discrete_autofit_toggle = Some(auto_fit);
+                        }
+                        if !part.collider_auto_fit {
+                            ui.horizontal(|ui| {
+                                ui.label("Offset:");
+                                for axis in 0..3 {
+                                    if ui
+                                        .add(egui::DragValue::new(&mut part.collider_offset[axis]).speed(0.02).fixed_decimals(2))
+                                        .changed()
+                                    {
+                                        changed_continuous = true;
+                                        *dirty = true;
+                                    }
+                                }
+                            });
+                            match &mut part.collider {
+                                ColliderShape::Box { half_extents } => {
+                                    ui.horizontal(|ui| {
+                                        ui.label("Mitades:");
+                                        for axis in 0..3 {
+                                            if ui
+                                                .add(
+                                                    egui::DragValue::new(&mut half_extents[axis])
+                                                        .speed(0.02)
+                                                        .range(0.02..=25.0)
+                                                        .fixed_decimals(2),
+                                                )
+                                                .changed()
+                                            {
+                                                changed_continuous = true;
+                                                *dirty = true;
+                                            }
+                                        }
+                                    });
+                                }
+                                ColliderShape::Sphere { radius } => {
+                                    if ui.add(egui::Slider::new(radius, 0.02..=25.0).text("Radio")).changed() {
+                                        changed_continuous = true;
+                                        *dirty = true;
+                                    }
+                                }
+                                ColliderShape::Capsule { radius, half_height } => {
+                                    if ui.add(egui::Slider::new(radius, 0.02..=25.0).text("Radio")).changed() {
+                                        changed_continuous = true;
+                                        *dirty = true;
+                                    }
+                                    if ui.add(egui::Slider::new(half_height, 0.01..=25.0).text("Semi-alto")).changed() {
+                                        changed_continuous = true;
+                                        *dirty = true;
+                                    }
+                                }
+                                ColliderShape::None => {}
+                            }
+                        }
+                    }
                 }
 
                 self.selected_profile_pt = selected_pt;
@@ -1192,6 +1341,30 @@ impl StudioApp {
                     self.scene.parts[sel_idx].group = assign;
                     *dirty = true;
                 }
+                if let Some(shape) = discrete_collider_change {
+                    self.push_undo();
+                    if !matches!(shape, ColliderShape::None) {
+                        self.scene.physics_enabled = true;
+                        self.scene.parts[sel_idx].collider_auto_fit = true;
+                        self.scene.parts[sel_idx].collider_offset = [0.0; 3];
+                    }
+                    self.scene.parts[sel_idx].collider = shape;
+                    self.status_note = format!("Colisionador: {}", shape.label());
+                    *dirty = true;
+                }
+                if let Some(auto_fit) = discrete_autofit_toggle {
+                    self.push_undo();
+                    if !auto_fit {
+                        // Seed manual collider dimensions from current baked mesh bounds
+                        let baked = self.scene.parts[sel_idx].bake();
+                        if let Some(fitted) = self.scene.parts[sel_idx].fitted_collider_for_mesh(&baked) {
+                            self.scene.parts[sel_idx].collider = fitted.shape;
+                            self.scene.parts[sel_idx].collider_offset = [0.0; 3];
+                        }
+                    }
+                    self.scene.parts[sel_idx].collider_auto_fit = auto_fit;
+                    *dirty = true;
+                }
 
                 ui.horizontal(|ui| {
                     ui.add_sized([120.0, btn_h], egui::TextEdit::singleline(&mut self.new_group_draft));
@@ -1208,6 +1381,104 @@ impl StudioApp {
             None => {
                 ui.label("Toca una pieza en el 3D o añádela en Piezas.");
             }
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        self.render_model_physics_section(ui, dirty, compact);
+    }
+
+    fn render_model_physics_section(&mut self, ui: &mut egui::Ui, dirty: &mut bool, compact: bool) {
+        let btn_h = if compact { 32.0 } else { 22.0 };
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Físicas del modelo (.f3d)").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_sized([116.0, btn_h], egui::Button::new("Auto-colisión"))
+                    .on_hover_text("Activa físicas .f3d y genera colisionadores para todas las piezas")
+                    .clicked()
+                {
+                    self.push_undo();
+                    self.scene.auto_generate_colliders();
+                    self.show_colliders = true;
+                    self.status_note = String::from("Físicas y colisionadores generados en .f3d");
+                    *dirty = true;
+                }
+            });
+        });
+
+        let mut phys_on = self.scene.physics_enabled;
+        if ui
+            .checkbox(&mut phys_on, "Embeber físicas en binario .f3d (FLAG_PHYSICS)")
+            .changed()
+        {
+            self.push_undo();
+            self.scene.physics_enabled = phys_on;
+            if phys_on
+                && self
+                    .scene
+                    .parts
+                    .iter()
+                    .all(|p| matches!(p.collider, ColliderShape::None))
+            {
+                self.scene.auto_generate_colliders();
+            }
+            *dirty = true;
+        }
+
+        if self.scene.physics_enabled {
+            let mut body_kind_change = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Tipo:");
+                for kind in RigidBodyKind::ALL {
+                    if ui
+                        .add_sized([74.0, btn_h], egui::Button::selectable(self.scene.physics.body_kind == kind, kind.label()))
+                        .clicked()
+                        && self.scene.physics.body_kind != kind
+                    {
+                        body_kind_change = Some(kind);
+                    }
+                }
+            });
+            if let Some(kind) = body_kind_change {
+                self.push_undo();
+                self.scene.physics.body_kind = kind;
+                *dirty = true;
+            }
+
+            let mut changed_continuous = false;
+            if ui
+                .add(egui::Slider::new(&mut self.scene.physics.mass, 0.1..=100.0).text("Masa (kg)"))
+                .changed()
+            {
+                changed_continuous = true;
+                *dirty = true;
+            }
+            if ui
+                .add(egui::Slider::new(&mut self.scene.physics.friction, 0.0..=1.5).text("Fricción"))
+                .changed()
+            {
+                changed_continuous = true;
+                *dirty = true;
+            }
+            if ui
+                .add(egui::Slider::new(&mut self.scene.physics.restitution, 0.0..=1.0).text("Rebote"))
+                .changed()
+            {
+                changed_continuous = true;
+                *dirty = true;
+            }
+            if ui
+                .add(egui::Slider::new(&mut self.scene.physics.gravity_scale, -2.0..=3.0).text("Escala gravedad"))
+                .changed()
+            {
+                changed_continuous = true;
+                *dirty = true;
+            }
+            if changed_continuous {
+                self.begin_continuous_edit(ui);
+            }
+            self.flush_continuous_edit(ui);
         }
     }
 
@@ -1295,6 +1566,24 @@ impl StudioApp {
                     ))
                     .monospace()
                     .size(11.5),
+                );
+                let phys_summary = match &self.baked_model.physics {
+                    Some(p) => format!(
+                        "Física .f3d: Activa ({} · {} colisionadores · {:.1} kg)",
+                        p.body_kind.label(),
+                        p.colliders.len(),
+                        p.mass
+                    ),
+                    None => String::from("Física .f3d: Desactivada (solo malla)"),
+                };
+                ui.label(
+                    egui::RichText::new(phys_summary)
+                        .size(11.5)
+                        .color(if self.baked_model.physics.is_some() {
+                            egui::Color32::from_rgb(52, 211, 153)
+                        } else {
+                            egui::Color32::from_gray(145)
+                        }),
                 );
 
                 ui.add_space(6.0);
@@ -1622,8 +1911,8 @@ impl StudioApp {
             }
         }
 
-        // Click / Tap to select 3D part via Ray-AABB (skip if clicking gizmo handle)
-        if response.clicked() && hovered_axis.is_none() {
+        // Click / Tap to select 3D part via Ray-AABB (skip if clicking gizmo handle or simulating)
+        if self.sim_world.is_none() && response.clicked() && hovered_axis.is_none() {
             if let Some(pos) = response.interact_pointer_pos() {
                 let norm_x = ((pos.x - rect.left()) / rect.width()) * 2.0 - 1.0;
                 let norm_y = 1.0 - ((pos.y - rect.top()) / rect.height()) * 2.0;
@@ -1650,7 +1939,9 @@ impl StudioApp {
         let camera = self.camera;
         let selected_mask = self.selected_mesh_mask();
         let show_grid = self.show_grid;
+        let show_colliders = self.show_colliders || self.sim_world.is_some();
         let wireframe = self.wireframe;
+        let model_offset = self.sim_offset;
         let aspect = rect.width() / rect.height().max(1.0);
 
         let callback = egui::PaintCallback {
@@ -1661,7 +1952,16 @@ impl StudioApp {
                     if let Some(renderer) = guard.as_mut() {
                         unsafe {
                             renderer.sync_model(gl, &model_clone, generation);
-                            renderer.paint(gl, aspect, &camera, &selected_mask, show_grid, wireframe);
+                            renderer.sync_collider_debug(gl, &model_clone, generation, show_colliders);
+                            renderer.paint(
+                                gl,
+                                aspect,
+                                &camera,
+                                &selected_mask,
+                                show_grid,
+                                wireframe,
+                                model_offset,
+                            );
                         }
                     }
                 }
@@ -1669,8 +1969,9 @@ impl StudioApp {
         };
         ui.painter().add(callback);
 
-        // Crisp 3D Gizmo Overlay drawn from projected 3D coordinates
-        if let Some((origin, _, handles)) = self.gizmo_handles(rect) {
+        // Crisp 3D Gizmo Overlay drawn from projected 3D coordinates (hidden during live physics playback)
+        if self.sim_world.is_none() {
+            if let Some((origin, _, handles)) = self.gizmo_handles(rect) {
             let painter = ui.painter_at(rect);
             let axis_names = ["X", "Y", "Z"];
             for (i, &(axis, tip, base_col)) in handles.iter().enumerate() {
@@ -1709,6 +2010,7 @@ impl StudioApp {
                 );
             }
             painter.circle_filled(origin, 4.5, egui::Color32::WHITE);
+            }
         }
 
         // Top-left floating Gizmo Mode + Undo/Redo + Snap bar inside 3D Viewport
@@ -1756,8 +2058,61 @@ impl StudioApp {
                 });
         });
 
-        // Bottom-left floating viewport controls (Wire / Grid / Zoom / Reset)
-        let bar_w = if compact { (rect.width() - 16.0).max(200.0) } else { 490.0 };
+        // Floating Physics Playback Bar (forja3d-physics)
+        let is_simulating = self.sim_world.is_some();
+        let sim_w = if is_simulating { 280.0 } else { 132.0 };
+        let sim_pos = if compact {
+            rect.left_top() + egui::vec2(8.0, top_bar_h + 14.0)
+        } else {
+            rect.right_top() + egui::vec2(-(sim_w + 8.0), 8.0)
+        };
+        let sim_rect = egui::Rect::from_min_size(sim_pos, egui::vec2(sim_w, top_bar_h));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(sim_rect), |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgba_unmultiplied(15, 22, 28, 225))
+                .inner_margin(egui::Margin::symmetric(8, 4))
+                .corner_radius(6.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let bh = if compact { 28.0 } else { 22.0 };
+                        let sim_lbl = if is_simulating { "⏹ Parar" } else { "▶ Física" };
+                        if ui
+                            .add_sized([84.0, bh], egui::Button::selectable(is_simulating, sim_lbl))
+                            .on_hover_text("Probar físicas del .f3d con forja3d-physics")
+                            .clicked()
+                        {
+                            if is_simulating {
+                                self.stop_physics_sim();
+                                self.status_note = String::from("Simulación detenida");
+                            } else {
+                                self.start_physics_sim(2.2);
+                            }
+                        }
+                        if is_simulating {
+                            if ui.add_sized([82.0, bh], egui::Button::new("↑ Impulso")).clicked() {
+                                if let (Some(world), Some(handle)) = (self.sim_world.as_mut(), self.sim_body) {
+                                    let mass = world.body(handle).map_or(1.0, |b| b.mass.max(0.5));
+                                    world.apply_impulse(handle, [0.0, 6.5 * mass, 0.0]);
+                                }
+                            }
+                            if let (Some(world), Some(handle)) = (&self.sim_world, self.sim_body) {
+                                if let Some(body) = world.body(handle) {
+                                    let ground_txt = if body.on_ground { "Suelo" } else { "Aire" };
+                                    ui.label(
+                                        egui::RichText::new(format!("Y:{:.2}m · {ground_txt}", body.position[1]))
+                                            .size(11.0)
+                                            .monospace()
+                                            .color(egui::Color32::from_rgb(52, 211, 153)),
+                                    );
+                                }
+                            }
+                        }
+                    });
+                });
+        });
+
+        // Bottom-left floating viewport controls (Wire / Grid / Col. / Zoom / Reset)
+        let bar_w = if compact { (rect.width() - 16.0).max(200.0) } else { 540.0 };
         let bar_h = if compact { 38.0 } else { 28.0 };
         let overlay_rect = egui::Rect::from_min_size(
             rect.left_bottom() + egui::vec2(8.0, -(bar_h + 8.0)),
@@ -1773,6 +2128,7 @@ impl StudioApp {
                         let btn_h = if compact { 28.0 } else { 20.0 };
                         ui.toggle_value(&mut self.wireframe, "Wire");
                         ui.toggle_value(&mut self.show_grid, "Grid");
+                        ui.toggle_value(&mut self.show_colliders, "Col.");
                         if ui.add_sized([28.0, btn_h], egui::Button::new("+")).on_hover_text("Acercar").clicked() {
                             self.camera.distance = (self.camera.distance * 0.82).clamp(0.6, 250.0);
                         }
@@ -1810,6 +2166,8 @@ impl eframe::App for StudioApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.step_physics_sim(ui.ctx());
+
         // Handle pending async file-picker (.glb/.gltf/.f3d) import
         let picked = self.pending_import.lock().ok().and_then(|mut g| g.take());
         if let Some((name, bytes, base_dir)) = picked {

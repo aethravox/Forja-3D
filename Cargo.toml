@@ -1,0 +1,7 @@
+[package]
+name = "forja3d-workspace"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+langes = "0.1.0"

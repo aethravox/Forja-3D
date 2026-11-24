@@ -38,5 +38,8 @@ jobs:
       - name: Check forja3d #![no_std] compatibility on wasm32
         run: cargo check --manifest-path rust-workspace/Cargo.toml -p forja3d --no-default-features --target wasm32-unknown-unknown
 
+      - name: Check forja3d-physics #![no_std] compatibility on wasm32
+        run: cargo check --manifest-path rust-workspace/Cargo.toml -p forja3d-physics --no-default-features --target wasm32-unknown-unknown
+
       - name: Check forja3d-studio wasm32 compilation
         run: cargo check --manifest-path rust-workspace/Cargo.toml -p forja3d-studio --lib --target wasm32-unknown-unknown

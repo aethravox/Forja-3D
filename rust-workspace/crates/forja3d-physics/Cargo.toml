@@ -1,0 +1,18 @@
+[package]
+name = "forja3d-physics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Motor de físicas 3D #![no_std] sin dependencias externas nativo para modelos .f3d (Forja3D)."
+keywords = ["physics", "3d", "no_std", "gamedev", "forja3d"]
+categories = ["game-development", "simulation", "mathematics"]
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+forja3d = { version = "0.1.0", path = "../forja3d", default-features = false }

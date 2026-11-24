@@ -1,0 +1,17 @@
+[package]
+name = "langes"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.81"
+repository = "https://github.com/aethravox/Forja-3D"
+description = "Crate #![no_std] ultraligera para tablas de localización y parseo de diccionarios de idiomas en Rust."
+keywords = ["localization", "i18n", "no_std", "strings", "config"]
+categories = ["internationalization", "text-processing", "no-std"]
+readme = "README.md"
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]

@@ -1,6 +1,6 @@
 use forja3d::{
-    DecodeError, Model, PartSpec, PrimitiveKind, RustExportTarget, SceneDocument, ShadingMode,
-    FLAG_COMPACT, MAGIC,
+    ColliderShape, DecodeError, Model, PartSpec, PrimitiveKind, RigidBodyKind, RustExportTarget,
+    SceneDocument, ShadingMode, FLAG_COMPACT, FLAG_PHYSICS, MAGIC,
 };
 
 #[test]
@@ -40,6 +40,7 @@ fn generates_valid_rust_source_targets() {
     let mut scene = SceneDocument {
         model_name: String::from("Torreta"),
         parts: vec![PartSpec::new("base", PrimitiveKind::Cylinder)],
+        ..SceneDocument::default()
     };
     scene.parts[0].scale = [1.5, 0.5, 1.5];
     let model = scene.bake();
@@ -144,6 +145,52 @@ fn wavefront_obj_export_and_scene_from_model() {
     let imported_scene = SceneDocument::from_model(model.clone());
     assert_eq!(imported_scene.parts.len(), model.parts.len());
     assert_eq!(imported_scene.parts[0].kind, PrimitiveKind::CustomMesh);
+    assert!(imported_scene.physics_enabled);
     let rebaked = imported_scene.bake();
     assert_eq!(rebaked.triangle_count(), model.triangle_count());
+    assert!(rebaked.physics.is_some());
 }
+
+#[test]
+fn roundtrip_f3d_with_physics_standard_and_compact() {
+    let mut scene = SceneDocument::preset_drone();
+    scene.auto_generate_colliders();
+    let model = scene.bake();
+    assert!(model.physics.is_some());
+    assert!(!model.physics.as_ref().unwrap().colliders.is_empty());
+
+    let std_bytes = model.to_bytes();
+    let std_flags = u16::from_le_bytes([std_bytes[6], std_bytes[7]]);
+    assert_ne!(std_flags & FLAG_PHYSICS, 0);
+    assert_eq!(std_flags & FLAG_COMPACT, 0);
+
+    let decoded_std = Model::from_bytes(&std_bytes).expect("physics standard .f3d should decode");
+    assert_eq!(decoded_std, model);
+
+    let cmp_bytes = model.to_bytes_compact();
+    let cmp_flags = u16::from_le_bytes([cmp_bytes[6], cmp_bytes[7]]);
+    assert_ne!(cmp_flags & FLAG_PHYSICS, 0);
+    assert_ne!(cmp_flags & FLAG_COMPACT, 0);
+
+    let decoded_cmp = Model::from_bytes(&cmp_bytes).expect("physics compact .f3d should decode");
+    assert_eq!(decoded_cmp.physics, model.physics);
+}
+
+#[test]
+fn f3d_without_physics_flag_decodes_physics_none_and_supports_with_auto_physics() {
+    let mut model = SceneDocument::new("SoloMalla").bake();
+    model.parts.push(PartSpec::new("bloque", PrimitiveKind::Cube).bake());
+    let bytes = model.to_bytes();
+    let flags = u16::from_le_bytes([bytes[6], bytes[7]]);
+    assert_eq!(flags & FLAG_PHYSICS, 0);
+
+    let decoded = Model::from_bytes(&bytes).expect("model without physics should decode");
+    assert!(decoded.physics.is_none());
+
+    let with_phys = decoded.with_auto_physics(RigidBodyKind::Dynamic);
+    let phys = with_phys.physics.as_ref().expect("with_auto_physics should populate PhysicsSpec");
+    assert_eq!(phys.body_kind, RigidBodyKind::Dynamic);
+    assert_eq!(phys.colliders.len(), 1);
+    assert!(matches!(phys.colliders[0].shape, ColliderShape::Box { .. }));
+}
+

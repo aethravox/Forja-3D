@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/forja3d",
+    "crates/forja3d-physics",
+    "crates/langes",
     "crates/forja3d-studio",
 ]
 

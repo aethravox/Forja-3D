@@ -2,7 +2,10 @@ use alloc::{string::String, vec, vec::Vec};
 use core::f32::consts::TAU;
 
 use crate::{
-    format::{Material, MeshPart, Model, Vertex},
+    format::{
+        fnv1a_32, ColliderShape, ColliderSpec, Material, MeshPart, Model, PhysicsSpec,
+        RigidBodyKind, Vertex,
+    },
     math::{sin_cos, Aabb, Mat4, Vec3},
     mesh_ops::{
         apply_shading, build_extruded_polygon, build_lathe_profile, deduplicate_vertices,
@@ -76,6 +79,9 @@ pub struct PartSpec {
     pub profile: Vec<[f32; 2]>,
     pub extrude_depth: f32,
     pub custom_mesh: Option<MeshPart>,
+    pub collider: ColliderShape,
+    pub collider_auto_fit: bool,
+    pub collider_offset: [f32; 3],
 }
 
 impl PartSpec {
@@ -102,6 +108,63 @@ impl PartSpec {
             profile,
             extrude_depth: 0.4,
             custom_mesh: None,
+            collider: ColliderShape::None,
+            collider_auto_fit: true,
+            collider_offset: [0.0; 3],
+        }
+    }
+
+    pub fn recommended_collider_shape(&self) -> ColliderShape {
+        match self.kind {
+            PrimitiveKind::Sphere => ColliderShape::Sphere { radius: 0.5 },
+            PrimitiveKind::Cylinder => ColliderShape::Capsule {
+                radius: 0.5,
+                half_height: 0.25,
+            },
+            _ => ColliderShape::Box {
+                half_extents: [0.5, 0.5, 0.5],
+            },
+        }
+    }
+
+    pub fn fitted_collider_for_mesh(&self, baked: &MeshPart) -> Option<ColliderSpec> {
+        let part_hash = fnv1a_32(baked.name.as_bytes());
+        match self.collider {
+            ColliderShape::None => None,
+            _ if self.collider_auto_fit => {
+                let (offset, shape) = match self.collider {
+                    ColliderShape::Box { .. } => ColliderShape::fit_box(baked.bounds),
+                    ColliderShape::Sphere { .. } => ColliderShape::fit_sphere(baked.bounds),
+                    ColliderShape::Capsule { .. } => ColliderShape::fit_capsule(baked.bounds),
+                    ColliderShape::None => unreachable!(),
+                };
+                Some(ColliderSpec {
+                    part_hash,
+                    offset,
+                    shape,
+                })
+            }
+            shape => {
+                let b = baked.bounds;
+                let center = if b.is_valid() {
+                    [
+                        (b.min[0] + b.max[0]) * 0.5,
+                        (b.min[1] + b.max[1]) * 0.5,
+                        (b.min[2] + b.max[2]) * 0.5,
+                    ]
+                } else {
+                    self.position
+                };
+                Some(ColliderSpec {
+                    part_hash,
+                    offset: [
+                        center[0] + self.collider_offset[0],
+                        center[1] + self.collider_offset[1],
+                        center[2] + self.collider_offset[2],
+                    ],
+                    shape,
+                })
+            }
         }
     }
 
@@ -170,6 +233,9 @@ impl PartSpec {
             profile: default_extrude_profile(),
             extrude_depth: 0.4,
             custom_mesh: Some(local_mesh),
+            collider: ColliderShape::None,
+            collider_auto_fit: true,
+            collider_offset: [0.0; 3],
         }
     }
 
@@ -306,13 +372,78 @@ impl PartSpec {
 pub struct SceneDocument {
     pub model_name: String,
     pub parts: Vec<PartSpec>,
+    pub physics_enabled: bool,
+    pub physics: PhysicsSpec,
+}
+
+impl Default for SceneDocument {
+    fn default() -> Self {
+        Self {
+            model_name: String::from("MiModelo"),
+            parts: Vec::new(),
+            physics_enabled: false,
+            physics: PhysicsSpec::default(),
+        }
+    }
 }
 
 impl SceneDocument {
+    pub fn new(model_name: impl Into<String>) -> Self {
+        Self {
+            model_name: model_name.into(),
+            ..Self::default()
+        }
+    }
+
     pub fn from_model(model: Model) -> Self {
+        let phys_opt = model.physics;
+        let mut parts: Vec<PartSpec> = model
+            .parts
+            .into_iter()
+            .map(PartSpec::from_mesh_part)
+            .collect();
+
+        let (physics_enabled, physics) = if let Some(phys) = phys_opt {
+            for part in &mut parts {
+                let h = fnv1a_32(part.name.as_bytes());
+                if let Some(c) = phys.colliders.iter().find(|c| c.part_hash == h) {
+                    part.collider = c.shape;
+                    part.collider_auto_fit = false;
+                    part.collider_offset = [
+                        c.offset[0] - part.position[0],
+                        c.offset[1] - part.position[1],
+                        c.offset[2] - part.position[2],
+                    ];
+                }
+            }
+            (
+                true,
+                PhysicsSpec {
+                    colliders: Vec::new(),
+                    ..phys
+                },
+            )
+        } else {
+            (false, PhysicsSpec::default())
+        };
+
         Self {
             model_name: model.name,
-            parts: model.parts.into_iter().map(PartSpec::from_mesh_part).collect(),
+            parts,
+            physics_enabled,
+            physics,
+        }
+    }
+
+    /// Enable `.f3d` physics and assign auto-fitted colliders to any parts without one.
+    pub fn auto_generate_colliders(&mut self) {
+        self.physics_enabled = true;
+        for part in &mut self.parts {
+            if part.collider == ColliderShape::None {
+                part.collider = part.recommended_collider_shape();
+                part.collider_auto_fit = true;
+                part.collider_offset = [0.0; 3];
+            }
         }
     }
 
@@ -324,14 +455,29 @@ impl SceneDocument {
     pub fn bake_with_part_map(&self) -> (Model, Vec<usize>) {
         let mut model = Model::new(self.model_name.clone());
         let mut part_map = Vec::new();
+        let mut colliders = Vec::new();
+
         for (idx, part) in self.parts.iter().enumerate() {
             if part.visible {
                 for baked in part.bake_all() {
+                    if self.physics_enabled {
+                        if let Some(spec) = part.fitted_collider_for_mesh(&baked) {
+                            colliders.push(spec);
+                        }
+                    }
                     model.parts.push(baked);
                     part_map.push(idx);
                 }
             }
         }
+
+        if self.physics_enabled {
+            model.physics = Some(PhysicsSpec {
+                colliders,
+                ..self.physics.clone()
+            });
+        }
+
         (model, part_map)
     }
 
@@ -360,6 +506,7 @@ impl SceneDocument {
                     roughness: 0.32,
                     segments: 16,
                     group: Some(String::from("Cuerpo")),
+                    collider: ColliderShape::Box { half_extents: [0.5; 3] },
                     ..PartSpec::new("chasis_central", PrimitiveKind::Cube)
                 },
                 PartSpec {
@@ -369,6 +516,7 @@ impl SceneDocument {
                     metallic: 0.25,
                     roughness: 0.18,
                     group: Some(String::from("Cuerpo")),
+                    collider: ColliderShape::Sphere { radius: 0.5 },
                     ..PartSpec::new("nucleo_visor", PrimitiveKind::Sphere)
                 },
                 PartSpec {
@@ -379,6 +527,7 @@ impl SceneDocument {
                     roughness: 0.28,
                     mirror: [true, false, false],
                     group: Some(String::from("Propulsion")),
+                    collider: ColliderShape::Box { half_extents: [0.5; 3] },
                     ..PartSpec::new("rotor_lateral", PrimitiveKind::Torus)
                 },
                 PartSpec {
@@ -393,6 +542,16 @@ impl SceneDocument {
                     ..PartSpec::new("brazo_transversal", PrimitiveKind::Cylinder)
                 },
             ],
+            physics_enabled: true,
+            physics: PhysicsSpec {
+                body_kind: RigidBodyKind::Dynamic,
+                mass: 2.5,
+                friction: 0.45,
+                restitution: 0.35,
+                linear_damping: 0.05,
+                gravity_scale: 1.0,
+                colliders: Vec::new(),
+            },
         }
     }
 
@@ -408,6 +567,7 @@ impl SceneDocument {
                     roughness: 0.75,
                     segments: 12,
                     group: Some(String::from("Estructura")),
+                    collider: ColliderShape::Box { half_extents: [0.5; 3] },
                     ..PartSpec::new("base_pedestal", PrimitiveKind::Cube)
                 },
                 PartSpec {
@@ -418,6 +578,7 @@ impl SceneDocument {
                     roughness: 0.35,
                     segments: 8,
                     group: Some(String::from("Estructura")),
+                    collider: ColliderShape::Capsule { radius: 0.4, half_height: 0.4 },
                     ..PartSpec::new("columna", PrimitiveKind::Cylinder)
                 },
                 PartSpec {
@@ -428,9 +589,20 @@ impl SceneDocument {
                     metallic: 0.85,
                     roughness: 0.22,
                     segments: 12,
+                    collider: ColliderShape::Box { half_extents: [0.5; 3] },
                     ..PartSpec::new("corona", PrimitiveKind::Pyramid)
                 },
             ],
+            physics_enabled: true,
+            physics: PhysicsSpec {
+                body_kind: RigidBodyKind::Static,
+                mass: 10.0,
+                friction: 0.6,
+                restitution: 0.15,
+                linear_damping: 0.04,
+                gravity_scale: 1.0,
+                colliders: Vec::new(),
+            },
         }
     }
 }

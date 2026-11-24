@@ -1,7 +1,7 @@
 use eframe::glow;
 use glow::HasContext;
 
-use forja3d::{Aabb, Model};
+use forja3d::{Aabb, ColliderShape, Model};
 
 #[derive(Debug, Clone, Copy)]
 pub struct OrbitCamera {
@@ -156,8 +156,12 @@ pub struct GlViewportRenderer {
     grid_vao: glow::VertexArray,
     grid_vbo: glow::Buffer,
     grid_vertex_count: i32,
+    debug_vao: glow::VertexArray,
+    debug_vbo: glow::Buffer,
+    debug_vertex_count: i32,
     parts: Vec<GpuPart>,
     uploaded_generation: u64,
+    uploaded_debug_key: u64,
 }
 
 impl GlViewportRenderer {
@@ -175,15 +179,17 @@ impl GlViewportRenderer {
             layout(location = 2) in vec4 a_color;
 
             uniform mat4 u_mvp;
+            uniform vec3 u_offset;
             out vec3 v_world_pos;
             out vec3 v_normal;
             out vec4 v_color;
 
             void main() {{
-                v_world_pos = a_pos;
+                vec3 pos = a_pos + u_offset;
+                v_world_pos = pos;
                 v_normal = a_normal;
                 v_color = a_color;
-                gl_Position = u_mvp * vec4(a_pos, 1.0);
+                gl_Position = u_mvp * vec4(pos, 1.0);
             }}"
         );
 
@@ -228,13 +234,14 @@ impl GlViewportRenderer {
             layout(location = 1) in vec3 a_color;
 
             uniform mat4 u_mvp;
+            uniform vec3 u_offset;
             uniform float u_use_override;
             uniform vec3 u_override_color;
             out vec3 v_col;
 
             void main() {{
                 v_col = mix(a_color, u_override_color, u_use_override);
-                gl_Position = u_mvp * vec4(a_pos, 1.0);
+                gl_Position = u_mvp * vec4(a_pos + u_offset, 1.0);
             }}"
         );
 
@@ -262,15 +269,59 @@ impl GlViewportRenderer {
         gl.vertex_attrib_pointer_f32(1, 3, glow::FLOAT, false, 24, 12);
         gl.bind_vertex_array(None);
 
+        let debug_vao = gl.create_vertex_array()?;
+        let debug_vbo = gl.create_buffer()?;
+        gl.bind_vertex_array(Some(debug_vao));
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(debug_vbo));
+        gl.enable_vertex_attrib_array(0);
+        gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, 24, 0);
+        gl.enable_vertex_attrib_array(1);
+        gl.vertex_attrib_pointer_f32(1, 3, glow::FLOAT, false, 24, 12);
+        gl.bind_vertex_array(None);
+
         Ok(Self {
             program,
             line_program,
             grid_vao,
             grid_vbo,
             grid_vertex_count: (grid_data.len() / 6) as i32,
+            debug_vao,
+            debug_vbo,
+            debug_vertex_count: 0,
             parts: Vec::new(),
             uploaded_generation: 0,
+            uploaded_debug_key: 0,
         })
+    }
+
+    pub unsafe fn sync_collider_debug(
+        &mut self,
+        gl: &glow::Context,
+        model: &Model,
+        generation: u64,
+        show_colliders: bool,
+    ) {
+        let key = if show_colliders { generation } else { u64::MAX };
+        if self.uploaded_debug_key == key {
+            return;
+        }
+        self.uploaded_debug_key = key;
+
+        let line_data = if show_colliders {
+            build_collider_debug_vertices(model)
+        } else {
+            Vec::new()
+        };
+        self.debug_vertex_count = (line_data.len() / 6) as i32;
+        if !line_data.is_empty() {
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.debug_vbo));
+            gl.buffer_data_u8_slice(
+                glow::ARRAY_BUFFER,
+                bytemuck_slice(&line_data),
+                glow::DYNAMIC_DRAW,
+            );
+            gl.bind_buffer(glow::ARRAY_BUFFER, None);
+        }
     }
 
     pub unsafe fn sync_model(&mut self, gl: &glow::Context, model: &Model, generation: u64) {
@@ -349,6 +400,7 @@ impl GlViewportRenderer {
         selected_mask: &[bool],
         show_grid: bool,
         wireframe: bool,
+        model_offset: [f32; 3],
     ) {
         let view = camera.view_matrix();
         let proj = camera.proj_matrix(aspect);
@@ -366,6 +418,9 @@ impl GlViewportRenderer {
             if let Some(loc) = gl.get_uniform_location(self.line_program, "u_mvp") {
                 gl.uniform_matrix_4_f32_slice(Some(&loc), false, &mvp);
             }
+            if let Some(loc) = gl.get_uniform_location(self.line_program, "u_offset") {
+                gl.uniform_3_f32_slice(Some(&loc), &[0.0, 0.0, 0.0]);
+            }
             if let Some(loc) = gl.get_uniform_location(self.line_program, "u_use_override") {
                 gl.uniform_1_f32(Some(&loc), 0.0);
             }
@@ -377,6 +432,9 @@ impl GlViewportRenderer {
         gl.use_program(Some(self.program));
         if let Some(loc) = gl.get_uniform_location(self.program, "u_mvp") {
             gl.uniform_matrix_4_f32_slice(Some(&loc), false, &mvp);
+        }
+        if let Some(loc) = gl.get_uniform_location(self.program, "u_offset") {
+            gl.uniform_3_f32_slice(Some(&loc), &model_offset);
         }
         if let Some(loc) = gl.get_uniform_location(self.program, "u_eye") {
             gl.uniform_3_f32_slice(Some(&loc), &eye);
@@ -404,6 +462,9 @@ impl GlViewportRenderer {
                 if let Some(loc) = gl.get_uniform_location(self.line_program, "u_mvp") {
                     gl.uniform_matrix_4_f32_slice(Some(&loc), false, &mvp);
                 }
+                if let Some(loc) = gl.get_uniform_location(self.line_program, "u_offset") {
+                    gl.uniform_3_f32_slice(Some(&loc), &model_offset);
+                }
                 if let Some(loc) = gl.get_uniform_location(self.line_program, "u_use_override") {
                     gl.uniform_1_f32(Some(&loc), 1.0);
                 }
@@ -417,6 +478,21 @@ impl GlViewportRenderer {
             }
         }
 
+        if self.debug_vertex_count > 0 {
+            gl.use_program(Some(self.line_program));
+            if let Some(loc) = gl.get_uniform_location(self.line_program, "u_mvp") {
+                gl.uniform_matrix_4_f32_slice(Some(&loc), false, &mvp);
+            }
+            if let Some(loc) = gl.get_uniform_location(self.line_program, "u_offset") {
+                gl.uniform_3_f32_slice(Some(&loc), &model_offset);
+            }
+            if let Some(loc) = gl.get_uniform_location(self.line_program, "u_use_override") {
+                gl.uniform_1_f32(Some(&loc), 0.0);
+            }
+            gl.bind_vertex_array(Some(self.debug_vao));
+            gl.draw_arrays(glow::LINES, 0, self.debug_vertex_count);
+        }
+
         gl.bind_vertex_array(None);
         gl.use_program(None);
         gl.disable(glow::DEPTH_TEST);
@@ -427,6 +503,8 @@ impl GlViewportRenderer {
         gl.delete_program(self.line_program);
         gl.delete_vertex_array(self.grid_vao);
         gl.delete_buffer(self.grid_vbo);
+        gl.delete_vertex_array(self.debug_vao);
+        gl.delete_buffer(self.debug_vbo);
         for p in self.parts.drain(..) {
             gl.delete_vertex_array(p.vao);
             gl.delete_buffer(p.vbo);
@@ -547,3 +625,96 @@ fn mat4_mul(a: [f32; 16], b: [f32; 16]) -> [f32; 16] {
     }
     out
 }
+
+fn push_line(out: &mut Vec<f32>, a: [f32; 3], b: [f32; 3], col: [f32; 3]) {
+    out.extend_from_slice(&[a[0], a[1], a[2], col[0], col[1], col[2]]);
+    out.extend_from_slice(&[b[0], b[1], b[2], col[0], col[1], col[2]]);
+}
+
+fn push_box_wire(out: &mut Vec<f32>, c: [f32; 3], h: [f32; 3], col: [f32; 3]) {
+    let corners = [
+        [c[0] - h[0], c[1] - h[1], c[2] - h[2]],
+        [c[0] + h[0], c[1] - h[1], c[2] - h[2]],
+        [c[0] + h[0], c[1] + h[1], c[2] - h[2]],
+        [c[0] - h[0], c[1] + h[1], c[2] - h[2]],
+        [c[0] - h[0], c[1] - h[1], c[2] + h[2]],
+        [c[0] + h[0], c[1] - h[1], c[2] + h[2]],
+        [c[0] + h[0], c[1] + h[1], c[2] + h[2]],
+        [c[0] - h[0], c[1] + h[1], c[2] + h[2]],
+    ];
+    let edges = [
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        (4, 5), (5, 6), (6, 7), (7, 4),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+    ];
+    for (i, j) in edges {
+        push_line(out, corners[i], corners[j], col);
+    }
+}
+
+fn push_circle_wire(out: &mut Vec<f32>, c: [f32; 3], r: f32, plane: u8, col: [f32; 3]) {
+    let segs = 20usize;
+    for i in 0..segs {
+        let a0 = (i as f32 / segs as f32) * core::f32::consts::TAU;
+        let a1 = ((i + 1) as f32 / segs as f32) * core::f32::consts::TAU;
+        let (s0, c0) = a0.sin_cos();
+        let (s1, c1) = a1.sin_cos();
+        let (p0, p1) = match plane {
+            0 => ([c[0] + c0 * r, c[1], c[2] + s0 * r], [c[0] + c1 * r, c[1], c[2] + s1 * r]), // XZ
+            1 => ([c[0] + c0 * r, c[1] + s0 * r, c[2]], [c[0] + c1 * r, c[1] + s1 * r, c[2]]), // XY
+            _ => ([c[0], c[1] + s0 * r, c[2] + c0 * r], [c[0], c[1] + s1 * r, c[2] + c1 * r]), // YZ
+        };
+        push_line(out, p0, p1, col);
+    }
+}
+
+fn build_collider_debug_vertices(model: &Model) -> Vec<f32> {
+    let mut out = Vec::new();
+    let active_col = [0.20, 0.90, 0.58];
+    let fallback_col = [0.95, 0.72, 0.22];
+
+    if let Some(phys) = &model.physics {
+        if !phys.colliders.is_empty() {
+            for spec in &phys.colliders {
+                match spec.shape {
+                    ColliderShape::None => {}
+                    ColliderShape::Box { half_extents } => {
+                        push_box_wire(&mut out, spec.offset, half_extents, active_col);
+                    }
+                    ColliderShape::Sphere { radius } => {
+                        push_circle_wire(&mut out, spec.offset, radius, 0, active_col);
+                        push_circle_wire(&mut out, spec.offset, radius, 1, active_col);
+                        push_circle_wire(&mut out, spec.offset, radius, 2, active_col);
+                    }
+                    ColliderShape::Capsule { radius, half_height } => {
+                        let top = [spec.offset[0], spec.offset[1] + half_height, spec.offset[2]];
+                        let bot = [spec.offset[0], spec.offset[1] - half_height, spec.offset[2]];
+                        push_circle_wire(&mut out, top, radius, 0, active_col);
+                        push_circle_wire(&mut out, bot, radius, 0, active_col);
+                        push_circle_wire(&mut out, top, radius, 1, active_col);
+                        push_circle_wire(&mut out, bot, radius, 2, active_col);
+                        for [dx, dz] in [[radius, 0.0], [-radius, 0.0], [0.0, radius], [0.0, -radius]] {
+                            push_line(
+                                &mut out,
+                                [bot[0] + dx, bot[1], bot[2] + dz],
+                                [top[0] + dx, top[1], top[2] + dz],
+                                active_col,
+                            );
+                        }
+                    }
+                }
+            }
+            return out;
+        }
+    }
+
+    let bounds = model.bounds();
+    if bounds.is_valid() {
+        let (center, shape) = ColliderShape::fit_box(bounds);
+        if let ColliderShape::Box { half_extents } = shape {
+            push_box_wire(&mut out, center, half_extents, fallback_col);
+        }
+    }
+    out
+}
+

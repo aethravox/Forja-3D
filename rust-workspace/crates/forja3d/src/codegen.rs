@@ -1,7 +1,7 @@
 use alloc::{format, string::String, vec::Vec};
 use core::fmt::Write;
 
-use crate::format::{MeshPart, Model, Vertex};
+use crate::format::{ColliderShape, MeshPart, Model, PhysicsSpec, Vertex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RustExportTarget {
@@ -143,6 +143,13 @@ fn emit_zero_dep(out: &mut String, model: &Model) {
         }
     }
     let _ = writeln!(out, "];");
+
+    if let Some(phys) = &model.physics {
+        let _ = writeln!(out, "\npub const PHYSICS_MASS: f32 = {:.4};", phys.mass);
+        let _ = writeln!(out, "pub const PHYSICS_FRICTION: f32 = {:.4};", phys.friction);
+        let _ = writeln!(out, "pub const PHYSICS_RESTITUTION: f32 = {:.4};", phys.restitution);
+        let _ = writeln!(out, "pub const COLLIDER_COUNT: usize = {};", phys.colliders.len());
+    }
 }
 
 fn emit_wgpu_bytemuck(out: &mut String, model: &Model) {
@@ -185,7 +192,10 @@ fn emit_wgpu_bytemuck(out: &mut String, model: &Model) {
 }
 
 fn emit_forja3d_model(out: &mut String, fn_name: &str, model: &Model) {
-    let _ = writeln!(out, "use forja3d::{{Aabb, Material, MeshPart, Model, Vertex}};\n");
+    let _ = writeln!(
+        out,
+        "use forja3d::{{Aabb, ColliderShape, ColliderSpec, Material, MeshPart, Model, PhysicsSpec, RigidBodyKind, Vertex}};\n"
+    );
     let _ = writeln!(out, "pub fn build_{fn_name}() -> Model {{");
     let _ = writeln!(out, "    Model {{");
     let _ = writeln!(out, "        name: String::from({:?}),", model.name);
@@ -194,8 +204,50 @@ fn emit_forja3d_model(out: &mut String, fn_name: &str, model: &Model) {
         emit_part(out, part);
     }
     let _ = writeln!(out, "        ],");
+    match &model.physics {
+        None => {
+            let _ = writeln!(out, "        physics: None,");
+        }
+        Some(phys) => {
+            emit_physics(out, phys);
+        }
+    }
     let _ = writeln!(out, "    }}");
     let _ = writeln!(out, "}}");
+}
+
+fn emit_physics(out: &mut String, phys: &PhysicsSpec) {
+    let _ = writeln!(out, "        physics: Some(PhysicsSpec {{");
+    let _ = writeln!(out, "            body_kind: RigidBodyKind::{:?},", phys.body_kind);
+    let _ = writeln!(out, "            mass: {:.4},", phys.mass);
+    let _ = writeln!(out, "            friction: {:.4},", phys.friction);
+    let _ = writeln!(out, "            restitution: {:.4},", phys.restitution);
+    let _ = writeln!(out, "            linear_damping: {:.4},", phys.linear_damping);
+    let _ = writeln!(out, "            gravity_scale: {:.4},", phys.gravity_scale);
+    let _ = writeln!(out, "            colliders: vec![");
+    for c in &phys.colliders {
+        let shape_str = match c.shape {
+            ColliderShape::None => String::from("ColliderShape::None"),
+            ColliderShape::Box { half_extents } => format!(
+                "ColliderShape::Box {{ half_extents: [{:.5}, {:.5}, {:.5}] }}",
+                half_extents[0], half_extents[1], half_extents[2]
+            ),
+            ColliderShape::Sphere { radius } => {
+                format!("ColliderShape::Sphere {{ radius: {:.5} }}", radius)
+            }
+            ColliderShape::Capsule { radius, half_height } => format!(
+                "ColliderShape::Capsule {{ radius: {:.5}, half_height: {:.5} }}",
+                radius, half_height
+            ),
+        };
+        let _ = writeln!(
+            out,
+            "                ColliderSpec {{ part_hash: 0x{:08X}, offset: [{:.5}, {:.5}, {:.5}], shape: {} }},",
+            c.part_hash, c.offset[0], c.offset[1], c.offset[2], shape_str
+        );
+    }
+    let _ = writeln!(out, "            ],");
+    let _ = writeln!(out, "        }}),");
 }
 
 fn emit_part(out: &mut String, part: &MeshPart) {
