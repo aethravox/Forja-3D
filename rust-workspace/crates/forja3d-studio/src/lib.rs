@@ -104,6 +104,10 @@ pub struct StudioApp {
     cached_obj_src: String,
     pending_import: Arc<Mutex<Option<(String, Vec<u8>, Option<std::path::PathBuf>)>>>,
     pending_status: Arc<Mutex<Option<String>>>,
+    safe_insets_dp: [f32; 4],
+    last_inset_poll: f64,
+    was_focused: bool,
+    immersive_applied: bool,
     status_note: String,
     pub lang_table: langes::LangTable,
     gl_renderer: Arc<Mutex<Option<GlViewportRenderer>>>,
@@ -161,6 +165,10 @@ impl StudioApp {
             cached_obj_src,
             pending_import: Arc::new(Mutex::new(None)),
             pending_status: Arc::new(Mutex::new(None)),
+            safe_insets_dp: [0.0; 4],
+            last_inset_poll: -1.0,
+            was_focused: false,
+            immersive_applied: false,
             status_note: String::from("Arrastra el gizmo X/Y/Z para editar"),
             lang_table: langes::LangTable::parse_text(
                 "[es]\ntitle = \"Forja3D Studio\"\nexport = \"Exportar\"\nphysics = \"Física\"\n[en]\ntitle = \"Forja3D Studio\"\nexport = \"Export\"\nphysics = \"Physics\"",
@@ -2020,35 +2028,41 @@ impl StudioApp {
                 .inner_margin(egui::Margin::symmetric(8, 4))
                 .corner_radius(6.0)
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let bh = if compact { 28.0 } else { 22.0 };
-                        for mode in [GizmoMode::Translate, GizmoMode::Rotate, GizmoMode::Scale] {
-                            if ui
-                                .add_sized([54.0, bh], egui::Button::selectable(self.gizmo_mode == mode, mode.label()))
-                                .clicked()
-                            {
-                                self.gizmo_mode = mode;
-                            }
-                        }
-                        ui.toggle_value(&mut self.snap_enabled, "Snap");
-                        ui.separator();
-                        let can_undo = !self.undo_stack.is_empty();
-                        let can_redo = !self.redo_stack.is_empty();
-                        if ui
-                            .add_enabled(can_undo, egui::Button::new("↶").min_size(egui::vec2(28.0, bh)))
-                            .on_hover_text("Deshacer (Ctrl+Z)")
-                            .clicked()
-                        {
-                            self.undo();
-                        }
-                        if ui
-                            .add_enabled(can_redo, egui::Button::new("↷").min_size(egui::vec2(28.0, bh)))
-                            .on_hover_text("Rehacer (Ctrl+Y)")
-                            .clicked()
-                        {
-                            self.redo();
-                        }
-                    });
+                    egui::ScrollArea::horizontal()
+                        .id_salt("viewport_top_bar_scroll")
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let bh = if compact { 28.0 } else { 22.0 };
+                                let mode_w = if compact && rect.width() < 390.0 { 48.0 } else { 54.0 };
+                                for mode in [GizmoMode::Translate, GizmoMode::Rotate, GizmoMode::Scale] {
+                                    if ui
+                                        .add_sized([mode_w, bh], egui::Button::selectable(self.gizmo_mode == mode, mode.label()))
+                                        .clicked()
+                                    {
+                                        self.gizmo_mode = mode;
+                                    }
+                                }
+                                ui.toggle_value(&mut self.snap_enabled, "Snap");
+                                ui.separator();
+                                let can_undo = !self.undo_stack.is_empty();
+                                let can_redo = !self.redo_stack.is_empty();
+                                if ui
+                                    .add_enabled(can_undo, egui::Button::new("↶").min_size(egui::vec2(28.0, bh)))
+                                    .on_hover_text("Deshacer (Ctrl+Z)")
+                                    .clicked()
+                                {
+                                    self.undo();
+                                }
+                                if ui
+                                    .add_enabled(can_redo, egui::Button::new("↷").min_size(egui::vec2(28.0, bh)))
+                                    .on_hover_text("Rehacer (Ctrl+Y)")
+                                    .clicked()
+                                {
+                                    self.redo();
+                                }
+                            });
+                        });
                 });
         });
 
@@ -2118,29 +2132,34 @@ impl StudioApp {
                 .inner_margin(egui::Margin::symmetric(8, 4))
                 .corner_radius(6.0)
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let btn_h = if compact { 28.0 } else { 20.0 };
-                        ui.toggle_value(&mut self.wireframe, "Wire");
-                        ui.toggle_value(&mut self.show_grid, "Grid");
-                        ui.toggle_value(&mut self.show_colliders, "Col.");
-                        if ui.add_sized([28.0, btn_h], egui::Button::new("+")).on_hover_text("Acercar").clicked() {
-                            self.camera.distance = (self.camera.distance * 0.82).clamp(0.6, 250.0);
-                        }
-                        if ui.add_sized([28.0, btn_h], egui::Button::new("-")).on_hover_text("Alejar").clicked() {
-                            self.camera.distance = (self.camera.distance * 1.22).clamp(0.6, 250.0);
-                        }
-                        if ui.add_sized([64.0, btn_h], egui::Button::new("Centrar")).clicked() {
-                            self.camera = OrbitCamera::default();
-                        }
-                        if !compact {
-                            ui.separator();
-                            ui.label(
-                                egui::RichText::new(&self.status_note)
-                                    .size(11.5)
-                                    .color(egui::Color32::from_gray(185)),
-                            );
-                        }
-                    });
+                    egui::ScrollArea::horizontal()
+                        .id_salt("viewport_bottom_bar_scroll")
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let btn_h = if compact { 28.0 } else { 20.0 };
+                                ui.toggle_value(&mut self.wireframe, "Wire");
+                                ui.toggle_value(&mut self.show_grid, "Grid");
+                                ui.toggle_value(&mut self.show_colliders, "Col.");
+                                if ui.add_sized([28.0, btn_h], egui::Button::new("+")).on_hover_text("Acercar").clicked() {
+                                    self.camera.distance = (self.camera.distance * 0.82).clamp(0.6, 250.0);
+                                }
+                                if ui.add_sized([28.0, btn_h], egui::Button::new("-")).on_hover_text("Alejar").clicked() {
+                                    self.camera.distance = (self.camera.distance * 1.22).clamp(0.6, 250.0);
+                                }
+                                if ui.add_sized([64.0, btn_h], egui::Button::new("Centrar")).clicked() {
+                                    self.camera = OrbitCamera::default();
+                                }
+                                if !compact {
+                                    ui.separator();
+                                    ui.label(
+                                        egui::RichText::new(&self.status_note)
+                                            .size(11.5)
+                                            .color(egui::Color32::from_gray(185)),
+                                    );
+                                }
+                            });
+                        });
                 });
         });
     }
@@ -2214,6 +2233,72 @@ impl eframe::App for StudioApp {
             self.undo();
         } else if want_redo {
             self.redo();
+        }
+
+        #[cfg(target_os = "android")]
+        {
+            let (now, focused, viewport_rect, content_rect) = ui.ctx().input(|i| {
+                (
+                    i.time,
+                    i.viewport().focused.unwrap_or(true),
+                    i.viewport_rect(),
+                    i.content_rect(),
+                )
+            });
+            if !self.immersive_applied || (!self.was_focused && focused) {
+                android_enable_immersive();
+                self.immersive_applied = true;
+                self.last_inset_poll = -1.0;
+            }
+            if self.last_inset_poll < 0.0 || (now - self.last_inset_poll) > 0.25 {
+                let raw = android_safe_insets_dp(ui.ctx(), viewport_rect);
+                let already = [
+                    (content_rect.left() - viewport_rect.left()).max(0.0),
+                    (content_rect.top() - viewport_rect.top()).max(0.0),
+                    (viewport_rect.right() - content_rect.right()).max(0.0),
+                    (viewport_rect.bottom() - content_rect.bottom()).max(0.0),
+                ];
+                self.safe_insets_dp = [
+                    (raw[0] - already[0]).max(0.0),
+                    (raw[1] - already[1]).max(0.0),
+                    (raw[2] - already[2]).max(0.0),
+                    (raw[3] - already[3]).max(0.0),
+                ];
+                self.last_inset_poll = now;
+            }
+            self.was_focused = focused;
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = (self.last_inset_poll, self.was_focused, self.immersive_applied);
+        }
+
+        let [safe_l, safe_t, safe_r, safe_b] = self.safe_insets_dp;
+        if safe_t > 0.5 {
+            egui::Panel::top("android_safe_top")
+                .exact_size(safe_t)
+                .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(13, 16, 22)))
+                .show(ui, |_| {});
+        }
+        if safe_b > 0.5 {
+            egui::Panel::bottom("android_safe_bottom")
+                .exact_size(safe_b)
+                .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(16, 19, 25)))
+                .show(ui, |_| {});
+        }
+        if safe_l > 0.5 {
+            egui::Panel::left("android_safe_left")
+                .exact_size(safe_l)
+                .resizable(false)
+                .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(13, 16, 22)))
+                .show(ui, |_| {});
+        }
+        if safe_r > 0.5 {
+            egui::Panel::right("android_safe_right")
+                .exact_size(safe_r)
+                .resizable(false)
+                .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(13, 16, 22)))
+                .show(ui, |_| {});
         }
 
         let mut dirty = false;
@@ -2325,6 +2410,121 @@ fn dist_point_to_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
 
 #[cfg(target_os = "android")]
 static ANDROID_BASE_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "android")]
+static ANDROID_APP: std::sync::OnceLock<winit::platform::android::activity::AndroidApp> =
+    std::sync::OnceLock::new();
+
+#[cfg(target_os = "android")]
+static SYSTEM_BARS_CLASS: std::sync::OnceLock<jni::objects::GlobalRef> =
+    std::sync::OnceLock::new();
+
+#[cfg(target_os = "android")]
+const SYSTEM_BARS_DEX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/classes.dex"));
+
+#[cfg(target_os = "android")]
+fn android_system_bars_class<'a>(
+    env: &mut jni::JNIEnv<'a>,
+) -> jni::errors::Result<&'static jni::objects::GlobalRef> {
+    if let Some(cls) = SYSTEM_BARS_CLASS.get() {
+        return Ok(cls);
+    }
+    let byte_buffer = unsafe {
+        env.new_direct_byte_buffer(SYSTEM_BARS_DEX.as_ptr() as *mut u8, SYSTEM_BARS_DEX.len())
+    }?;
+    let loader = env.new_object(
+        "dalvik/system/InMemoryDexClassLoader",
+        "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V",
+        &[
+            jni::objects::JValueGen::Object(&jni::objects::JObject::from(byte_buffer)),
+            jni::objects::JValueGen::Object(&jni::objects::JObject::null()),
+        ],
+    )?;
+    let class_name = env.new_string("dev.aethravox.forja3d.SystemBarsHelper")?;
+    let cls_obj = env
+        .call_method(
+            &loader,
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[jni::objects::JValueGen::Object(&jni::objects::JObject::from(
+                class_name,
+            ))],
+        )?
+        .l()?;
+    let global = env.new_global_ref(cls_obj)?;
+    Ok(SYSTEM_BARS_CLASS.get_or_init(|| global))
+}
+
+#[cfg(target_os = "android")]
+fn android_enable_immersive() {
+    let _ = robius_android_env::with_activity(|env, activity| {
+        if let Ok(cls) = android_system_bars_class(env) {
+            let _ = env.call_static_method(
+                cls,
+                "enableImmersive",
+                "(Landroid/app/Activity;)V",
+                &[jni::objects::JValueGen::Object(activity)],
+            );
+        }
+    });
+}
+
+#[cfg(target_os = "android")]
+fn android_safe_insets_dp(ctx: &egui::Context, screen_rect: egui::Rect) -> [f32; 4] {
+    let ppp = ctx.pixels_per_point().max(1.0);
+    let jni_px = robius_android_env::with_activity(|env, activity| -> [i32; 4] {
+        let Ok(cls) = android_system_bars_class(env) else {
+            return [0; 4];
+        };
+        let Ok(val) = env.call_static_method(
+            cls,
+            "getSafeInsetsPx",
+            "(Landroid/app/Activity;)[I",
+            &[jni::objects::JValueGen::Object(activity)],
+        ) else {
+            return [0; 4];
+        };
+        let Ok(obj) = val.l() else {
+            return [0; 4];
+        };
+        if obj.is_null() {
+            return [0; 4];
+        }
+        let arr: jni::objects::JIntArray<'_> = obj.into();
+        let mut buf = [0_i32; 4];
+        let _ = env.get_int_array_region(&arr, 0, &mut buf);
+        buf
+    })
+    .unwrap_or([0; 4]);
+
+    let mut left_px = jni_px[0].max(0) as f32;
+    let mut top_px = jni_px[1].max(0) as f32;
+    let mut right_px = jni_px[2].max(0) as f32;
+    let mut bottom_px = jni_px[3].max(0) as f32;
+
+    if let Some(app) = ANDROID_APP.get() {
+        let cr = app.content_rect();
+        let phys_w = screen_rect.width() * ppp;
+        let phys_h = screen_rect.height() * ppp;
+        if cr.right > cr.left && cr.bottom > cr.top && phys_w > 0.0 && phys_h > 0.0 {
+            let cr_l = (cr.left.max(0) as f32).min(phys_w * 0.25);
+            let cr_t = (cr.top.max(0) as f32).min(phys_h * 0.25);
+            let cr_r = ((phys_w - cr.right as f32).max(0.0)).min(phys_w * 0.25);
+            let cr_b = ((phys_h - cr.bottom as f32).max(0.0)).min(phys_h * 0.25);
+            left_px = left_px.max(cr_l);
+            top_px = top_px.max(cr_t);
+            right_px = right_px.max(cr_r);
+            bottom_px = bottom_px.max(cr_b);
+        }
+    }
+
+    [
+        (left_px / ppp).min(screen_rect.width() * 0.2),
+        (top_px / ppp).min(screen_rect.height() * 0.2),
+        (right_px / ppp).min(screen_rect.width() * 0.2),
+        (bottom_px / ppp).min(screen_rect.height() * 0.2),
+    ]
+}
 
 #[cfg(target_os = "android")]
 fn android_storage_root() -> std::path::PathBuf {
@@ -2572,6 +2772,13 @@ mod wasm_entry {
 #[cfg(target_os = "android")]
 #[no_mangle]
 pub extern "C" fn android_main(app: winit::platform::android::activity::AndroidApp) {
+    let _ = ANDROID_APP.set(app.clone());
+    app.set_window_flags(
+        winit::platform::android::activity::WindowManagerFlags::FULLSCREEN
+            | winit::platform::android::activity::WindowManagerFlags::LAYOUT_IN_SCREEN,
+        winit::platform::android::activity::WindowManagerFlags::empty(),
+    );
+    android_enable_immersive();
     if let Some(root) = app.external_data_path().or_else(|| app.internal_data_path()) {
         let _ = std::fs::create_dir_all(root.join("imports"));
         let _ = std::fs::create_dir_all(root.join("exports"));
