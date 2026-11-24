@@ -1,6 +1,6 @@
 use forja3d::{
-    ColliderShape, ColliderSpec, Model, PartSpec, PhysicsSpec, PrimitiveKind, RigidBodyKind,
-    SceneDocument,
+    ColliderShape, ColliderSpec, Model, PartSpec, PhysicsAsset, PhysicsSpec, PrimitiveKind,
+    RigidBodyKind, SceneDocument,
 };
 use forja3d_physics::PhysicsWorld;
 
@@ -100,3 +100,39 @@ fn raycast_hits_spawned_f3d_collider() {
     assert!((hit.distance - 4.1).abs() < 0.25, "hit distance {}", hit.distance);
     assert!(hit.normal[2] > 0.9);
 }
+
+#[test]
+fn spawn_from_f3p_bytes_sets_gravity_and_simulates() {
+    let mut asset = PhysicsAsset::new(
+        "CapsulaLunar",
+        PhysicsSpec {
+            body_kind: RigidBodyKind::Dynamic,
+            mass: 2.0,
+            friction: 0.5,
+            restitution: 0.6,
+            linear_damping: 0.01,
+            gravity_scale: 1.0,
+            colliders: vec![ColliderSpec {
+                part_hash: 42,
+                offset: [0.0, 0.0, 0.0],
+                shape: ColliderShape::Sphere { radius: 0.5 },
+            }],
+        },
+    );
+    asset.gravity = [0.0, -5.0, 0.0];
+    let f3p_bytes = asset.to_bytes();
+
+    let mut world = PhysicsWorld::new();
+    let handle = world
+        .spawn_from_f3p_bytes(&f3p_bytes, [0.0, 2.5, 0.0])
+        .expect("valid .f3p should spawn");
+    assert_eq!(world.gravity, [0.0, -5.0, 0.0]);
+
+    for _ in 0..120 {
+        world.step(1.0 / 60.0);
+    }
+    let b = world.body(handle).unwrap();
+    assert_eq!(b.name, "CapsulaLunar");
+    assert!(b.position[1] >= 0.45 && b.position[1] < 2.5);
+}
+

@@ -3,9 +3,11 @@ mod renderer;
 
 use eframe::egui;
 use forja3d::{
-    default_extrude_profile, default_lathe_profile, format::fnv1a_32, ColliderShape, Model,
-    PartSpec, PrimitiveKind, RigidBodyKind, RustExportTarget, SceneDocument, ShadingMode,
-    FLAG_COMPACT, FLAG_PHYSICS,
+    default_extrude_profile, default_lathe_profile, format::fnv1a_32, AnimationClip,
+    AnimationProperty, AnimationSet, AnimationTrack, ColliderShape, Document2D, InterpolationMode,
+    Keyframe, Model, PartSpec, PhysicsAsset, PrimitiveKind, RigidBodyKind, RustExportTarget,
+    SceneDocument, ShadingMode, SpriteQuad2D, Texture, F2D_MAGIC, F3A_MAGIC, F3P_MAGIC,
+    F3T_MAGIC, FLAG_COMPACT, FLAG_PHYSICS,
 };
 use forja3d_physics::{BodyHandle, PhysicsWorld};
 use renderer::{ray_intersects_aabb, GlViewportRenderer, OrbitCamera};
@@ -16,6 +18,7 @@ const MAX_UNDO_HISTORY: usize = 60;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExportTab {
     F3dBinary,
+    AssetFormats,
     RustSource,
     WavefrontObj,
 }
@@ -296,7 +299,11 @@ impl StudioApp {
         base_dir: Option<&std::path::Path>,
     ) {
         let lower = filename.unwrap_or("").to_ascii_lowercase();
-        let is_f3d_magic = bytes.len() >= 4 && &bytes[0..4] == &forja3d::MAGIC;
+        let is_f3d_magic = bytes.len() >= 4 && bytes[0..4] == forja3d::MAGIC;
+        let is_f3p_magic = bytes.len() >= 4 && bytes[0..4] == F3P_MAGIC;
+        let is_f3a_magic = bytes.len() >= 4 && bytes[0..4] == F3A_MAGIC;
+        let is_f2d_magic = bytes.len() >= 4 && bytes[0..4] == F2D_MAGIC;
+        let is_f3t_magic = bytes.len() >= 4 && bytes[0..4] == F3T_MAGIC;
         let is_glb_magic = bytes.len() >= 4 && &bytes[0..4] == b"glTF";
         let is_gltf = lower.ends_with(".glb") || lower.ends_with(".gltf") || is_glb_magic;
 
@@ -332,6 +339,100 @@ impl StudioApp {
                     self.status_note = format!("Error al importar .f3d: {err}");
                 }
             }
+        } else if is_f3p_magic || lower.ends_with(".f3p") {
+            match PhysicsAsset::from_bytes(bytes) {
+                Ok(asset) => {
+                    self.push_undo();
+                    let kind_label = asset.spec.body_kind.label();
+                    let collider_count = asset.spec.colliders.len();
+                    let mass = asset.spec.mass;
+                    self.scene.physics_enabled = true;
+                    self.scene.physics = asset.spec;
+                    self.rebuild_outputs();
+                    let src = filename.unwrap_or(&asset.name);
+                    self.status_note = format!(
+                        "Físicas .f3p '{src}' aplicadas ({kind_label}, {mass:.1} kg, {collider_count} colisionadores)"
+                    );
+                }
+                Err(err) => {
+                    self.status_note = format!("Error al importar .f3p: {err}");
+                }
+            }
+        } else if is_f3a_magic || lower.ends_with(".f3a") {
+            match AnimationSet::from_bytes(bytes) {
+                Ok(anim) => {
+                    let tracks: usize = anim.clips.iter().map(|c| c.tracks.len()).sum();
+                    let kf = anim.total_keyframes();
+                    let src = filename.unwrap_or(&anim.name);
+                    self.status_note = format!(
+                        "Animación .f3a '{src}' válida ({} clips, {tracks} pistas, {kf} keyframes)",
+                        anim.clips.len()
+                    );
+                }
+                Err(err) => {
+                    self.status_note = format!("Error al importar .f3a: {err}");
+                }
+            }
+        } else if is_f2d_magic || lower.ends_with(".f2d") {
+            match Document2D::from_bytes(bytes) {
+                Ok(doc) => {
+                    let pt_count = doc.primary_profile().map_or(0, |p| p.len());
+                    if let Some(pts) = doc.primary_profile() {
+                        if pts.len() >= 3 {
+                            self.push_undo();
+                            let applied_existing = match self.selection {
+                                Some(Selection::Part(idx)) => {
+                                    if let Some(part) = self.scene.parts.get_mut(idx) {
+                                        if part.kind.uses_profile() {
+                                            part.profile = pts.to_vec();
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                }
+                                _ => false,
+                            };
+                            if !applied_existing {
+                                let mut part = PartSpec::new(
+                                    format!("perfil_{}", self.scene.parts.len() + 1),
+                                    PrimitiveKind::Extrude,
+                                );
+                                part.profile = pts.to_vec();
+                                self.scene.parts.push(part);
+                                self.selection = Some(Selection::Part(self.scene.parts.len() - 1));
+                            }
+                            self.rebuild_outputs();
+                        }
+                    }
+                    let src = filename.unwrap_or(&doc.name);
+                    self.status_note = format!(
+                        "Vector .f2d '{src}' aplicado ({} rutas, {pt_count} pts, {} sprites)",
+                        doc.paths.len(),
+                        doc.sprites.len()
+                    );
+                }
+                Err(err) => {
+                    self.status_note = format!("Error al importar .f2d: {err}");
+                }
+            }
+        } else if is_f3t_magic || lower.ends_with(".f3t") {
+            match Texture::from_bytes(bytes) {
+                Ok(tex) => {
+                    let src = filename.unwrap_or(&tex.name);
+                    self.status_note = format!(
+                        "Textura .f3t '{src}' válida ({}x{} px, {} bytes)",
+                        tex.width,
+                        tex.height,
+                        tex.data.len()
+                    );
+                }
+                Err(err) => {
+                    self.status_note = format!("Error al importar .f3t: {err}");
+                }
+            }
         } else {
             match gltf_import::import_gltf_or_glb(filename, bytes, base_dir) {
                 Ok(scene) => {
@@ -356,6 +457,137 @@ impl StudioApp {
                 }
             }
         }
+    }
+
+    fn build_physics_asset(&self) -> PhysicsAsset {
+        PhysicsAsset::from_model(&self.baked_model)
+    }
+
+    fn build_animation_asset(&self) -> AnimationSet {
+        let mut set = AnimationSet::new(self.scene.model_name.clone());
+        let mut clip = AnimationClip::new("Idle", 2.0, true);
+        let mut added = 0usize;
+        for part in self.scene.parts.iter().filter(|p| p.visible).take(6) {
+            let mut pos_track = AnimationTrack::new(
+                part.name.clone(),
+                AnimationProperty::Translation,
+                InterpolationMode::Linear,
+            );
+            let p = part.position;
+            pos_track.keyframes.push(Keyframe {
+                time: 0.0,
+                value: [p[0], p[1], p[2], 0.0],
+            });
+            pos_track.keyframes.push(Keyframe {
+                time: 1.0,
+                value: [p[0], p[1] + 0.15, p[2], 0.0],
+            });
+            pos_track.keyframes.push(Keyframe {
+                time: 2.0,
+                value: [p[0], p[1], p[2], 0.0],
+            });
+            clip.tracks.push(pos_track);
+
+            let mut rot_track = AnimationTrack::new(
+                part.name.clone(),
+                AnimationProperty::Rotation,
+                InterpolationMode::Linear,
+            );
+            rot_track.keyframes.push(Keyframe {
+                time: 0.0,
+                value: [0.0, 0.0, 0.0, 1.0],
+            });
+            rot_track.keyframes.push(Keyframe {
+                time: 1.0,
+                value: [0.0, 0.38268343, 0.0, 0.9238795],
+            });
+            rot_track.keyframes.push(Keyframe {
+                time: 2.0,
+                value: [0.0, 0.0, 0.0, 1.0],
+            });
+            clip.tracks.push(rot_track);
+            added += 1;
+        }
+        if added == 0 {
+            let mut root = AnimationTrack::new(
+                self.scene.model_name.clone(),
+                AnimationProperty::Translation,
+                InterpolationMode::Linear,
+            );
+            root.keyframes.push(Keyframe {
+                time: 0.0,
+                value: [0.0, 0.0, 0.0, 0.0],
+            });
+            root.keyframes.push(Keyframe {
+                time: 2.0,
+                value: [0.0, 0.0, 0.0, 0.0],
+            });
+            clip.tracks.push(root);
+        }
+        set.clips.push(clip);
+        set
+    }
+
+    fn build_2d_asset(&self) -> Document2D {
+        let (profile_name, points, closed) = match self.selection {
+            Some(Selection::Part(idx)) => match self.scene.parts.get(idx) {
+                Some(part) if !part.profile.is_empty() => (
+                    part.name.clone(),
+                    part.profile.clone(),
+                    part.kind != PrimitiveKind::Lathe,
+                ),
+                _ => (
+                    format!("{}_perfil", self.scene.model_name),
+                    default_extrude_profile(),
+                    true,
+                ),
+            },
+            _ => (
+                format!("{}_perfil", self.scene.model_name),
+                default_extrude_profile(),
+                true,
+            ),
+        };
+        let mut doc = Document2D::from_profile(profile_name, points, closed);
+        for part in self.scene.parts.iter().filter(|p| p.visible).take(16) {
+            doc.sprites.push(SpriteQuad2D {
+                name: part.name.clone(),
+                position: [part.position[0], part.position[1]],
+                size: [part.scale[0].abs().max(0.1), part.scale[1].abs().max(0.1)],
+                rotation_deg: part.rotation_deg[2],
+                uv_rect: [0.0, 0.0, 1.0, 1.0],
+                tint: part.color,
+            });
+        }
+        doc
+    }
+
+    fn build_texture_asset(&self) -> Texture {
+        const SIZE: u16 = 16;
+        let palette: Vec<[u8; 4]> = if self.scene.parts.is_empty() {
+            vec![[224, 159, 62, 255], [56, 189, 248, 255]]
+        } else {
+            self.scene.parts.iter().map(|p| p.color).collect()
+        };
+        let mut rgba = Vec::with_capacity((SIZE as usize) * (SIZE as usize) * 4);
+        for y in 0..SIZE as usize {
+            for x in 0..SIZE as usize {
+                let idx = ((x / 4) + (y / 4) * 4) % palette.len();
+                let mut c = palette[idx];
+                if (x + y) % 2 == 0 {
+                    c[0] = c[0].saturating_add(10);
+                    c[1] = c[1].saturating_add(10);
+                    c[2] = c[2].saturating_add(10);
+                }
+                rgba.extend_from_slice(&c);
+            }
+        }
+        Texture::new_rgba(
+            format!("{}_albedo", self.scene.model_name),
+            SIZE,
+            SIZE,
+            rgba,
+        )
     }
 
     fn load_preset(&mut self, scene: SceneDocument) {
@@ -480,11 +712,11 @@ impl StudioApp {
                 self.request_import(ui.ctx(), ".glb,.gltf");
             }
             if ui
-                .add_sized([92.0, btn_h], egui::Button::new("Abrir .f3d"))
-                .on_hover_text("Importar archivo .f3d / .glb / .gltf")
+                .add_sized([96.0, btn_h], egui::Button::new("Abrir .f3*"))
+                .on_hover_text("Importar .f3d / .f3a / .f3p / .f2d / .f3t / .glb / .gltf")
                 .clicked()
             {
-                self.request_import(ui.ctx(), ".f3d,.glb,.gltf");
+                self.request_import(ui.ctx(), ".f3d,.f3a,.f3p,.f2d,.f3t,.glb,.gltf");
             }
         });
 
@@ -1495,13 +1727,19 @@ impl StudioApp {
         }
 
         let btn_h = if compact { 34.0 } else { 24.0 };
-        let tab_w = if compact { 96.0 } else { 98.0 };
+        let tab_w = if compact { 88.0 } else { 92.0 };
         ui.horizontal_wrapped(|ui| {
             if ui
-                .add_sized([tab_w, btn_h], egui::Button::selectable(self.export_tab == ExportTab::F3dBinary, "Formato .f3d"))
+                .add_sized([tab_w, btn_h], egui::Button::selectable(self.export_tab == ExportTab::F3dBinary, "Modelo .f3d"))
                 .clicked()
             {
                 self.export_tab = ExportTab::F3dBinary;
+            }
+            if ui
+                .add_sized([tab_w, btn_h], egui::Button::selectable(self.export_tab == ExportTab::AssetFormats, "Assets .f3*"))
+                .clicked()
+            {
+                self.export_tab = ExportTab::AssetFormats;
             }
             if ui
                 .add_sized([tab_w, btn_h], egui::Button::selectable(self.export_tab == ExportTab::RustSource, "Código .rs"))
@@ -1647,6 +1885,205 @@ impl StudioApp {
                     .corner_radius(4.0)
                     .show(ui, |ui| {
                         ui.add(egui::Label::new(egui::RichText::new(hex_preview).monospace().size(11.0)));
+                    });
+            }
+            ExportTab::AssetFormats => {
+                let base_name = self.scene.model_name.to_lowercase();
+                let phys_asset = self.build_physics_asset();
+                let phys_bytes = phys_asset.to_bytes();
+                let anim_asset = self.build_animation_asset();
+                let anim_bytes = anim_asset.to_bytes();
+                let doc2d = self.build_2d_asset();
+                let f2d_bytes = doc2d.to_bytes();
+                let tex_asset = self.build_texture_asset();
+                let f3t_bytes = tex_asset.to_bytes();
+
+                egui::ScrollArea::vertical()
+                    .id_salt("assets_f3_scroll")
+                    .show(ui, |ui| {
+                        let card_fill = egui::Color32::from_rgb(22, 26, 35);
+
+                        // .f3p Physics
+                        egui::Frame::new()
+                            .fill(card_fill)
+                            .inner_margin(8.0)
+                            .corner_radius(6.0)
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new(".f3p · Físicas (F3P1)").strong());
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} · {:.1} kg · {} colisionadores · {} B",
+                                        phys_asset.spec.body_kind.label(),
+                                        phys_asset.spec.mass,
+                                        phys_asset.spec.colliders.len(),
+                                        phys_bytes.len()
+                                    ))
+                                    .size(11.5)
+                                    .color(egui::Color32::from_gray(180)),
+                                );
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.add_sized([114.0, btn_h], egui::Button::new("Descargar .f3p")).clicked() {
+                                        let file = format!("{base_name}.f3p");
+                                        match trigger_download(&file, &phys_bytes, "application/octet-stream") {
+                                            Ok(Some(saved)) => self.status_note = format!("Guardado: {saved}"),
+                                            Ok(None) => self.status_note = format!("Exportado {file} ({} B)", phys_bytes.len()),
+                                            Err(err) => self.status_note = err,
+                                        }
+                                    }
+                                    if ui.add_sized([102.0, btn_h], egui::Button::new("Importar .f3p")).clicked() {
+                                        self.request_import(ui.ctx(), ".f3p");
+                                    }
+                                    if ui.add_sized([110.0, btn_h], egui::Button::new("Probar .f3p")).clicked() {
+                                        match PhysicsAsset::from_bytes(&phys_bytes) {
+                                            Ok(dec) => {
+                                                self.status_note = format!(
+                                                    "Roundtrip .f3p OK ({} colisionadores)",
+                                                    dec.spec.colliders.len()
+                                                );
+                                            }
+                                            Err(err) => self.status_note = format!("Error .f3p: {err}"),
+                                        }
+                                    }
+                                });
+                            });
+                        ui.add_space(6.0);
+
+                        // .f3a Animation
+                        egui::Frame::new()
+                            .fill(card_fill)
+                            .inner_margin(8.0)
+                            .corner_radius(6.0)
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new(".f3a · Animación (F3A1)").strong());
+                                let track_count: usize =
+                                    anim_asset.clips.iter().map(|c| c.tracks.len()).sum();
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} clip · {track_count} pistas · {} keyframes · {} B",
+                                        anim_asset.clips.len(),
+                                        anim_asset.total_keyframes(),
+                                        anim_bytes.len()
+                                    ))
+                                    .size(11.5)
+                                    .color(egui::Color32::from_gray(180)),
+                                );
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.add_sized([114.0, btn_h], egui::Button::new("Descargar .f3a")).clicked() {
+                                        let file = format!("{base_name}.f3a");
+                                        match trigger_download(&file, &anim_bytes, "application/octet-stream") {
+                                            Ok(Some(saved)) => self.status_note = format!("Guardado: {saved}"),
+                                            Ok(None) => self.status_note = format!("Exportado {file} ({} B)", anim_bytes.len()),
+                                            Err(err) => self.status_note = err,
+                                        }
+                                    }
+                                    if ui.add_sized([102.0, btn_h], egui::Button::new("Importar .f3a")).clicked() {
+                                        self.request_import(ui.ctx(), ".f3a");
+                                    }
+                                    if ui.add_sized([110.0, btn_h], egui::Button::new("Probar .f3a")).clicked() {
+                                        match AnimationSet::from_bytes(&anim_bytes) {
+                                            Ok(dec) => {
+                                                self.status_note = format!(
+                                                    "Roundtrip .f3a OK ({} keyframes)",
+                                                    dec.total_keyframes()
+                                                );
+                                            }
+                                            Err(err) => self.status_note = format!("Error .f3a: {err}"),
+                                        }
+                                    }
+                                });
+                            });
+                        ui.add_space(6.0);
+
+                        // .f2d Vector Profile / Sprites
+                        egui::Frame::new()
+                            .fill(card_fill)
+                            .inner_margin(8.0)
+                            .corner_radius(6.0)
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new(".f2d · Vector 2D / Sprites (F2D1)").strong());
+                                let pts = doc2d.primary_profile().map_or(0, |p| p.len());
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} ruta ({pts} pts) · {} sprites · {} B",
+                                        doc2d.paths.len(),
+                                        doc2d.sprites.len(),
+                                        f2d_bytes.len()
+                                    ))
+                                    .size(11.5)
+                                    .color(egui::Color32::from_gray(180)),
+                                );
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.add_sized([114.0, btn_h], egui::Button::new("Descargar .f2d")).clicked() {
+                                        let file = format!("{base_name}.f2d");
+                                        match trigger_download(&file, &f2d_bytes, "application/octet-stream") {
+                                            Ok(Some(saved)) => self.status_note = format!("Guardado: {saved}"),
+                                            Ok(None) => self.status_note = format!("Exportado {file} ({} B)", f2d_bytes.len()),
+                                            Err(err) => self.status_note = err,
+                                        }
+                                    }
+                                    if ui.add_sized([102.0, btn_h], egui::Button::new("Importar .f2d")).clicked() {
+                                        self.request_import(ui.ctx(), ".f2d");
+                                    }
+                                    if ui.add_sized([110.0, btn_h], egui::Button::new("Probar .f2d")).clicked() {
+                                        match Document2D::from_bytes(&f2d_bytes) {
+                                            Ok(dec) => {
+                                                self.status_note = format!(
+                                                    "Roundtrip .f2d OK ({} rutas, {} sprites)",
+                                                    dec.paths.len(),
+                                                    dec.sprites.len()
+                                                );
+                                            }
+                                            Err(err) => self.status_note = format!("Error .f2d: {err}"),
+                                        }
+                                    }
+                                });
+                            });
+                        ui.add_space(6.0);
+
+                        // .f3t Texture
+                        egui::Frame::new()
+                            .fill(card_fill)
+                            .inner_margin(8.0)
+                            .corner_radius(6.0)
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new(".f3t · Textura RGBA8 (F3T1)").strong());
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{}x{} px · paleta escena · {} B",
+                                        tex_asset.width,
+                                        tex_asset.height,
+                                        f3t_bytes.len()
+                                    ))
+                                    .size(11.5)
+                                    .color(egui::Color32::from_gray(180)),
+                                );
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.add_sized([114.0, btn_h], egui::Button::new("Descargar .f3t")).clicked() {
+                                        let file = format!("{base_name}.f3t");
+                                        match trigger_download(&file, &f3t_bytes, "application/octet-stream") {
+                                            Ok(Some(saved)) => self.status_note = format!("Guardado: {saved}"),
+                                            Ok(None) => self.status_note = format!("Exportado {file} ({} B)", f3t_bytes.len()),
+                                            Err(err) => self.status_note = err,
+                                        }
+                                    }
+                                    if ui.add_sized([102.0, btn_h], egui::Button::new("Importar .f3t")).clicked() {
+                                        self.request_import(ui.ctx(), ".f3t");
+                                    }
+                                    if ui.add_sized([110.0, btn_h], egui::Button::new("Probar .f3t")).clicked() {
+                                        match Texture::from_bytes(&f3t_bytes) {
+                                            Ok(dec) => {
+                                                self.status_note = format!(
+                                                    "Roundtrip .f3t OK ({}x{}, {} B)",
+                                                    dec.width,
+                                                    dec.height,
+                                                    dec.data.len()
+                                                );
+                                            }
+                                            Err(err) => self.status_note = format!("Error .f3t: {err}"),
+                                        }
+                                    }
+                                });
+                            });
                     });
             }
             ExportTab::RustSource => {
@@ -2549,8 +2986,8 @@ impl StudioApp {
                 .filter(|s| !s.is_empty())
                 .collect();
             let picked = rfd::FileDialog::new()
-                .set_title("Importar modelo (.glb / .gltf / .f3d)")
-                .add_filter("Modelos 3D", &exts)
+                .set_title("Importar Forja3D (.f3d / .f3a / .f3p / .f2d / .f3t / .glb)")
+                .add_filter("Assets Forja3D & 3D", &exts)
                 .pick_file();
             if let Some(path) = picked {
                 match std::fs::read(&path) {
@@ -2578,7 +3015,7 @@ impl StudioApp {
             let ctx_clone = ctx.clone();
 
             let res = robius_file_picker::FileDialog::new()
-                .set_title("Importar modelo (.glb / .gltf / .f3d)")
+                .set_title("Importar Forja3D (.f3d / .f3a / .f3p / .f2d / .f3t / .glb)")
                 .set_mime_type("*/*")
                 .pick_file(move |result| {
                     match result {

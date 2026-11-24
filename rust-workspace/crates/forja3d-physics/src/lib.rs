@@ -4,7 +4,8 @@ extern crate alloc;
 
 use alloc::{string::String, vec, vec::Vec};
 use forja3d::{
-    math::sqrtf, Aabb, ColliderShape, ColliderSpec, Model, PhysicsSpec, RigidBodyKind, Vec3,
+    math::sqrtf, Aabb, ColliderShape, ColliderSpec, DecodeError, Model, PhysicsAsset, PhysicsSpec,
+    RigidBodyKind, Vec3,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -127,6 +128,10 @@ impl RigidBody {
         }
     }
 
+    pub fn from_physics_asset(asset: &PhysicsAsset, position: [f32; 3]) -> Self {
+        Self::from_physics_spec(asset.name.clone(), position, &asset.spec, Aabb::EMPTY)
+    }
+
     pub fn world_aabb(&self) -> Aabb {
         let mut out = Aabb::EMPTY;
         for c in &self.colliders {
@@ -189,6 +194,27 @@ impl PhysicsWorld {
     pub fn spawn_from_model(&mut self, model: &Model, position: [f32; 3]) -> BodyHandle {
         let body = RigidBody::from_model(model, position);
         self.add_body(body)
+    }
+
+    /// Spawn a standalone `.f3p` `PhysicsAsset` directly.
+    pub fn spawn_from_physics_asset(
+        &mut self,
+        asset: &PhysicsAsset,
+        position: [f32; 3],
+    ) -> BodyHandle {
+        let body = RigidBody::from_physics_asset(asset, position);
+        self.add_body(body)
+    }
+
+    /// Decode a `.f3p` binary stream, apply its gravity vector, and spawn the rigid body.
+    pub fn spawn_from_f3p_bytes(
+        &mut self,
+        bytes: &[u8],
+        position: [f32; 3],
+    ) -> Result<BodyHandle, DecodeError> {
+        let asset = PhysicsAsset::from_bytes(bytes)?;
+        self.gravity = asset.gravity;
+        Ok(self.spawn_from_physics_asset(&asset, position))
     }
 
     pub fn add_static_box(

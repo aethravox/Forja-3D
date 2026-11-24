@@ -570,7 +570,7 @@ impl fmt::Display for DecodeError {
 
 impl core::error::Error for DecodeError {}
 
-fn encode_physics(payload: &mut Vec<u8>, phys: &PhysicsSpec) {
+pub(crate) fn encode_physics(payload: &mut Vec<u8>, phys: &PhysicsSpec) {
     payload.push(phys.body_kind as u8);
     payload.extend_from_slice(&phys.mass.to_le_bytes());
     payload.extend_from_slice(&phys.friction.to_le_bytes());
@@ -605,7 +605,7 @@ fn encode_physics(payload: &mut Vec<u8>, phys: &PhysicsSpec) {
     }
 }
 
-fn decode_physics(cursor: &mut Cursor<'_>) -> Result<PhysicsSpec, DecodeError> {
+pub(crate) fn decode_physics(cursor: &mut Cursor<'_>) -> Result<PhysicsSpec, DecodeError> {
     let kind_raw = cursor.take(1)?[0];
     let body_kind = RigidBodyKind::from_u8(kind_raw).ok_or(DecodeError::InvalidPhysicsData)?;
     let mass = cursor.read_f32()?;
@@ -668,24 +668,24 @@ fn round_to_i8(v: f32) -> i8 {
     r.clamp(-127, 127) as i8
 }
 
-fn write_str(buf: &mut Vec<u8>, s: &str) {
+pub(crate) fn write_str(buf: &mut Vec<u8>, s: &str) {
     let bytes = s.as_bytes();
     let len = bytes.len().min(u16::MAX as usize) as u16;
     buf.extend_from_slice(&len.to_le_bytes());
     buf.extend_from_slice(&bytes[..len as usize]);
 }
 
-struct Cursor<'a> {
+pub(crate) struct Cursor<'a> {
     data: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Cursor<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
         Self { data, pos: 0 }
     }
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
         let end = self.pos.checked_add(n).ok_or(DecodeError::UnexpectedEof)?;
         if end > self.data.len() {
             return Err(DecodeError::UnexpectedEof);
@@ -695,25 +695,25 @@ impl<'a> Cursor<'a> {
         Ok(slice)
     }
 
-    fn read_4(&mut self) -> Result<[u8; 4], DecodeError> {
+    pub(crate) fn read_4(&mut self) -> Result<[u8; 4], DecodeError> {
         let s = self.take(4)?;
         Ok([s[0], s[1], s[2], s[3]])
     }
 
-    fn read_u16(&mut self) -> Result<u16, DecodeError> {
+    pub(crate) fn read_u16(&mut self) -> Result<u16, DecodeError> {
         let s = self.take(2)?;
         Ok(u16::from_le_bytes([s[0], s[1]]))
     }
 
-    fn read_u32(&mut self) -> Result<u32, DecodeError> {
+    pub(crate) fn read_u32(&mut self) -> Result<u32, DecodeError> {
         Ok(u32::from_le_bytes(self.read_4()?))
     }
 
-    fn read_f32(&mut self) -> Result<f32, DecodeError> {
+    pub(crate) fn read_f32(&mut self) -> Result<f32, DecodeError> {
         Ok(f32::from_le_bytes(self.read_4()?))
     }
 
-    fn read_str(&mut self) -> Result<String, DecodeError> {
+    pub(crate) fn read_str(&mut self) -> Result<String, DecodeError> {
         let len = self.read_u16()? as usize;
         let bytes = self.take(len)?;
         let s = core::str::from_utf8(bytes).map_err(|_| DecodeError::InvalidUtf8)?;

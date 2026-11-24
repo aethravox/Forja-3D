@@ -1,6 +1,9 @@
 use forja3d::{
-    ColliderShape, DecodeError, Model, PartSpec, PrimitiveKind, RigidBodyKind, RustExportTarget,
-    SceneDocument, ShadingMode, FLAG_COMPACT, FLAG_PHYSICS, MAGIC,
+    default_extrude_profile, AnimationClip, AnimationProperty, AnimationSet, AnimationTrack,
+    ColliderShape, DecodeError, Document2D, InterpolationMode, Keyframe, Model, PartSpec,
+    PhysicsAsset, PrimitiveKind, RigidBodyKind, RustExportTarget, SceneDocument, ShadingMode,
+    SpriteQuad2D, Texture, F2D_MAGIC, F3A_MAGIC, F3P_MAGIC, F3T_MAGIC, FLAG_COMPACT, FLAG_PHYSICS,
+    MAGIC,
 };
 
 #[test]
@@ -194,3 +197,149 @@ fn f3d_without_physics_flag_decodes_physics_none_and_supports_with_auto_physics(
     assert!(matches!(phys.colliders[0].shape, ColliderShape::Box { .. }));
 }
 
+#[test]
+fn roundtrip_f3a_animation_and_sampling() {
+    let mut set = AnimationSet::new("DronAnim");
+    let mut clip = AnimationClip::new("Idle", 2.0, true);
+
+    let mut pos_track = AnimationTrack::new(
+        "chasis",
+        AnimationProperty::Translation,
+        InterpolationMode::Linear,
+    );
+    pos_track.keyframes.push(Keyframe {
+        time: 0.0,
+        value: [0.0, 0.0, 0.0, 0.0],
+    });
+    pos_track.keyframes.push(Keyframe {
+        time: 1.0,
+        value: [0.0, 2.0, 0.0, 0.0],
+    });
+    pos_track.keyframes.push(Keyframe {
+        time: 2.0,
+        value: [0.0, 0.0, 0.0, 0.0],
+    });
+
+    let mut rot_track = AnimationTrack::new(
+        "rotor",
+        AnimationProperty::Rotation,
+        InterpolationMode::Linear,
+    );
+    rot_track.keyframes.push(Keyframe {
+        time: 0.0,
+        value: [0.0, 0.0, 0.0, 1.0],
+    });
+    rot_track.keyframes.push(Keyframe {
+        time: 2.0,
+        value: [0.0, 1.0, 0.0, 0.0],
+    });
+
+    let mut scale_track = AnimationTrack::new(
+        "faro",
+        AnimationProperty::Scale,
+        InterpolationMode::Step,
+    );
+    scale_track.keyframes.push(Keyframe {
+        time: 0.0,
+        value: [1.0, 1.0, 1.0, 0.0],
+    });
+    scale_track.keyframes.push(Keyframe {
+        time: 1.0,
+        value: [2.0, 2.0, 2.0, 0.0],
+    });
+
+    clip.tracks.push(pos_track);
+    clip.tracks.push(rot_track);
+    clip.tracks.push(scale_track);
+    set.clips.push(clip);
+
+    let bytes = set.to_bytes();
+    assert_eq!(&bytes[0..4], &F3A_MAGIC);
+    let decoded = AnimationSet::from_bytes(&bytes).expect("valid .f3a should decode");
+    assert_eq!(decoded, set);
+    assert_eq!(decoded.total_keyframes(), 7);
+
+    let dec_clip = &decoded.clips[0];
+    assert!((dec_clip.wrap_time(2.5) - 0.5).abs() < 1e-5);
+    assert!((dec_clip.wrap_time(-0.25) - 1.75).abs() < 1e-5);
+
+    let sampled_pos = dec_clip.tracks[0].sample(0.5).unwrap();
+    assert!((sampled_pos[1] - 1.0).abs() < 1e-5);
+
+    let sampled_rot = dec_clip.tracks[1].sample(1.0).unwrap();
+    let q_len = (sampled_rot[0] * sampled_rot[0]
+        + sampled_rot[1] * sampled_rot[1]
+        + sampled_rot[2] * sampled_rot[2]
+        + sampled_rot[3] * sampled_rot[3])
+        .sqrt();
+    assert!((q_len - 1.0).abs() < 1e-4);
+
+    let sampled_scale = dec_clip.tracks[2].sample(0.9).unwrap();
+    assert_eq!(sampled_scale, [1.0, 1.0, 1.0, 0.0]);
+
+    let mut bad = bytes.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 0x55;
+    assert!(matches!(
+        AnimationSet::from_bytes(&bad),
+        Err(DecodeError::ChecksumMismatch { .. })
+    ));
+    bad[0] = b'Z';
+    assert_eq!(AnimationSet::from_bytes(&bad), Err(DecodeError::InvalidMagic));
+}
+
+#[test]
+fn roundtrip_f3p_physics_asset() {
+    let mut scene = SceneDocument::preset_drone();
+    scene.auto_generate_colliders();
+    let model = scene.bake();
+
+    let mut asset = PhysicsAsset::from_model(&model);
+    asset.gravity = [0.0, -3.72, 0.0];
+    let bytes = asset.to_bytes();
+    assert_eq!(&bytes[0..4], &F3P_MAGIC);
+
+    let decoded = PhysicsAsset::from_bytes(&bytes).expect("valid .f3p should decode");
+    assert_eq!(decoded, asset);
+    assert!(!decoded.spec.colliders.is_empty());
+
+    let mut bad = bytes.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 0xFF;
+    assert!(matches!(
+        PhysicsAsset::from_bytes(&bad),
+        Err(DecodeError::ChecksumMismatch { .. })
+    ));
+}
+
+#[test]
+fn roundtrip_f2d_document_and_f3t_texture() {
+    let profile = default_extrude_profile();
+    let mut doc = Document2D::from_profile("PerfilAla", profile.clone(), true);
+    doc.sprites.push(SpriteQuad2D {
+        name: String::from("icono"),
+        position: [0.25, -0.5],
+        size: [0.8, 0.4],
+        rotation_deg: 15.0,
+        ..SpriteQuad2D::default()
+    });
+
+    let f2d_bytes = doc.to_bytes();
+    assert_eq!(&f2d_bytes[0..4], &F2D_MAGIC);
+    let dec_doc = Document2D::from_bytes(&f2d_bytes).expect("valid .f2d should decode");
+    assert_eq!(dec_doc, doc);
+    assert_eq!(dec_doc.primary_profile(), Some(profile.as_slice()));
+
+    let tex = Texture::new_rgba(
+        "metal_albedo",
+        2,
+        2,
+        vec![
+            255, 128, 0, 255, 128, 255, 0, 255, 0, 128, 255, 255, 255, 255, 255, 255,
+        ],
+    );
+    let f3t_bytes = tex.to_bytes();
+    assert_eq!(&f3t_bytes[0..4], &F3T_MAGIC);
+    let dec_tex = Texture::from_bytes(&f3t_bytes).expect("valid .f3t should decode");
+    assert_eq!(dec_tex, tex);
+}

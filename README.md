@@ -4,9 +4,9 @@ Motor y editor visual 3D multiplataforma escrito 100% en Rust (`#![no_std]` en e
 
 ## Crates del Workspace
 
-- **`forja3d`** (`rust-workspace/crates/forja3d`): Formato binario `.f3d` (`F3D1`) con modo estándar, compacto (`FLAG_COMPACT`, 17 B/vértice) y físicas embebidas (`FLAG_PHYSICS`), checksum FNV-1a, primitivas procedurales, extrusión, revolución (*lathe*), sombreado `Flat`/`Smooth` y exportadores a código `.rs` y Wavefront `.obj`. **Cero dependencias externas** (`#![no_std]` + `alloc`).
-- **`forja3d-physics`** (`rust-workspace/crates/forja3d-physics`): Motor de físicas 3D `#![no_std]` **sin dependencias externas** nativo para modelos `.f3d` (`Box`, `Sphere`, `Capsule`, cuerpos `Dynamic`/`Static`/`Kinematic`/`Sensor`, impulsos y *raycast*).
-- **`forja3d-studio`** (`rust-workspace/crates/forja3d-studio`): Estudio de modelado y físicas 3D para **Windows, Linux, macOS, Android y WebAssembly**, con importador **`.glb`/`.gltf`** y `.f3d`, gizmo X/Y/Z, colisionadores, simulación en vivo, espejo de simetría, grupos y deshacer/rehacer.
+- **`forja3d`** (`rust-workspace/crates/forja3d`): Formatos binarios `#![no_std]` con checksum FNV-1a: **`.f3d`** (`F3D1` modelos estándar/compacto y físicas), **`.f3a`** (`F3A1` animación por keyframes y nlerp), **`.f3p`** (`F3P1` físicas/colisionadores independientes), **`.f2d`** (`F2D1` perfiles vectoriales 2D y sprites) y **`.f3t`** (`F3T1` texturas), además de primitivas procedurales, extrusión, revolución (*lathe*), sombreado `Flat`/`Smooth` y exportadores `.rs`/`.obj`. **Cero dependencias externas** (`#![no_std]` + `alloc`).
+- **`forja3d-physics`** (`rust-workspace/crates/forja3d-physics`): Motor de físicas 3D `#![no_std]` **sin dependencias externas** nativo para modelos `.f3d` y assets `.f3p` (`Box`, `Sphere`, `Capsule`, cuerpos `Dynamic`/`Static`/`Kinematic`/`Sensor`, impulsos y *raycast*).
+- **`forja3d-studio`** (`rust-workspace/crates/forja3d-studio`): Estudio de modelado y físicas 3D para **Windows, Linux, macOS, Android y WebAssembly**, con importador/exportador **`.f3d`, `.f3a`, `.f3p`, `.f2d`, `.f3t`** y **`.glb`/`.gltf`**, gizmo X/Y/Z, colisionadores, simulación en vivo, espejo de simetría, grupos y deshacer/rehacer.
 
 ## Compilación rápida
 
