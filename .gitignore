@@ -7,7 +7,15 @@ rust-workspace/target/
 .DS_Store
 *.log
 .env*
-!.env.example
 .aistudio/
+metadata.json
+server.ts
+package.json
+bun.lock
+index.html
+tsconfig.json
+vite.config.ts
+src/
+
 
 

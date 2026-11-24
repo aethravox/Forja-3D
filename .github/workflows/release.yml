@@ -157,25 +157,39 @@ jobs:
           sudo mv /tmp/wasm-bindgen-0.2.130-x86_64-unknown-linux-musl/wasm-bindgen /usr/local/bin/
           wasm-bindgen --version
 
-      - name: Build WASM cdylib
+      - name: Build WASM cdylib & standalone web package
         run: |
           cargo build --manifest-path rust-workspace/Cargo.toml -p forja3d-studio --lib --target wasm32-unknown-unknown --release
-          wasm-bindgen --out-dir src/wasm --target web rust-workspace/target/wasm32-unknown-unknown/release/forja3d_studio.wasm
-          tar -C src/wasm -czf forja3d-studio-wasm-pkg.tar.gz .
-
-      - name: Build Full Web Studio Static Bundle
-        uses: oven-sh/setup-bun@v2
-      - run: |
-          bun install --frozen-lockfile
-          bun run build
-          tar -C dist -czf forja3d-studio-web-dist.tar.gz .
+          mkdir -p wasm-dist
+          wasm-bindgen --out-dir wasm-dist --target web rust-workspace/target/wasm32-unknown-unknown/release/forja3d_studio.wasm
+          cat << 'EOF' > wasm-dist/index.html
+          <!doctype html>
+          <html lang="es">
+          <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+            <title>Forja3D Studio</title>
+            <style>
+              html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #0B0D11; }
+              canvas { width: 100%; height: 100%; display: block; outline: none; }
+            </style>
+          </head>
+          <body>
+            <canvas id="forja3d-canvas"></canvas>
+            <script type="module">
+              import init, { start_forja3d_canvas } from './forja3d_studio.js';
+              await init();
+              start_forja3d_canvas('forja3d-canvas');
+            </script>
+          </body>
+          </html>
+          EOF
+          tar -C wasm-dist -czf forja3d-studio-wasm-web.tar.gz .
 
       - uses: actions/upload-artifact@v4
         with:
           name: release-wasm
-          path: |
-            forja3d-studio-wasm-pkg.tar.gz
-            forja3d-studio-web-dist.tar.gz
+          path: forja3d-studio-wasm-web.tar.gz
 
   build-android:
     name: Build Android APK (arm64-v8a)

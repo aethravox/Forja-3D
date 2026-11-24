@@ -11,7 +11,7 @@ env:
 
 jobs:
   rust-tests:
-    name: Rust Tests & no_std Check
+    name: Rust Tests, no_std & WASM Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,12 +38,5 @@ jobs:
       - name: Check forja3d #![no_std] compatibility on wasm32
         run: cargo check --manifest-path rust-workspace/Cargo.toml -p forja3d --no-default-features --target wasm32-unknown-unknown
 
-  web-shell:
-    name: Web Shell TypeCheck & Vite Build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-      - run: bun install --frozen-lockfile
-      - run: bun run lint
-      - run: bun run build
+      - name: Check forja3d-studio wasm32 compilation
+        run: cargo check --manifest-path rust-workspace/Cargo.toml -p forja3d-studio --lib --target wasm32-unknown-unknown

@@ -1,6 +1,0 @@
-{
-  "name": "Forja3D",
-  "description": "Cross-platform Rust 3D modeling studio with custom .f3d binary format, zero-dependency loader crate, and direct .rs code export running in WebAssembly.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
