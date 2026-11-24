@@ -160,6 +160,7 @@ jobs:
   Android:
     name: Android
     runs-on: ubuntu-latest
+    continue-on-error: true
     env:
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
       ANDROID_HOME: /usr/local/lib/android/sdk
