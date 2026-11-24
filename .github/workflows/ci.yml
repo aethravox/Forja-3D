@@ -1,8 +1,10 @@
-name: CI Checks
+name: Forja3D CI & Builds
 
 on:
   push:
     branches: ["main"]
+    tags:
+      - "v*"
   pull_request:
     branches: ["main"]
   workflow_dispatch:
@@ -11,12 +13,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  rust-tests-and-wasm:
-    name: Rust Tests & WebAssembly Check
+  Test:
+    name: Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Linux graphics dev libs
         run: |
           sudo apt-get update
@@ -24,33 +25,52 @@ jobs:
             libxkbcommon-dev libwayland-dev libxrandr-dev libxi-dev \
             libxcursor-dev libgl1-mesa-dev libgtk-3-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev pkg-config
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust-workspace
-
       - name: Run workspace unit & integration tests
         run: cargo test --manifest-path rust-workspace/Cargo.toml --workspace
-
-      - name: Check forja3d #![no_std] on wasm32
+      - name: Check forja3d on wasm32
         run: cargo check --manifest-path rust-workspace/Cargo.toml -p forja3d --no-default-features --target wasm32-unknown-unknown
-
-      - name: Check forja3d-physics #![no_std] on wasm32
+      - name: Check forja3d-physics on wasm32
         run: cargo check --manifest-path rust-workspace/Cargo.toml -p forja3d-physics --no-default-features --target wasm32-unknown-unknown
-
       - name: Check forja3d-studio wasm32 compilation
         run: cargo check --manifest-path rust-workspace/Cargo.toml -p forja3d-studio --lib --target wasm32-unknown-unknown
 
-  build-linux:
-    name: Build Linux Desktop (x86_64)
+  Windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-workspace
+          key: windows-x64
+      - name: Build executable
+        run: cargo build --manifest-path rust-workspace/Cargo.toml -p forja3d-studio --bin forja3d-studio --release --target x86_64-pc-windows-msvc
+      - name: Package release zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist-win | Out-Null
+          Copy-Item rust-workspace/target/x86_64-pc-windows-msvc/release/forja3d-studio.exe dist-win/
+          Copy-Item rust-workspace/README.md dist-win/
+          Compress-Archive -Path dist-win/* -DestinationPath forja3d-studio-windows-x86_64.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Windows
+          path: forja3d-studio-windows-x86_64.zip
+
+  Linux:
+    name: Linux
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Linux graphics dev libs
         run: |
           sudo apt-get update
@@ -58,97 +78,138 @@ jobs:
             libxkbcommon-dev libwayland-dev libxrandr-dev libxi-dev \
             libxcursor-dev libgl1-mesa-dev libgtk-3-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev pkg-config
-
       - uses: dtolnay/rust-toolchain@stable
-
+        with:
+          targets: x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust-workspace
-          key: linux-desktop
+          key: linux-x64
+      - name: Build binary
+        run: cargo build --manifest-path rust-workspace/Cargo.toml -p forja3d-studio --bin forja3d-studio --release --target x86_64-unknown-linux-gnu
+      - name: Package tar.gz
+        run: |
+          mkdir -p dist-linux
+          cp rust-workspace/target/x86_64-unknown-linux-gnu/release/forja3d-studio dist-linux/
+          strip dist-linux/forja3d-studio || true
+          cp rust-workspace/README.md dist-linux/
+          tar -C dist-linux -czf forja3d-studio-linux-x86_64.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Linux
+          path: forja3d-studio-linux-x86_64.tar.gz
 
-      - name: Build release binary
-        run: cargo build --manifest-path rust-workspace/crates/forja3d-studio/Cargo.toml --release
-
-  build-macos:
-    name: Build macOS Desktop (Universal/Apple Silicon/Intel)
+  MacOS:
+    name: MacOS
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
-
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust-workspace
-          key: macos-desktop
-
-      - name: Build release binary
-        run: cargo build --manifest-path rust-workspace/crates/forja3d-studio/Cargo.toml --release
-
-  build-windows:
-    name: Build Windows Desktop (x86_64-pc-windows-msvc)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+          key: macos-universal
+      - name: Build Apple Silicon & Intel binaries
+        run: |
+          cargo build --manifest-path rust-workspace/Cargo.toml -p forja3d-studio --bin forja3d-studio --release --target aarch64-apple-darwin
+          cargo build --manifest-path rust-workspace/Cargo.toml -p forja3d-studio --bin forja3d-studio --release --target x86_64-apple-darwin
+      - name: Create Universal .app bundle and tar.gz
+        run: |
+          mkdir -p "dist-macos/Forja3D Studio.app/Contents/MacOS"
+          lipo -create \
+            rust-workspace/target/aarch64-apple-darwin/release/forja3d-studio \
+            rust-workspace/target/x86_64-apple-darwin/release/forja3d-studio \
+            -output "dist-macos/Forja3D Studio.app/Contents/MacOS/forja3d-studio"
+          chmod +x "dist-macos/Forja3D Studio.app/Contents/MacOS/forja3d-studio"
+          tar -C dist-macos -czf forja3d-studio-macos-universal.tar.gz "Forja3D Studio.app"
+      - uses: actions/upload-artifact@v4
         with:
-          workspaces: rust-workspace
-          key: windows-desktop
+          name: MacOS
+          path: forja3d-studio-macos-universal.tar.gz
 
-      - name: Build release binary
-        run: cargo build --manifest-path rust-workspace/crates/forja3d-studio/Cargo.toml --release
-
-  build-android:
-    name: Build Android APK (arm64-v8a)
+  Webassembly:
+    name: Webassembly
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-workspace
+          key: wasm32
+      - name: Install wasm-bindgen CLI (0.2.130)
+        run: |
+          curl -sSfL https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.130/wasm-bindgen-0.2.130-x86_64-unknown-linux-musl.tar.gz | tar -xz -C /tmp
+          sudo mv /tmp/wasm-bindgen-0.2.130-x86_64-unknown-linux-musl/wasm-bindgen /usr/local/bin/
+          wasm-bindgen --version
+      - name: Build WASM cdylib & web package
+        run: |
+          cargo build --manifest-path rust-workspace/Cargo.toml -p forja3d-studio --lib --target wasm32-unknown-unknown --release
+          mkdir -p wasm-dist
+          wasm-bindgen --out-dir wasm-dist --target web rust-workspace/target/wasm32-unknown-unknown/release/forja3d_studio.wasm
+          tar -C wasm-dist -czf forja3d-studio-wasm-web.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Webassembly
+          path: forja3d-studio-wasm-web.tar.gz
 
+  Android:
+    name: Android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: "temurin"
           java-version: "17"
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
-
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust-workspace
-          key: android-apk
-
-      - name: Install Android SDK & NDK
+          key: android-arm64
+      - name: Install cargo-apk
+        run: cargo install cargo-apk --locked
+      - name: Install Android SDK Build-Tools & NDK
         run: |
           SDK_DIR="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-          NDK_DIR="${SDK_DIR}/ndk/26.1.10909125"
-          TOOLCHAIN_BIN="${NDK_DIR}/toolchains/llvm/prebuilt/linux-x86_64/bin"
           echo "ANDROID_SDK_ROOT=${SDK_DIR}" >> "$GITHUB_ENV"
           echo "ANDROID_HOME=${SDK_DIR}" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_HOME=${NDK_DIR}" >> "$GITHUB_ENV"
-          echo "CC_aarch64_linux_android=${TOOLCHAIN_BIN}/aarch64-linux-android26-clang" >> "$GITHUB_ENV"
-          echo "AR_aarch64_linux_android=${TOOLCHAIN_BIN}/llvm-ar" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${SDK_DIR}/ndk/26.1.10909125" >> "$GITHUB_ENV"
           yes | sudo "${SDK_DIR}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           sudo "${SDK_DIR}/cmdline-tools/latest/bin/sdkmanager" \
             "platforms;android-34" \
             "build-tools;34.0.0" \
             "ndk;26.1.10909125"
-
-      - name: Install cargo-apk
-        run: cargo install cargo-apk
-
-      - name: Build Android APK (Debug)
-        run: cargo apk build --manifest-path rust-workspace/Cargo.toml -p forja3d-studio --lib
-
-      - name: Upload APK Artifact
-        uses: actions/upload-artifact@v4
+      - name: Build & Sign Android APK
+        run: |
+          cargo apk build --manifest-path rust-workspace/Cargo.toml -p forja3d-studio --lib --release
+          APK_PATH=$(find rust-workspace/target -name "*.apk" | head -n 1)
+          if [ -z "$APK_PATH" ]; then
+            APK_PATH=$(find target -name "*.apk" | head -n 1)
+          fi
+          echo "Found APK at: $APK_PATH"
+          test -n "$APK_PATH"
+          cp "$APK_PATH" forja3d-studio-android-arm64.apk
+          APKSIGNER="${ANDROID_SDK_ROOT}/build-tools/34.0.0/apksigner"
+          keytool -genkeypair -noprompt \
+            -keystore release.keystore \
+            -storepass forja3d-ci \
+            -keypass forja3d-ci \
+            -alias forja3d \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Forja3D, OU=Studio, O=Aethravox, L=Dev, S=Dev, C=US"
+          "$APKSIGNER" sign \
+            --ks release.keystore \
+            --ks-pass "pass:forja3d-ci" \
+            forja3d-studio-android-arm64.apk
+          "$APKSIGNER" verify forja3d-studio-android-arm64.apk
+      - uses: actions/upload-artifact@v4
         with:
-          name: Forja3D-Studio-Android-APK
-          path: |
-            rust-workspace/crates/forja3d-studio/target/**/*.apk
-            rust-workspace/crates/forja3d-studio/target/android/apk/*.apk
-            rust-workspace/crates/forja3d-studio/target/debug/apk/*.apk
-          if-no-files-found: warn
+          name: Android
+          path: forja3d-studio-android-arm64.apk
