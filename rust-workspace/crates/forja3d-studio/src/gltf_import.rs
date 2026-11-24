@@ -57,7 +57,7 @@ pub fn import_gltf_or_glb_full(
     let buffers = resolve_buffers(&gltf.document, gltf.blob.as_deref(), base_dir)?;
     let images = resolve_images(&gltf.document, &buffers, base_dir);
     let mut parts: Vec<PartSpec> = Vec::new();
-    let mut saw_draco = gltf
+    let saw_draco = gltf
         .document
         .extensions_required()
         .any(|ext| ext == "KHR_draco_mesh_compression")
@@ -72,11 +72,11 @@ pub fn import_gltf_or_glb_full(
         .or_else(|| gltf.document.scenes().next())
     {
         for node in scene.nodes() {
-            collect_node(&node, IDENTITY, &buffers, &images, &mut parts, &mut saw_draco);
+            collect_node(&node, IDENTITY, &buffers, &images, &mut parts);
         }
     } else {
         for node in gltf.document.nodes() {
-            collect_node(&node, IDENTITY, &buffers, &images, &mut parts, &mut saw_draco);
+            collect_node(&node, IDENTITY, &buffers, &images, &mut parts);
         }
     }
 
@@ -138,7 +138,6 @@ fn collect_node(
     buffers: &[Vec<u8>],
     images: &[Option<DecodedImage>],
     out_parts: &mut Vec<PartSpec>,
-    saw_draco: &mut bool,
 ) {
     let local = node.transform().matrix();
     let world = mat4_mul(parent_world, local);
@@ -153,12 +152,6 @@ fn collect_node(
 
         let prim_count = mesh.primitives().count();
         for (prim_idx, primitive) in mesh.primitives().enumerate() {
-            if primitive
-                .extension_value("KHR_draco_mesh_compression")
-                .is_some()
-            {
-                *saw_draco = true;
-            }
             if let Some(mesh_part) = convert_primitive(
                 &primitive,
                 &base_name,
@@ -179,7 +172,7 @@ fn collect_node(
     }
 
     for child in node.children() {
-        collect_node(&child, world, buffers, images, out_parts, saw_draco);
+        collect_node(&child, world, buffers, images, out_parts);
     }
 }
 
