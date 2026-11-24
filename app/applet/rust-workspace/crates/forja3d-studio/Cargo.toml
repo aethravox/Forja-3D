@@ -19,6 +19,7 @@ name = "forja3d-studio"
 path = "src/main.rs"
 
 [dependencies]
+forja3d_studio = { path = "." }
 forja3d = { version = "0.1.0", path = "../forja3d" }
 forja3d-physics = { version = "0.1.0", path = "../forja3d-physics" }
 langes = { version = "0.1.0", path = "../langes" }
