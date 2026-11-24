@@ -45,6 +45,30 @@ jobs:
       - name: Check forja3d-studio wasm32 compilation
         run: cargo check --manifest-path rust-workspace/Cargo.toml -p forja3d-studio --lib --target wasm32-unknown-unknown
 
+  desktop-linux-build:
+    name: Build Linux Desktop (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux graphics dev libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libxrandr-dev libxi-dev \
+            libxcursor-dev libgl1-mesa-dev libgtk-3-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-workspace
+          key: desktop-linux-build
+
+      - name: Build forja3d-studio desktop binary
+        run: cargo build --manifest-path rust-workspace/crates/forja3d-studio/Cargo.toml --release
+
   android-build-apk:
     name: Build Android APK (arm64-v8a)
     runs-on: ubuntu-latest
@@ -84,11 +108,11 @@ jobs:
       - name: Install cargo-apk
         run: cargo install cargo-apk
 
-      - name: Build Android APK
-        run: cargo apk build --manifest-path rust-workspace/crates/forja3d-studio/Cargo.toml --release
+      - name: Build Android APK (Debug)
+        run: cargo apk build --manifest-path rust-workspace/crates/forja3d-studio/Cargo.toml
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Forja3D-Studio-Android-APK
-          path: rust-workspace/crates/forja3d-studio/target/android/apk/release/*.apk
+          path: rust-workspace/crates/forja3d-studio/target/android/apk/*.apk
