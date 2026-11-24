@@ -183,8 +183,9 @@ jobs:
         run: cargo install cargo-apk
       - name: Install Android SDK Build-Tools & NDK
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager \
+          SDK_DIR="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          yes | "${SDK_DIR}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "${SDK_DIR}/cmdline-tools/latest/bin/sdkmanager" \
             "platforms;android-34" \
             "build-tools;34.0.0" \
             "ndk;26.1.10909125"
