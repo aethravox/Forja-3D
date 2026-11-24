@@ -470,3 +470,267 @@ fn triangulate_polygon_2d(pts: &[[f32; 2]]) -> Vec<[usize; 3]> {
     }
     tris
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerrainPreset {
+    Hills,
+    Mountains,
+    Island,
+    Canyon,
+}
+
+impl TerrainPreset {
+    pub const ALL: [Self; 4] = [Self::Hills, Self::Mountains, Self::Island, Self::Canyon];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Hills => "Colinas",
+            Self::Mountains => "Montañas",
+            Self::Island => "Isla",
+            Self::Canyon => "Cañón",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerrainStamp {
+    /// Normalized XZ coordinates inside [-0.5, 0.5].
+    pub x: f32,
+    pub z: f32,
+    /// Influence radius in local terrain units (typically 0.08..=0.45).
+    pub radius: f32,
+    /// Height delta applied at the stamp center (+ raises, - digs).
+    pub height: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerrainSpec {
+    pub seed: u32,
+    pub amplitude: f32,
+    pub frequency: f32,
+    pub octaves: u8,
+    pub preset: TerrainPreset,
+    pub biome_tint: bool,
+    pub stamps: Vec<TerrainStamp>,
+}
+
+impl Default for TerrainSpec {
+    fn default() -> Self {
+        Self {
+            seed: 42,
+            amplitude: 0.42,
+            frequency: 2.6,
+            octaves: 4,
+            preset: TerrainPreset::Hills,
+            biome_tint: true,
+            stamps: Vec::new(),
+        }
+    }
+}
+
+#[inline]
+fn floor_i32_no_std(x: f32) -> i32 {
+    let i = x as i32;
+    if (i as f32) > x {
+        i - 1
+    } else {
+        i
+    }
+}
+
+#[inline]
+fn hash_2d(ix: i32, iz: i32, seed: u32) -> f32 {
+    let mut h = (ix as u32).wrapping_mul(374_761_393)
+        ^ (iz as u32).wrapping_mul(668_265_263)
+        ^ seed.wrapping_mul(2_246_822_519);
+    h = (h ^ (h >> 13)).wrapping_mul(1_274_126_177);
+    h ^= h >> 16;
+    (h & 0x00FF_FFFF) as f32 / 16_777_215.0
+}
+
+fn value_noise_2d(x: f32, z: f32, seed: u32) -> f32 {
+    let ix = floor_i32_no_std(x);
+    let iz = floor_i32_no_std(z);
+    let fx = x - ix as f32;
+    let fz = z - iz as f32;
+    let ux = fx * fx * (3.0 - 2.0 * fx);
+    let uz = fz * fz * (3.0 - 2.0 * fz);
+
+    let v00 = hash_2d(ix, iz, seed);
+    let v10 = hash_2d(ix + 1, iz, seed);
+    let v01 = hash_2d(ix, iz + 1, seed);
+    let v11 = hash_2d(ix + 1, iz + 1, seed);
+
+    let a = v00 + (v10 - v00) * ux;
+    let b = v01 + (v11 - v01) * ux;
+    a + (b - a) * uz
+}
+
+fn fbm_2d(x: f32, z: f32, seed: u32, octaves: u8) -> f32 {
+    let octs = octaves.clamp(1, 6);
+    let mut sum = 0.0_f32;
+    let mut amp = 0.5_f32;
+    let mut freq = 1.0_f32;
+    let mut norm = 0.0_f32;
+    for o in 0..octs {
+        let s = seed.wrapping_add((o as u32).wrapping_mul(1013));
+        sum += amp * (value_noise_2d(x * freq, z * freq, s) * 2.0 - 1.0);
+        norm += amp;
+        amp *= 0.5;
+        freq *= 2.05;
+    }
+    if norm > 1e-6 {
+        sum / norm
+    } else {
+        0.0
+    }
+}
+
+/// Evaluate local terrain height at normalized `(nx, nz)` inside `[-0.5, 0.5]`.
+pub fn terrain_height_at(spec: &TerrainSpec, nx: f32, nz: f32) -> f32 {
+    let freq = spec.frequency.max(0.2);
+    let base = fbm_2d((nx + 0.5) * freq, (nz + 0.5) * freq, spec.seed, spec.octaves);
+    let mut h = match spec.preset {
+        TerrainPreset::Hills => base * spec.amplitude,
+        TerrainPreset::Mountains => {
+            let ridge = 1.0 - base.abs();
+            (ridge * ridge * 1.35 - 0.35) * spec.amplitude
+        }
+        TerrainPreset::Island => {
+            let r2 = (nx * nx + nz * nz) * 4.0;
+            let falloff = (1.0 - r2).clamp(0.0, 1.0);
+            let falloff_smooth = falloff * falloff * (3.0 - 2.0 * falloff);
+            ((base * 0.65 + 0.55) * falloff_smooth - 0.15) * spec.amplitude
+        }
+        TerrainPreset::Canyon => {
+            let valley = (nx * 2.2).abs().clamp(0.0, 1.0);
+            let wall = valley * valley;
+            (wall * 0.95 + base * 0.45 - 0.35) * spec.amplitude
+        }
+    };
+
+    for stamp in &spec.stamps {
+        let r = stamp.radius.max(0.02);
+        let dx = nx - stamp.x;
+        let dz = nz - stamp.z;
+        let d2 = dx * dx + dz * dz;
+        let r2 = r * r;
+        if d2 < r2 {
+            let t = 1.0 - d2 / r2;
+            h += stamp.height * t * t;
+        }
+    }
+
+    h
+}
+
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    let t = t.clamp(0.0, 1.0);
+    let v = a as f32 + (b as f32 - a as f32) * t;
+    v.clamp(0.0, 255.0) as u8
+}
+
+fn tint_terrain_color(base: [u8; 4], height: f32, min_h: f32, max_h: f32) -> [u8; 4] {
+    let span = (max_h - min_h).max(1e-4);
+    let t = ((height - min_h) / span).clamp(0.0, 1.0);
+    if t < 0.32 {
+        let k = t / 0.32;
+        [
+            lerp_u8((base[0] as f32 * 0.52) as u8, base[0], k),
+            lerp_u8((base[1] as f32 * 0.50) as u8, base[1], k),
+            lerp_u8((base[2] as f32 * 0.45) as u8, base[2], k),
+            base[3],
+        ]
+    } else if t > 0.72 {
+        let k = (t - 0.72) / 0.28;
+        [
+            lerp_u8(base[0], 230, k * 0.65),
+            lerp_u8(base[1], 226, k * 0.65),
+            lerp_u8(base[2], 216, k * 0.65),
+            base[3],
+        ]
+    } else {
+        base
+    }
+}
+
+/// Build a subdivided 3D heightfield terrain mesh spanning `[-0.5, 0.5]` in XZ.
+pub fn build_terrain(
+    spec: &TerrainSpec,
+    segments: u16,
+    color: [u8; 4],
+) -> (Vec<Vertex>, Vec<u32>) {
+    let seg = (segments as usize).clamp(4, 64);
+    let stride = seg + 1;
+    let mut heights = Vec::with_capacity(stride * stride);
+    let mut min_h = f32::INFINITY;
+    let mut max_h = f32::NEG_INFINITY;
+
+    for z in 0..=seg {
+        let vz = z as f32 / seg as f32;
+        let nz = vz - 0.5;
+        for x in 0..=seg {
+            let ux = x as f32 / seg as f32;
+            let nx = ux - 0.5;
+            let h = terrain_height_at(spec, nx, nz);
+            if h < min_h {
+                min_h = h;
+            }
+            if h > max_h {
+                max_h = h;
+            }
+            heights.push(h);
+        }
+    }
+
+    let step = 1.0 / seg as f32;
+    let mut verts = Vec::with_capacity(stride * stride);
+    for z in 0..=seg {
+        let vz = z as f32 / seg as f32;
+        let nz = vz - 0.5;
+        for x in 0..=seg {
+            let ux = x as f32 / seg as f32;
+            let nx = ux - 0.5;
+            let idx = z * stride + x;
+            let h = heights[idx];
+
+            let h_l = heights[z * stride + x.saturating_sub(1)];
+            let h_r = heights[z * stride + (x + 1).min(seg)];
+            let h_d = heights[z.saturating_sub(1) * stride + x];
+            let h_u = heights[(z + 1).min(seg) * stride + x];
+
+            let dx_span = if x == 0 || x == seg { step } else { step * 2.0 };
+            let dz_span = if z == 0 || z == seg { step } else { step * 2.0 };
+            let normal = Vec3::new((h_l - h_r) / dx_span, 1.0, (h_d - h_u) / dz_span)
+                .normalized()
+                .to_array();
+
+            let v_color = if spec.biome_tint && (max_h - min_h) > 1e-4 {
+                tint_terrain_color(color, h, min_h, max_h)
+            } else {
+                color
+            };
+
+            verts.push(Vertex {
+                position: [nx, h, nz],
+                normal,
+                color: v_color,
+                uv: [ux, vz],
+            });
+        }
+    }
+
+    let mut indices = Vec::with_capacity(seg * seg * 6);
+    for z in 0..seg {
+        for x in 0..seg {
+            let a = (z * stride + x) as u32;
+            let b = a + 1;
+            let c = ((z + 1) * stride + x) as u32;
+            let d = c + 1;
+            indices.extend_from_slice(&[a, c, b, b, c, d]);
+        }
+    }
+
+    (verts, indices)
+}
+

@@ -42,9 +42,9 @@ impl OrbitCamera {
         let dx = bounds.max[0] - bounds.min[0];
         let dy = bounds.max[1] - bounds.min[1];
         let dz = bounds.max[2] - bounds.min[2];
-        let radius = ((dx * dx + dy * dy + dz * dz).sqrt() * 0.5).max(0.25);
+        let radius = ((dx * dx + dy * dy + dz * dz).sqrt() * 0.5).max(0.05);
         self.target = [cx, cy, cz];
-        self.distance = (radius * 2.8).clamp(1.5, 250.0);
+        self.distance = (radius * 2.8).clamp(0.4, 5000.0);
     }
 
     pub fn view_matrix(&self) -> [f32; 16] {
@@ -52,7 +52,9 @@ impl OrbitCamera {
     }
 
     pub fn proj_matrix(&self, aspect: f32) -> [f32; 16] {
-        perspective(45.0_f32.to_radians(), aspect.max(0.1), 0.1, 500.0)
+        let near = (self.distance * 0.004).clamp(0.005, 1.0);
+        let far = (self.distance * 30.0).max(500.0);
+        perspective(45.0_f32.to_radians(), aspect.max(0.1), near, far)
     }
 
     pub fn pan(&mut self, dx: f32, dy: f32) {
@@ -206,7 +208,8 @@ impl GlViewportRenderer {
             out vec4 frag_color;
 
             void main() {{
-                vec3 n = normalize(v_normal);
+                float n_len = length(v_normal);
+                vec3 n = n_len > 0.0001 ? (v_normal / n_len) : vec3(0.0, 1.0, 0.0);
                 vec3 v = normalize(u_eye - v_world_pos);
                 vec3 key_dir = normalize(vec3(0.55, 0.85, 0.45));
                 vec3 fill_dir = normalize(vec3(-0.7, 0.35, -0.5));

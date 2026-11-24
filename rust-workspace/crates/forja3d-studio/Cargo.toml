@@ -19,6 +19,7 @@ forja3d-physics = { version = "0.1.0", path = "../forja3d-physics" }
 langes = { version = "0.1.0", path = "../langes" }
 eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow"] }
 gltf = { version = "1.4", default-features = false, features = ["utils", "names"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [target.'cfg(not(any(target_arch = "wasm32", target_os = "android")))'.dependencies]
 eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }

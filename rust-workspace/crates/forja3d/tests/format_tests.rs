@@ -2,8 +2,8 @@ use forja3d::{
     default_extrude_profile, Anchor2D, AnimationClip, AnimationProperty, AnimationSet,
     AnimationTargetKind, AnimationTrack, ColliderShape, DecodeError, Document2D, ForjaPack,
     InterpolationMode, Keyframe, Model, PartSpec, PrimitiveKind, RigidBodyKind, RustExportTarget,
-    SceneDocument, ShadingMode, Texture, UiDocument2D, Widget2D, WidgetKind2D, F2D_MAGIC,
-    F3A_MAGIC, F3P_MAGIC, F3T_MAGIC, FLAG_COMPACT, FLAG_PHYSICS, MAGIC,
+    SceneDocument, ShadingMode, TerrainPreset, TerrainStamp, Texture, UiDocument2D, Widget2D,
+    WidgetKind2D, F2D_MAGIC, F3A_MAGIC, F3P_MAGIC, F3T_MAGIC, FLAG_COMPACT, FLAG_PHYSICS, MAGIC,
 };
 
 #[test]
@@ -381,3 +381,35 @@ fn roundtrip_f2d_screen_document_and_f3t_texture() {
     let dec_tex = Texture::from_bytes(&f3t_bytes).expect("valid .f3t should decode");
     assert_eq!(dec_tex, tex);
 }
+
+#[test]
+fn terrain_generates_non_flat_relief_supports_stamps_and_roundtrips_f3d() {
+    let mut terrain = PartSpec::new("colinas", PrimitiveKind::Terrain);
+    terrain.segments = 24;
+    terrain.terrain.preset = TerrainPreset::Mountains;
+    terrain.terrain.amplitude = 0.8;
+    terrain.terrain.stamps.push(TerrainStamp {
+        x: 0.0,
+        z: 0.0,
+        radius: 0.25,
+        height: 1.1,
+    });
+
+    let baked = terrain.bake();
+    assert_eq!(baked.vertices.len(), 25 * 25);
+    assert_eq!(baked.indices.len(), 24 * 24 * 6);
+    assert!(
+        baked.bounds.max[1] - baked.bounds.min[1] > 0.5,
+        "terrain should have non-flat vertical relief: {:?}",
+        baked.bounds
+    );
+
+    let mut scene = SceneDocument::preset_terrain();
+    scene.parts[0] = terrain;
+    let model = scene.bake();
+    let f3d_bytes = model.to_bytes_compact();
+    let decoded = Model::from_bytes(&f3d_bytes).expect("compact terrain .f3d should decode");
+    assert_eq!(decoded.parts.len(), model.parts.len());
+    assert_eq!(decoded.triangle_count(), model.triangle_count());
+}
+

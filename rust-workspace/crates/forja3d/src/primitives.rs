@@ -8,8 +8,9 @@ use crate::{
     },
     math::{sin_cos, Aabb, Mat4, Vec3},
     mesh_ops::{
-        apply_shading, build_extruded_polygon, build_lathe_profile, deduplicate_vertices,
-        default_extrude_profile, default_lathe_profile, ShadingMode,
+        apply_shading, build_extruded_polygon, build_lathe_profile, build_terrain,
+        deduplicate_vertices, default_extrude_profile, default_lathe_profile, ShadingMode,
+        TerrainPreset, TerrainSpec,
     },
 };
 
@@ -22,13 +23,14 @@ pub enum PrimitiveKind {
     Pyramid,
     Torus,
     Plane,
+    Terrain,
     Extrude,
     Lathe,
     CustomMesh,
 }
 
 impl PrimitiveKind {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Cube,
         Self::Sphere,
         Self::Cylinder,
@@ -36,6 +38,7 @@ impl PrimitiveKind {
         Self::Pyramid,
         Self::Torus,
         Self::Plane,
+        Self::Terrain,
         Self::Extrude,
         Self::Lathe,
     ];
@@ -49,6 +52,7 @@ impl PrimitiveKind {
             Self::Pyramid => "Pirámide",
             Self::Torus => "Toroide",
             Self::Plane => "Plano",
+            Self::Terrain => "Terreno",
             Self::Extrude => "Extruir 2D",
             Self::Lathe => "Revolución",
             Self::CustomMesh => "Malla .f3d",
@@ -78,6 +82,7 @@ pub struct PartSpec {
     pub deduplicate: bool,
     pub profile: Vec<[f32; 2]>,
     pub extrude_depth: f32,
+    pub terrain: TerrainSpec,
     pub custom_mesh: Option<MeshPart>,
     pub collider: ColliderShape,
     pub collider_auto_fit: bool,
@@ -90,16 +95,17 @@ impl PartSpec {
             PrimitiveKind::Lathe => default_lathe_profile(),
             _ => default_extrude_profile(),
         };
+        let is_terrain = kind == PrimitiveKind::Terrain;
         Self {
             name: name.into(),
             kind,
-            position: [0.0, 0.5, 0.0],
+            position: if is_terrain { [0.0, 0.0, 0.0] } else { [0.0, 0.5, 0.0] },
             rotation_deg: [0.0, 0.0, 0.0],
-            scale: [1.0, 1.0, 1.0],
-            color: [224, 159, 62, 255],
-            metallic: 0.2,
-            roughness: 0.42,
-            segments: 20,
+            scale: if is_terrain { [4.5, 1.4, 4.5] } else { [1.0, 1.0, 1.0] },
+            color: if is_terrain { [88, 146, 78, 255] } else { [224, 159, 62, 255] },
+            metallic: if is_terrain { 0.05 } else { 0.2 },
+            roughness: if is_terrain { 0.88 } else { 0.42 },
+            segments: if is_terrain { 28 } else { 20 },
             visible: true,
             mirror: [false; 3],
             group: None,
@@ -107,6 +113,7 @@ impl PartSpec {
             deduplicate: true,
             profile,
             extrude_depth: 0.4,
+            terrain: TerrainSpec::default(),
             custom_mesh: None,
             collider: ColliderShape::None,
             collider_auto_fit: true,
@@ -232,6 +239,7 @@ impl PartSpec {
             deduplicate: true,
             profile: default_extrude_profile(),
             extrude_depth: 0.4,
+            terrain: TerrainSpec::default(),
             custom_mesh: Some(local_mesh),
             collider: ColliderShape::None,
             collider_auto_fit: true,
@@ -243,6 +251,7 @@ impl PartSpec {
         let (base_verts, base_indices) = match self.kind {
             PrimitiveKind::Extrude => build_extruded_polygon(&self.profile, self.extrude_depth, self.color),
             PrimitiveKind::Lathe => build_lathe_profile(&self.profile, self.segments.max(6), self.color),
+            PrimitiveKind::Terrain => build_terrain(&self.terrain, self.segments.max(6), self.color),
             PrimitiveKind::CustomMesh => {
                 if let Some(mesh) = &self.custom_mesh {
                     let recolor = self.color != mesh.material.base_color;
@@ -605,12 +614,58 @@ impl SceneDocument {
             },
         }
     }
+
+    pub fn preset_terrain() -> Self {
+        Self {
+            model_name: String::from("ValleForja"),
+            parts: vec![
+                PartSpec {
+                    position: [0.0, 0.0, 0.0],
+                    scale: [6.0, 1.8, 6.0],
+                    color: [86, 144, 76, 255],
+                    metallic: 0.04,
+                    roughness: 0.9,
+                    segments: 32,
+                    terrain: TerrainSpec {
+                        seed: 108,
+                        amplitude: 0.55,
+                        frequency: 2.8,
+                        octaves: 4,
+                        preset: TerrainPreset::Mountains,
+                        biome_tint: true,
+                        stamps: Vec::new(),
+                    },
+                    ..PartSpec::new("terreno_base", PrimitiveKind::Terrain)
+                },
+                PartSpec {
+                    position: [0.0, 0.65, 0.0],
+                    scale: [0.45, 0.9, 0.45],
+                    color: [245, 158, 11, 255],
+                    metallic: 0.72,
+                    roughness: 0.25,
+                    segments: 12,
+                    ..PartSpec::new("faro_cumbre", PrimitiveKind::Pyramid)
+                },
+            ],
+            physics_enabled: true,
+            physics: PhysicsSpec {
+                body_kind: RigidBodyKind::Static,
+                mass: 50.0,
+                friction: 0.75,
+                restitution: 0.1,
+                linear_damping: 0.05,
+                gravity_scale: 1.0,
+                colliders: Vec::new(),
+            },
+        }
+    }
 }
 
 pub fn generate_primitive(kind: PrimitiveKind, segments: u16, color: [u8; 4]) -> (Vec<Vertex>, Vec<u32>) {
     match kind {
         PrimitiveKind::Cube => build_cube(color),
         PrimitiveKind::Plane => build_plane(color),
+        PrimitiveKind::Terrain => build_terrain(&TerrainSpec::default(), segments, color),
         PrimitiveKind::Pyramid => build_pyramid(color),
         PrimitiveKind::Sphere => build_sphere(segments, segments / 2 + 4, color),
         PrimitiveKind::Cylinder => build_cylinder(segments, color),

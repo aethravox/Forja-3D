@@ -3,17 +3,31 @@ mod renderer;
 
 use eframe::egui;
 use forja3d::{
-    default_extrude_profile, default_lathe_profile, format::fnv1a_32, Anchor2D, AnimationClip,
-    AnimationProperty, AnimationSet, AnimationTrack, ColliderShape, Document2D, ForjaPack,
-    InterpolationMode, Keyframe, Model, PartSpec, PrimitiveKind, RigidBodyKind, RustExportTarget,
-    SceneDocument, ShadingMode, Texture, UiDocument2D, Widget2D, WidgetKind2D, F2D_MAGIC,
-    F3A_MAGIC, F3P_MAGIC, F3T_MAGIC, FLAG_COMPACT, FLAG_PHYSICS,
+    default_extrude_profile, default_lathe_profile, format::fnv1a_32, terrain_height_at,
+    Anchor2D, AnimationClip, AnimationProperty, AnimationSet, AnimationTrack, ColliderShape,
+    Document2D, ForjaPack, InterpolationMode, Keyframe, Model, PartSpec, PrimitiveKind,
+    RigidBodyKind, RustExportTarget, SceneDocument, ShadingMode, TerrainPreset, TerrainStamp,
+    Texture, UiDocument2D, Widget2D, WidgetKind2D, F2D_MAGIC, F3A_MAGIC, F3P_MAGIC, F3T_MAGIC,
+    FLAG_COMPACT, FLAG_PHYSICS,
 };
 use forja3d_physics::{BodyHandle, PhysicsWorld};
 use renderer::{ray_intersects_aabb, GlViewportRenderer, OrbitCamera};
 use std::sync::{Arc, Mutex};
 
 const MAX_UNDO_HISTORY: usize = 60;
+
+const QUICK_PALETTE: [(&str, [u8; 4]); 10] = [
+    ("Ámbar", [224, 159, 62, 255]),
+    ("Acero", [148, 163, 184, 255]),
+    ("Carbón", [46, 52, 64, 255]),
+    ("Rojo", [220, 68, 68, 255]),
+    ("Bosque", [84, 148, 76, 255]),
+    ("Cielo", [56, 189, 248, 255]),
+    ("Tierra", [142, 98, 64, 255]),
+    ("Arena", [214, 192, 144, 255]),
+    ("Piedra", [112, 118, 128, 255]),
+    ("Blanco", [240, 244, 248, 255]),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExportTab {
@@ -96,6 +110,13 @@ pub struct StudioApp {
     continuous_edit_snapshot: Option<HistoryEntry>,
     selected_profile_pt: Option<usize>,
     dragging_profile_pt: Option<usize>,
+    copied_color: Option<[u8; 4]>,
+    copied_material: Option<([u8; 4], f32, f32)>,
+    terrain_sculpt_raise: bool,
+    terrain_brush_radius: f32,
+    terrain_brush_strength: f32,
+    terrain_sculpt_last: Option<[f32; 2]>,
+    imported_textures: Vec<Texture>,
     new_group_draft: String,
     export_tab: ExportTab,
     mobile_tab: MobileTab,
@@ -157,6 +178,13 @@ impl StudioApp {
             continuous_edit_snapshot: None,
             selected_profile_pt: Some(0),
             dragging_profile_pt: None,
+            copied_color: None,
+            copied_material: None,
+            terrain_sculpt_raise: true,
+            terrain_brush_radius: 0.22,
+            terrain_brush_strength: 0.22,
+            terrain_sculpt_last: None,
+            imported_textures: Vec::new(),
             new_group_draft: String::from("Grupo"),
             export_tab: ExportTab::F3dBinary,
             mobile_tab: MobileTab::Viewport,
@@ -319,6 +347,7 @@ impl StudioApp {
                     let was_compact = (flags & FLAG_COMPACT) != 0;
                     let has_physics = (flags & FLAG_PHYSICS) != 0;
                     self.scene = SceneDocument::from_model(decoded);
+                    self.imported_textures.clear();
                     self.selection = if self.scene.parts.is_empty() {
                         None
                     } else {
@@ -344,6 +373,7 @@ impl StudioApp {
                 Ok(pack) => {
                     self.push_undo();
                     let mut summary = Vec::new();
+                    self.imported_textures = pack.textures.clone();
                     if let Some(model) = pack.model {
                         let tri = model.triangle_count();
                         self.scene = SceneDocument::from_model(model);
@@ -449,10 +479,12 @@ impl StudioApp {
                 }
             }
         } else {
-            match gltf_import::import_gltf_or_glb(filename, bytes, base_dir) {
-                Ok(scene) => {
+            match gltf_import::import_gltf_or_glb_full(filename, bytes, base_dir) {
+                Ok(imported) => {
                     self.push_undo();
-                    self.scene = scene;
+                    self.scene = imported.scene;
+                    let tex_count = imported.textures.len();
+                    self.imported_textures = imported.textures;
                     self.selection = if self.scene.parts.is_empty() {
                         None
                     } else {
@@ -461,8 +493,13 @@ impl StudioApp {
                     self.rebuild_outputs();
                     self.camera.frame_bounds(self.baked_model.bounds());
                     let src = filename.unwrap_or(&self.scene.model_name);
+                    let tex_tag = if tex_count > 0 {
+                        format!(", {tex_count} tex")
+                    } else {
+                        String::new()
+                    };
                     self.status_note = format!(
-                        "GLB/GLTF '{src}' ({} piezas, {} tri)",
+                        "GLB/GLTF '{src}' ({} piezas, {} tri{tex_tag})",
                         self.scene.parts.len(),
                         self.baked_model.triangle_count()
                     );
@@ -477,7 +514,11 @@ impl StudioApp {
     fn build_pack_asset(&self) -> ForjaPack {
         let mut pack = ForjaPack::new(self.scene.model_name.clone());
         pack.model = Some(self.baked_model.clone());
-        pack.textures.push(self.build_texture_asset());
+        if self.imported_textures.is_empty() {
+            pack.textures.push(self.build_texture_asset());
+        } else {
+            pack.textures.extend(self.imported_textures.iter().cloned());
+        }
         pack.animations.push(self.build_animation_asset());
         pack
     }
@@ -629,12 +670,14 @@ impl StudioApp {
     fn load_preset(&mut self, scene: SceneDocument) {
         self.push_undo();
         self.scene = scene;
+        self.imported_textures.clear();
         self.selection = if self.scene.parts.is_empty() {
             None
         } else {
             Some(Selection::Part(0))
         };
         self.rebuild_outputs();
+        self.camera.frame_bounds(self.baked_model.bounds());
         self.status_note = format!("Escena: {}", self.scene.model_name);
     }
 
@@ -642,7 +685,9 @@ impl StudioApp {
         self.push_undo();
         let idx = self.scene.parts.len() + 1;
         let mut part = PartSpec::new(format!("{}_{}", kind.label().to_lowercase(), idx), kind);
-        part.position = [((idx % 3) as f32 - 1.0) * 0.4, 0.5, 0.0];
+        if kind != PrimitiveKind::Terrain {
+            part.position = [((idx % 3) as f32 - 1.0) * 0.4, 0.5, 0.0];
+        }
         if let Some(Selection::Group(g)) = &self.selection {
             part.group = Some(g.clone());
         }
@@ -736,6 +781,9 @@ impl StudioApp {
             }
             if ui.add_sized([82.0, btn_h], egui::Button::new("Monolito")).clicked() {
                 self.load_preset(SceneDocument::preset_obelisk());
+            }
+            if ui.add_sized([78.0, btn_h], egui::Button::new("Terreno")).clicked() {
+                self.load_preset(SceneDocument::preset_terrain());
             }
             if ui.add_sized([70.0, btn_h], egui::Button::new("Vacío")).clicked() {
                 self.load_preset(SceneDocument::new("MiModelo"));
@@ -919,10 +967,40 @@ impl StudioApp {
         }
     }
 
+    fn render_palette_swatches(&mut self, ui: &mut egui::Ui, compact: bool) -> Option<[u8; 4]> {
+        let mut picked = None;
+        let sz = if compact { 22.0 } else { 18.0 };
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+            for &(name, col) in &QUICK_PALETTE {
+                let c32 = egui::Color32::from_rgba_unmultiplied(col[0], col[1], col[2], col[3]);
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(sz, sz), egui::Sense::click());
+                ui.painter().rect_filled(rect, 3.0, c32);
+                ui.painter().rect_stroke(
+                    rect,
+                    3.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 78, 92)),
+                    egui::StrokeKind::Inside,
+                );
+                if resp.on_hover_text(name).clicked() {
+                    picked = Some(col);
+                }
+            }
+        });
+        picked
+    }
+
     fn render_inspector(&mut self, ui: &mut egui::Ui, dirty: &mut bool, compact: bool) {
         let btn_h = if compact { 32.0 } else { 22.0 };
         match self.selection.clone() {
             Some(Selection::Group(group_name)) => {
+                let first_color = self
+                    .scene
+                    .parts
+                    .iter()
+                    .find(|p| p.group.as_deref() == Some(group_name.as_str()))
+                    .map(|p| p.color)
+                    .unwrap_or([224, 159, 62, 255]);
                 let count = self
                     .scene
                     .parts
@@ -931,10 +1009,47 @@ impl StudioApp {
                     .count();
                 ui.label(egui::RichText::new(format!("Grupo: {group_name} ({count} piezas)")).strong());
                 ui.label(
-                    egui::RichText::new("Arrastra el gizmo 3D para mover, rotar o escalar todo el grupo.")
+                    egui::RichText::new("Arrastra el gizmo 3D o rellena el color/posición de todo el grupo.")
                         .size(11.5)
                         .color(egui::Color32::from_gray(165)),
                 );
+
+                ui.add_space(6.0);
+                let mut group_rgba = first_color;
+                let mut apply_group_color: Option<[u8; 4]> = None;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Rellenar color:");
+                    if ui.color_edit_button_srgba_unmultiplied(&mut group_rgba).changed() {
+                        apply_group_color = Some(group_rgba);
+                    }
+                    if ui.add_sized([68.0, btn_h], egui::Button::new("Copiar")).clicked() {
+                        self.copied_color = Some(first_color);
+                        self.status_note = String::from("Color del grupo copiado");
+                    }
+                    if ui
+                        .add_enabled(
+                            self.copied_color.is_some(),
+                            egui::Button::new("Pegar").min_size(egui::vec2(64.0, btn_h)),
+                        )
+                        .clicked()
+                    {
+                        apply_group_color = self.copied_color;
+                    }
+                });
+                if let Some(swatch) = self.render_palette_swatches(ui, compact) {
+                    apply_group_color = Some(swatch);
+                }
+                if let Some(new_col) = apply_group_color {
+                    self.push_undo();
+                    for p in &mut self.scene.parts {
+                        if p.group.as_deref() == Some(group_name.as_str()) {
+                            p.color = new_col;
+                        }
+                    }
+                    self.status_note = format!("Color aplicado al grupo '{group_name}'");
+                    *dirty = true;
+                }
+
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
                     if ui.add_sized([120.0, btn_h], egui::Button::new("Espejo X grupo")).clicked() {
@@ -946,7 +1061,33 @@ impl StudioApp {
                         }
                         *dirty = true;
                     }
-                    if ui.add_sized([110.0, btn_h], egui::Button::new("Desagrupar")).clicked() {
+                    if ui.add_sized([120.0, btn_h], egui::Button::new("Al suelo (Y=0)")).clicked() {
+                        let min_y = self
+                            .part_map
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(m_idx, &src)| {
+                                let p = self.scene.parts.get(src)?;
+                                if p.group.as_deref() == Some(group_name.as_str()) {
+                                    let b = self.baked_model.parts[m_idx].bounds;
+                                    b.is_valid().then_some(b.min[1])
+                                } else {
+                                    None
+                                }
+                            })
+                            .fold(f32::INFINITY, f32::min);
+                        if min_y.is_finite() {
+                            self.push_undo();
+                            for p in &mut self.scene.parts {
+                                if p.group.as_deref() == Some(group_name.as_str()) {
+                                    p.position[1] -= min_y;
+                                }
+                            }
+                            self.status_note = String::from("Grupo apoyado en Y=0");
+                            *dirty = true;
+                        }
+                    }
+                    if ui.add_sized([102.0, btn_h], egui::Button::new("Desagrupar")).clicked() {
                         self.push_undo();
                         let mut first_idx = None;
                         for (i, p) in self.scene.parts.iter_mut().enumerate() {
@@ -969,14 +1110,14 @@ impl StudioApp {
                 }
                 let snap = self.snap_enabled;
                 let existing_groups = self.scene.group_names();
-                let (part_verts, part_tris) = self
+                let (part_verts, part_tris, part_bounds) = self
                     .part_map
                     .iter()
                     .enumerate()
                     .filter(|(_, &src)| src == sel_idx)
-                    .fold((0usize, 0usize), |(vc, tc), (m_idx, _)| {
+                    .fold((0usize, 0usize, forja3d::Aabb::EMPTY), |(vc, tc, ab), (m_idx, _)| {
                         let m = &self.baked_model.parts[m_idx];
-                        (vc + m.vertices.len(), tc + m.indices.len() / 3)
+                        (vc + m.vertices.len(), tc + m.indices.len() / 3, ab.merge(m.bounds))
                     });
                 let mut changed_continuous = false;
                 let mut discrete_mirror_toggle: Option<usize> = None;
@@ -986,15 +1127,36 @@ impl StudioApp {
                 let mut new_group_assign: Option<Option<String>> = None;
                 let mut discrete_collider_change: Option<ColliderShape> = None;
                 let mut discrete_autofit_toggle: Option<bool> = None;
+                let mut discrete_action: Option<&'static str> = None;
+                let mut fill_color_group: Option<[u8; 4]> = None;
+                let mut fill_color_all: Option<[u8; 4]> = None;
                 let mut selected_pt = self.selected_profile_pt;
                 let mut dragging_pt = self.dragging_profile_pt;
+                let copied_col_snapshot = self.copied_color;
+                let copied_mat_snapshot = self.copied_material;
+                let mut copy_color_req: Option<[u8; 4]> = None;
+                let mut copy_mat_req: Option<([u8; 4], f32, f32)> = None;
+                let mut sculpt_raise = self.terrain_sculpt_raise;
+                let mut brush_radius = self.terrain_brush_radius;
+                let mut brush_strength = self.terrain_brush_strength;
+                let mut sculpt_last = self.terrain_sculpt_last;
 
                 {
                     let part = &mut self.scene.parts[sel_idx];
-                    ui.label(egui::RichText::new("Inspector de pieza").strong());
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Inspector de pieza").strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add_sized([68.0, btn_h], egui::Button::new("Eliminar")).clicked() {
+                                discrete_action = Some("delete");
+                            }
+                            if ui.add_sized([68.0, btn_h], egui::Button::new("Duplicar")).clicked() {
+                                discrete_action = Some("duplicate");
+                            }
+                        });
+                    });
                     if part.kind == PrimitiveKind::CustomMesh {
                         ui.label(
-                            egui::RichText::new("Malla importada (.glb / .gltf / .f3d) · editable con gizmo/espejo/sombreado")
+                            egui::RichText::new("Malla importada (.glb / .gltf / .f3d) · editable con gizmo/color/espejo")
                                 .size(11.0)
                                 .color(egui::Color32::from_rgb(251, 191, 36)),
                         );
@@ -1047,7 +1209,7 @@ impl StudioApp {
                                 [drag_w, if compact { 32.0 } else { 22.0 }],
                                 egui::DragValue::new(&mut part.scale[axis])
                                     .speed(0.02)
-                                    .range(0.05..=20.0)
+                                    .range(0.02..=50.0)
                                     .fixed_decimals(2),
                             );
                             if resp.changed() {
@@ -1061,8 +1223,46 @@ impl StudioApp {
                         ui.end_row();
                     });
 
+                    // Uniform scale & alignment utilities
+                    let mut uni_scale = (part.scale[0] + part.scale[1] + part.scale[2]) / 3.0;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Escala U:");
+                        let prev_uni = uni_scale;
+                        if ui
+                            .add_sized(
+                                [62.0, if compact { 30.0 } else { 22.0 }],
+                                egui::DragValue::new(&mut uni_scale)
+                                    .speed(0.02)
+                                    .range(0.02..=50.0)
+                                    .fixed_decimals(2),
+                            )
+                            .changed()
+                            && prev_uni > 1e-4
+                        {
+                            let ratio = uni_scale / prev_uni;
+                            for axis in 0..3 {
+                                part.scale[axis] = (part.scale[axis] * ratio).clamp(0.02, 50.0);
+                            }
+                            changed_continuous = true;
+                            *dirty = true;
+                        }
+                        if ui.add_sized([84.0, btn_h], egui::Button::new("Al suelo Y=0")).clicked() {
+                            discrete_action = Some("ground");
+                        }
+                        if ui.add_sized([74.0, btn_h], egui::Button::new("Centrar XZ")).clicked() {
+                            discrete_action = Some("center_xz");
+                        }
+                        if ui
+                            .add_sized([88.0, btn_h], egui::Button::new("Ajustar 2m"))
+                            .on_hover_text("Escala uniformemente la pieza a ~2 metros (ideal tras importar .glb)")
+                            .clicked()
+                        {
+                            discrete_action = Some("normalize_2m");
+                        }
+                    });
+
                     ui.add_space(6.0);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("Color:");
                         let mut rgba = [part.color[0], part.color[1], part.color[2], part.color[3]];
                         if ui.color_edit_button_srgba_unmultiplied(&mut rgba).changed() {
@@ -1070,8 +1270,88 @@ impl StudioApp {
                             changed_continuous = true;
                             *dirty = true;
                         }
+                        if ui.add_sized([62.0, btn_h], egui::Button::new("Copiar")).clicked() {
+                            copy_color_req = Some(part.color);
+                            copy_mat_req = Some((part.color, part.metallic, part.roughness));
+                        }
+                        if ui
+                            .add_enabled(
+                                copied_col_snapshot.is_some(),
+                                egui::Button::new("Pegar").min_size(egui::vec2(58.0, btn_h)),
+                            )
+                            .clicked()
+                        {
+                            discrete_action = Some("paste_color");
+                        }
+                        if ui
+                            .add_enabled(
+                                copied_mat_snapshot.is_some(),
+                                egui::Button::new("Pegar Mat").min_size(egui::vec2(76.0, btn_h)),
+                            )
+                            .on_hover_text("Pega color, metálico y rugosidad copiados")
+                            .clicked()
+                        {
+                            discrete_action = Some("paste_material");
+                        }
+                        if let Some(c) = copied_col_snapshot {
+                            let c32 = egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
+                            let (r, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                            ui.painter().rect_filled(r, 3.0, c32);
+                            ui.painter().rect_stroke(
+                                r,
+                                3.0,
+                                egui::Stroke::new(1.0, egui::Color32::WHITE),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                    });
+
+                    // Quick palette swatches & fill buttons
+                    let sz = if compact { 22.0 } else { 18.0 };
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                        for &(name, col) in &QUICK_PALETTE {
+                            let c32 = egui::Color32::from_rgba_unmultiplied(col[0], col[1], col[2], col[3]);
+                            let (rect, resp) = ui.allocate_exact_size(egui::vec2(sz, sz), egui::Sense::click());
+                            ui.painter().rect_filled(rect, 3.0, c32);
+                            ui.painter().rect_stroke(
+                                rect,
+                                3.0,
+                                egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 78, 92)),
+                                egui::StrokeKind::Inside,
+                            );
+                            if resp.on_hover_text(name).clicked() {
+                                part.color = col;
+                                changed_continuous = true;
+                                *dirty = true;
+                            }
+                        }
+                    });
+
+                    ui.horizontal_wrapped(|ui| {
+                        if part.group.is_some()
+                            && ui.add_sized([108.0, btn_h], egui::Button::new("Rellenar grupo")).clicked()
+                        {
+                            fill_color_group = Some(part.color);
+                        }
+                        if ui.add_sized([104.0, btn_h], egui::Button::new("Rellenar todo")).clicked() {
+                            fill_color_all = Some(part.color);
+                        }
+                        if part.kind == PrimitiveKind::CustomMesh {
+                            if let Some(orig) = part.custom_mesh.as_ref().map(|m| m.material.base_color) {
+                                if orig != part.color
+                                    && ui.add_sized([108.0, btn_h], egui::Button::new("Color original")).clicked()
+                                {
+                                    discrete_action = Some("restore_original_color");
+                                }
+                            }
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
                         ui.label("Seg:");
-                        if ui.add(egui::DragValue::new(&mut part.segments).range(6..=48)).changed() {
+                        let max_seg = if part.kind == PrimitiveKind::Terrain { 64 } else { 48 };
+                        if ui.add(egui::DragValue::new(&mut part.segments).range(6..=max_seg)).changed() {
                             changed_continuous = true;
                             *dirty = true;
                         }
@@ -1118,6 +1398,196 @@ impl StudioApp {
                             );
                         });
                     });
+
+                    if part.kind == PrimitiveKind::Terrain {
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.label(egui::RichText::new("Editor de Terreno 3D").strong());
+                        ui.horizontal_wrapped(|ui| {
+                            for preset in TerrainPreset::ALL {
+                                if ui
+                                    .add_sized(
+                                        [78.0, btn_h],
+                                        egui::Button::selectable(part.terrain.preset == preset, preset.label()),
+                                    )
+                                    .clicked()
+                                    && part.terrain.preset != preset
+                                {
+                                    part.terrain.preset = preset;
+                                    changed_continuous = true;
+                                    *dirty = true;
+                                }
+                            }
+                        });
+                        if ui
+                            .add(egui::Slider::new(&mut part.terrain.amplitude, 0.0..=2.5).text("Relieve"))
+                            .changed()
+                        {
+                            changed_continuous = true;
+                            *dirty = true;
+                        }
+                        if ui
+                            .add(egui::Slider::new(&mut part.terrain.frequency, 0.5..=8.0).text("Frecuencia"))
+                            .changed()
+                        {
+                            changed_continuous = true;
+                            *dirty = true;
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Octavas:");
+                            if ui
+                                .add(egui::DragValue::new(&mut part.terrain.octaves).range(1..=6))
+                                .changed()
+                            {
+                                changed_continuous = true;
+                                *dirty = true;
+                            }
+                            ui.label("Semilla:");
+                            if ui
+                                .add(egui::DragValue::new(&mut part.terrain.seed).speed(1.0))
+                                .changed()
+                            {
+                                changed_continuous = true;
+                                *dirty = true;
+                            }
+                            if ui.add_sized([84.0, btn_h], egui::Button::new("Aleatorizar")).clicked() {
+                                part.terrain.seed = part.terrain.seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                                changed_continuous = true;
+                                *dirty = true;
+                            }
+                        });
+                        if ui
+                            .checkbox(&mut part.terrain.biome_tint, "Colorear por elevación (bioma)")
+                            .changed()
+                        {
+                            changed_continuous = true;
+                            *dirty = true;
+                        }
+
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("Esculpir relieve 2D (toca o arrastra para elevar/hundir):")
+                                .size(11.5)
+                                .color(egui::Color32::from_gray(180)),
+                        );
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .add_sized([82.0, btn_h], egui::Button::selectable(sculpt_raise, "Elevar (+)"))
+                                .clicked()
+                            {
+                                sculpt_raise = true;
+                            }
+                            if ui
+                                .add_sized([82.0, btn_h], egui::Button::selectable(!sculpt_raise, "Hundir (-)"))
+                                .clicked()
+                            {
+                                sculpt_raise = false;
+                            }
+                            if ui
+                                .add_enabled(
+                                    !part.terrain.stamps.is_empty(),
+                                    egui::Button::new("Deshacer trazo").min_size(egui::vec2(96.0, btn_h)),
+                                )
+                                .clicked()
+                            {
+                                part.terrain.stamps.pop();
+                                changed_continuous = true;
+                                *dirty = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    !part.terrain.stamps.is_empty(),
+                                    egui::Button::new("Limpiar").min_size(egui::vec2(64.0, btn_h)),
+                                )
+                                .clicked()
+                            {
+                                part.terrain.stamps.clear();
+                                changed_continuous = true;
+                                *dirty = true;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Slider::new(&mut brush_radius, 0.06..=0.45).text("Radio"));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Slider::new(&mut brush_strength, 0.05..=0.80).text("Fuerza"));
+                        });
+
+                        let pad_w = ui.available_width().clamp(180.0, 260.0);
+                        let pad_h = (pad_w * 0.65).clamp(115.0, 170.0);
+                        let (pad_resp, painter) =
+                            ui.allocate_painter(egui::vec2(pad_w, pad_h), egui::Sense::click_and_drag());
+                        let prect = pad_resp.rect;
+
+                        // Top-down heightmap preview grid
+                        let grid_n = 20usize;
+                        let cw = prect.width() / grid_n as f32;
+                        let ch = prect.height() / grid_n as f32;
+                        let mut hs = Vec::with_capacity(grid_n * grid_n);
+                        let mut min_h = f32::INFINITY;
+                        let mut max_h = f32::NEG_INFINITY;
+                        for gz in 0..grid_n {
+                            let nz = (gz as f32 + 0.5) / grid_n as f32 - 0.5;
+                            for gx in 0..grid_n {
+                                let nx = (gx as f32 + 0.5) / grid_n as f32 - 0.5;
+                                let h = terrain_height_at(&part.terrain, nx, nz);
+                                min_h = min_h.min(h);
+                                max_h = max_h.max(h);
+                                hs.push(h);
+                            }
+                        }
+                        let span = (max_h - min_h).max(1e-4);
+                        for gz in 0..grid_n {
+                            for gx in 0..grid_n {
+                                let t = ((hs[gz * grid_n + gx] - min_h) / span).clamp(0.0, 1.0);
+                                let r = (36.0 + t * 175.0) as u8;
+                                let g = (62.0 + t * 155.0) as u8;
+                                let b = (48.0 + t * 120.0) as u8;
+                                let cell = egui::Rect::from_min_size(
+                                    egui::pos2(prect.left() + gx as f32 * cw, prect.top() + gz as f32 * ch),
+                                    egui::vec2(cw + 0.6, ch + 0.6),
+                                );
+                                painter.rect_filled(cell, 0.0, egui::Color32::from_rgb(r, g, b));
+                            }
+                        }
+                        painter.rect_stroke(
+                            prect,
+                            4.0,
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(72, 82, 98)),
+                            egui::StrokeKind::Inside,
+                        );
+
+                        if (pad_resp.clicked() || pad_resp.dragged()) && pad_resp.interact_pointer_pos().is_some() {
+                            if let Some(ptr) = pad_resp.interact_pointer_pos() {
+                                let nx = ((ptr.x - prect.left()) / prect.width()).clamp(0.0, 1.0) - 0.5;
+                                let nz = ((ptr.y - prect.top()) / prect.height()).clamp(0.0, 1.0) - 0.5;
+                                let should_stamp = if pad_resp.clicked() {
+                                    true
+                                } else if let Some(prev) = sculpt_last {
+                                    let dx = nx - prev[0];
+                                    let dz = nz - prev[1];
+                                    (dx * dx + dz * dz).sqrt() >= (brush_radius * 0.28)
+                                } else {
+                                    true
+                                };
+                                if should_stamp {
+                                    let signed_h = if sculpt_raise { brush_strength } else { -brush_strength };
+                                    part.terrain.stamps.push(TerrainStamp {
+                                        x: nx,
+                                        z: nz,
+                                        radius: brush_radius,
+                                        height: signed_h,
+                                    });
+                                    sculpt_last = Some([nx, nz]);
+                                    changed_continuous = true;
+                                    *dirty = true;
+                                }
+                            }
+                        }
+                        if pad_resp.drag_stopped() {
+                            sculpt_last = None;
+                        }
+                    }
 
                     if part.kind.uses_profile() {
                         ui.add_space(6.0);
@@ -1571,11 +2041,133 @@ impl StudioApp {
 
                 self.selected_profile_pt = selected_pt;
                 self.dragging_profile_pt = dragging_pt;
+                self.terrain_sculpt_raise = sculpt_raise;
+                self.terrain_brush_radius = brush_radius;
+                self.terrain_brush_strength = brush_strength;
+                self.terrain_sculpt_last = sculpt_last;
+
+                if let Some(c) = copy_color_req {
+                    self.copied_color = Some(c);
+                    self.status_note = format!("Color copiado ({}, {}, {})", c[0], c[1], c[2]);
+                }
+                if let Some(m) = copy_mat_req {
+                    self.copied_material = Some(m);
+                }
 
                 if changed_continuous {
                     self.begin_continuous_edit(ui);
                 }
                 self.flush_continuous_edit(ui);
+
+                if let Some(col) = fill_color_group {
+                    if let Some(g_name) = self.scene.parts[sel_idx].group.clone() {
+                        self.push_undo();
+                        for p in &mut self.scene.parts {
+                            if p.group.as_deref() == Some(g_name.as_str()) {
+                                p.color = col;
+                            }
+                        }
+                        self.status_note = format!("Grupo '{g_name}' rellenado");
+                        *dirty = true;
+                    }
+                }
+                if let Some(col) = fill_color_all {
+                    self.push_undo();
+                    for p in &mut self.scene.parts {
+                        p.color = col;
+                    }
+                    self.status_note = String::from("Todas las piezas rellenadas con el color");
+                    *dirty = true;
+                }
+                if let Some(act) = discrete_action {
+                    match act {
+                        "paste_color" => {
+                            if let Some(c) = self.copied_color {
+                                self.push_undo();
+                                self.scene.parts[sel_idx].color = c;
+                                self.status_note = String::from("Color pegado");
+                                *dirty = true;
+                            }
+                        }
+                        "paste_material" => {
+                            if let Some((c, met, rough)) = self.copied_material {
+                                self.push_undo();
+                                self.scene.parts[sel_idx].color = c;
+                                self.scene.parts[sel_idx].metallic = met;
+                                self.scene.parts[sel_idx].roughness = rough;
+                                self.status_note = String::from("Material pegado (color + metálico + rugosidad)");
+                                *dirty = true;
+                            }
+                        }
+                        "restore_original_color" => {
+                            if let Some(orig) = self.scene.parts[sel_idx]
+                                .custom_mesh
+                                .as_ref()
+                                .map(|m| m.material.base_color)
+                            {
+                                self.push_undo();
+                                self.scene.parts[sel_idx].color = orig;
+                                self.status_note = String::from("Color original de malla restaurado");
+                                *dirty = true;
+                            }
+                        }
+                        "ground" => {
+                            if part_bounds.is_valid() {
+                                self.push_undo();
+                                self.scene.parts[sel_idx].position[1] -= part_bounds.min[1];
+                                self.status_note = String::from("Pieza apoyada en el suelo (Y=0)");
+                                *dirty = true;
+                            }
+                        }
+                        "center_xz" => {
+                            self.push_undo();
+                            self.scene.parts[sel_idx].position[0] = 0.0;
+                            self.scene.parts[sel_idx].position[2] = 0.0;
+                            self.status_note = String::from("Pieza centrada en XZ");
+                            *dirty = true;
+                        }
+                        "normalize_2m" => {
+                            if part_bounds.is_valid() {
+                                let dx = part_bounds.max[0] - part_bounds.min[0];
+                                let dy = part_bounds.max[1] - part_bounds.min[1];
+                                let dz = part_bounds.max[2] - part_bounds.min[2];
+                                let max_dim = dx.max(dy).max(dz);
+                                if max_dim > 1e-4 {
+                                    let factor = 2.0 / max_dim;
+                                    self.push_undo();
+                                    let p = &mut self.scene.parts[sel_idx];
+                                    for axis in 0..3 {
+                                        p.scale[axis] = (p.scale[axis] * factor).clamp(0.01, 100.0);
+                                    }
+                                    self.status_note = String::from("Pieza ajustada a 2m");
+                                    *dirty = true;
+                                }
+                            }
+                        }
+                        "duplicate" => {
+                            self.push_undo();
+                            let mut cloned = self.scene.parts[sel_idx].clone();
+                            cloned.name = format!("{}_copia", cloned.name);
+                            cloned.position[0] += 0.45;
+                            self.scene.parts.push(cloned);
+                            self.selection = Some(Selection::Part(self.scene.parts.len() - 1));
+                            self.status_note = String::from("Pieza duplicada");
+                            *dirty = true;
+                        }
+                        "delete" => {
+                            self.push_undo();
+                            self.scene.parts.remove(sel_idx);
+                            self.selection = if self.scene.parts.is_empty() {
+                                None
+                            } else {
+                                Some(Selection::Part(sel_idx.min(self.scene.parts.len() - 1)))
+                            };
+                            self.status_note = String::from("Pieza eliminada");
+                            *dirty = true;
+                        }
+                        _ => {}
+                    }
+                }
 
                 if let Some(mode) = discrete_shading_change {
                     self.push_undo();
@@ -2346,7 +2938,7 @@ impl StudioApp {
             }
         } else if let Some(mt) = ui.input(|i| i.multi_touch()) {
             if (mt.zoom_delta - 1.0).abs() > 0.001 {
-                self.camera.distance = (self.camera.distance / mt.zoom_delta.max(0.5)).clamp(0.6, 250.0);
+                self.camera.distance = (self.camera.distance / mt.zoom_delta.max(0.5)).clamp(0.15, 5000.0);
             }
             if mt.translation_delta.length_sq() > 0.01 {
                 self.camera.pan(mt.translation_delta.x, mt.translation_delta.y);
@@ -2387,7 +2979,7 @@ impl StudioApp {
         if response.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll.abs() > 0.0 {
-                self.camera.distance = (self.camera.distance * (1.0 - scroll * 0.0018)).clamp(0.6, 250.0);
+                self.camera.distance = (self.camera.distance * (1.0 - scroll * 0.0018)).clamp(0.15, 5000.0);
             }
         }
 
@@ -2620,13 +3212,14 @@ impl StudioApp {
                                 ui.toggle_value(&mut self.show_grid, "Grid");
                                 ui.toggle_value(&mut self.show_colliders, "Col.");
                                 if ui.add_sized([28.0, btn_h], egui::Button::new("+")).on_hover_text("Acercar").clicked() {
-                                    self.camera.distance = (self.camera.distance * 0.82).clamp(0.6, 250.0);
+                                    self.camera.distance = (self.camera.distance * 0.82).clamp(0.15, 5000.0);
                                 }
                                 if ui.add_sized([28.0, btn_h], egui::Button::new("-")).on_hover_text("Alejar").clicked() {
-                                    self.camera.distance = (self.camera.distance * 1.22).clamp(0.6, 250.0);
+                                    self.camera.distance = (self.camera.distance * 1.22).clamp(0.15, 5000.0);
                                 }
                                 if ui.add_sized([64.0, btn_h], egui::Button::new("Centrar")).clicked() {
                                     self.camera = OrbitCamera::default();
+                                    self.camera.frame_bounds(self.baked_model.bounds());
                                 }
                                 if !compact {
                                     ui.separator();
@@ -3021,14 +3614,17 @@ impl StudioApp {
         #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
         {
             let _ = ctx;
-            let exts: Vec<&str> = accept
+            let mut exts: Vec<String> = accept
                 .split(',')
                 .map(|s| s.trim().trim_start_matches('.'))
                 .filter(|s| !s.is_empty())
+                .flat_map(|s| [s.to_ascii_lowercase(), s.to_ascii_uppercase()])
                 .collect();
+            exts.dedup();
+            let ext_refs: Vec<&str> = exts.iter().map(String::as_str).collect();
             let picked = rfd::FileDialog::new()
                 .set_title("Importar Forja3D (.f3d / .f3a / .f3p / .f2d / .f3t / .glb)")
-                .add_filter("Assets Forja3D & 3D", &exts)
+                .add_filter("Assets Forja3D & 3D", &ext_refs)
                 .pick_file();
             if let Some(path) = picked {
                 match std::fs::read(&path) {
