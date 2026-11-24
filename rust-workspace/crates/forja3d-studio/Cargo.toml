@@ -44,7 +44,7 @@ android-build = "0.1"
 [package.metadata.android]
 package = "dev.aethravox.forja3d"
 apk_name = "forja3d-studio"
-build_targets = ["aarch64-linux-android"]
+build_targets = ["aarch64-linux-android", "armv7-linux-androideabi"]
 
 [package.metadata.android.sdk]
 min_sdk_version = 26
@@ -53,9 +53,3 @@ target_sdk_version = 34
 [package.metadata.android.application]
 label = "Forja3D Studio"
 theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
-
-[package.metadata.android.signing.release]
-keystore = "release.keystore"
-keystore_password = "forja3d-ci"
-alias = "forja3d"
-key_password = "forja3d-ci"

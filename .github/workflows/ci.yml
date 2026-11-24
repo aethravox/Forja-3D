@@ -174,7 +174,7 @@ jobs:
           java-version: "17"
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android
+          targets: aarch64-linux-android, armv7-linux-androideabi
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust-workspace
@@ -189,15 +189,28 @@ jobs:
             "platforms;android-34" \
             "build-tools;34.0.0" \
             "ndk;26.1.10909125"
-      - name: Generate release keystore & Build Release APK
+      - name: Prepare Android Keystore (Secret or Auto-generated)
         run: |
-          keytool -genkeypair -noprompt \
-            -keystore rust-workspace/crates/forja3d-studio/release.keystore \
-            -storepass forja3d-ci \
-            -keypass forja3d-ci \
-            -alias forja3d \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=Forja3D, OU=Studio, O=Aethravox, L=Dev, S=Dev, C=US"
+          mkdir -p "${RUNNER_TEMP}/keystore"
+          KEYSTORE="${RUNNER_TEMP}/keystore/release.keystore"
+          if [[ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]]; then
+            echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "$KEYSTORE"
+            echo "CARGO_APK_RELEASE_KEYSTORE=$KEYSTORE" >> "$GITHUB_ENV"
+            echo "CARGO_APK_RELEASE_KEYSTORE_PASSWORD=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}" >> "$GITHUB_ENV"
+          else
+            keytool -genkeypair -noprompt \
+              -keystore "$KEYSTORE" \
+              -storepass forja3d-ci \
+              -keypass forja3d-ci \
+              -alias forja3d \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Forja3D, OU=Studio, O=Aethravox, L=Dev, S=Dev, C=US"
+            echo "CARGO_APK_RELEASE_KEYSTORE=$KEYSTORE" >> "$GITHUB_ENV"
+            echo "CARGO_APK_RELEASE_KEYSTORE_PASSWORD=forja3d-ci" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build & Sign Android Release APK (64-bit + 32-bit)
+        run: |
           cargo apk build --manifest-path rust-workspace/crates/forja3d-studio/Cargo.toml --release --lib
           APK_PATH=$(find rust-workspace/target -name "*.apk" 2>/dev/null | head -n 1)
           if [ -z "$APK_PATH" ]; then
@@ -205,22 +218,17 @@ jobs:
           fi
           echo "Found APK at: $APK_PATH"
           test -n "$APK_PATH"
-          cp "$APK_PATH" forja3d-studio-android-arm64.apk
+          cp "$APK_PATH" forja3d-studio-android.apk
           APKSIGNER="${ANDROID_SDK_ROOT}/build-tools/34.0.0/apksigner"
-          rm -f release.keystore
-          keytool -genkeypair -noprompt \
-            -keystore release.keystore \
-            -storepass forja3d-ci \
-            -keypass forja3d-ci \
-            -alias forja3d \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=Forja3D, OU=Studio, O=Aethravox, L=Dev, S=Dev, C=US"
-          "$APKSIGNER" sign \
-            --ks release.keystore \
-            --ks-pass "pass:forja3d-ci" \
-            forja3d-studio-android-arm64.apk
-          "$APKSIGNER" verify forja3d-studio-android-arm64.apk
+          if ! "$APKSIGNER" verify forja3d-studio-android.apk >/dev/null 2>&1; then
+            "$APKSIGNER" sign \
+              --ks "$CARGO_APK_RELEASE_KEYSTORE" \
+              --ks-pass "pass:${CARGO_APK_RELEASE_KEYSTORE_PASSWORD}" \
+              forja3d-studio-android.apk
+          fi
+          "$APKSIGNER" verify forja3d-studio-android.apk
+
       - uses: actions/upload-artifact@v4
         with:
           name: Android
-          path: forja3d-studio-android-arm64.apk
+          path: forja3d-studio-android.apk
