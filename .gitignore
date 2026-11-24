@@ -18,6 +18,8 @@ rust-workspace/target/
 /src/
 /tailwind.config.js
 /postcss.config.js
+.vite/
+*.mjs
 
 
 
