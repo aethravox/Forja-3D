@@ -2,6 +2,7 @@ name: Multi-Platform Release
 
 on:
   push:
+    branches: ["main"]
     tags:
       - "v*"
   workflow_dispatch:
@@ -266,6 +267,7 @@ jobs:
   publish-release:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     needs: [build-windows, build-linux, build-macos, build-wasm, build-android]
     steps:
       - uses: actions/download-artifact@v4
