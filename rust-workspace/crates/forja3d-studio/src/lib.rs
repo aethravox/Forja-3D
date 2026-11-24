@@ -5,7 +5,7 @@ use eframe::egui;
 use forja3d::{
     default_extrude_profile, default_lathe_profile, format::fnv1a_32, terrain_height_at,
     Anchor2D, AnimationClip, AnimationProperty, AnimationSet, AnimationTrack, ColliderShape,
-    Document2D, ForjaPack, InterpolationMode, Keyframe, Model, PartSpec, PrimitiveKind,
+    ForjaPack, InterpolationMode, Keyframe, Model, PartSpec, PrimitiveKind,
     RigidBodyKind, RustExportTarget, SceneDocument, ShadingMode, TerrainPreset, TerrainStamp,
     Texture, UiDocument2D, Widget2D, WidgetKind2D, F2D_MAGIC, F3A_MAGIC, F3P_MAGIC, F3T_MAGIC,
     FLAG_COMPACT, FLAG_PHYSICS,

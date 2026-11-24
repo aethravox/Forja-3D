@@ -1,9 +1,9 @@
 use forja3d::{
-    default_extrude_profile, Anchor2D, AnimationClip, AnimationProperty, AnimationSet,
-    AnimationTargetKind, AnimationTrack, ColliderShape, DecodeError, Document2D, ForjaPack,
+    default_extrude_profile, AnimationClip, AnimationProperty, AnimationSet,
+    AnimationTargetKind, AnimationTrack, ColliderShape, DecodeError, ForjaPack,
     InterpolationMode, Keyframe, Model, PartSpec, PrimitiveKind, RigidBodyKind, RustExportTarget,
     SceneDocument, ShadingMode, TerrainPreset, TerrainStamp, Texture, UiDocument2D, Widget2D,
-    WidgetKind2D, F2D_MAGIC, F3A_MAGIC, F3P_MAGIC, F3T_MAGIC, FLAG_COMPACT, FLAG_PHYSICS, MAGIC,
+    F2D_MAGIC, F3A_MAGIC, F3P_MAGIC, F3T_MAGIC, FLAG_COMPACT, FLAG_PHYSICS, MAGIC,
 };
 
 #[test]

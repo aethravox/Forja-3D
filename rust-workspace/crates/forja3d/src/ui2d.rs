@@ -1,6 +1,6 @@
 use alloc::{
     format,
-    string::{String, ToString},
+    string::String,
     vec::Vec,
 };
 

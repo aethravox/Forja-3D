@@ -38,6 +38,7 @@ impl DecodedImage {
     }
 }
 
+#[allow(dead_code)]
 pub fn import_gltf_or_glb(
     filename: Option<&str>,
     bytes: &[u8],
