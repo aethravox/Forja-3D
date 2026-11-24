@@ -4,7 +4,7 @@ extern crate alloc;
 
 use alloc::{string::String, vec, vec::Vec};
 use forja3d::{
-    math::sqrtf, Aabb, ColliderShape, ColliderSpec, DecodeError, Model, PhysicsAsset, PhysicsSpec,
+    math::sqrtf, Aabb, ColliderShape, ColliderSpec, DecodeError, ForjaPack, Model, PhysicsSpec,
     RigidBodyKind, Vec3,
 };
 
@@ -128,8 +128,8 @@ impl RigidBody {
         }
     }
 
-    pub fn from_physics_asset(asset: &PhysicsAsset, position: [f32; 3]) -> Self {
-        Self::from_physics_spec(asset.name.clone(), position, &asset.spec, Aabb::EMPTY)
+    pub fn from_pack(pack: &ForjaPack, position: [f32; 3]) -> Option<Self> {
+        pack.model.as_ref().map(|m| Self::from_model(m, position))
     }
 
     pub fn world_aabb(&self) -> Aabb {
@@ -196,25 +196,24 @@ impl PhysicsWorld {
         self.add_body(body)
     }
 
-    /// Spawn a standalone `.f3p` `PhysicsAsset` directly.
-    pub fn spawn_from_physics_asset(
+    /// Spawn a `.f3p` `ForjaPack` complete package (if it contains geometry/model).
+    pub fn spawn_from_pack(
         &mut self,
-        asset: &PhysicsAsset,
+        pack: &ForjaPack,
         position: [f32; 3],
-    ) -> BodyHandle {
-        let body = RigidBody::from_physics_asset(asset, position);
-        self.add_body(body)
+    ) -> Option<BodyHandle> {
+        let body = RigidBody::from_pack(pack, position)?;
+        Some(self.add_body(body))
     }
 
-    /// Decode a `.f3p` binary stream, apply its gravity vector, and spawn the rigid body.
+    /// Decode a `.f3p` binary stream and spawn the rigid body if a model is present.
     pub fn spawn_from_f3p_bytes(
         &mut self,
         bytes: &[u8],
         position: [f32; 3],
-    ) -> Result<BodyHandle, DecodeError> {
-        let asset = PhysicsAsset::from_bytes(bytes)?;
-        self.gravity = asset.gravity;
-        Ok(self.spawn_from_physics_asset(&asset, position))
+    ) -> Result<Option<BodyHandle>, DecodeError> {
+        let pack = ForjaPack::from_bytes(bytes)?;
+        Ok(self.spawn_from_pack(&pack, position))
     }
 
     pub fn add_static_box(

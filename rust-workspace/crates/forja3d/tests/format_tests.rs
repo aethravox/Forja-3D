@@ -1,9 +1,9 @@
 use forja3d::{
-    default_extrude_profile, AnimationClip, AnimationProperty, AnimationSet, AnimationTrack,
-    ColliderShape, DecodeError, Document2D, InterpolationMode, Keyframe, Model, PartSpec,
-    PhysicsAsset, PrimitiveKind, RigidBodyKind, RustExportTarget, SceneDocument, ShadingMode,
-    SpriteQuad2D, Texture, F2D_MAGIC, F3A_MAGIC, F3P_MAGIC, F3T_MAGIC, FLAG_COMPACT, FLAG_PHYSICS,
-    MAGIC,
+    default_extrude_profile, Anchor2D, AnimationClip, AnimationProperty, AnimationSet,
+    AnimationTargetKind, AnimationTrack, ColliderShape, DecodeError, Document2D, ForjaPack,
+    InterpolationMode, Keyframe, Model, PartSpec, PrimitiveKind, RigidBodyKind, RustExportTarget,
+    SceneDocument, ShadingMode, Texture, UiDocument2D, Widget2D, WidgetKind2D, F2D_MAGIC,
+    F3A_MAGIC, F3P_MAGIC, F3T_MAGIC, FLAG_COMPACT, FLAG_PHYSICS, MAGIC,
 };
 
 #[test]
@@ -289,46 +289,84 @@ fn roundtrip_f3a_animation_and_sampling() {
 }
 
 #[test]
-fn roundtrip_f3p_physics_asset() {
+fn roundtrip_f3p_pack_all_in_one() {
     let mut scene = SceneDocument::preset_drone();
     scene.auto_generate_colliders();
     let model = scene.bake();
 
-    let mut asset = PhysicsAsset::from_model(&model);
-    asset.gravity = [0.0, -3.72, 0.0];
-    let bytes = asset.to_bytes();
+    let tex = Texture::new_rgba("albedo_dron", 2, 2, vec![255; 16]);
+
+    let mut anim_set = AnimationSet::new("VueloDron");
+    let mut clip = AnimationClip::new("Flotar", 1.0, true);
+    let mut track = AnimationTrack::new_with_kind(
+        "chasis",
+        AnimationTargetKind::Node,
+        AnimationProperty::Translation,
+        InterpolationMode::Linear,
+    );
+    track.keyframes.push(Keyframe {
+        time: 0.0,
+        value: [0.0, 0.0, 0.0, 0.0],
+    });
+    clip.tracks.push(track);
+    anim_set.clips.push(clip);
+
+    let mut pack = ForjaPack::new("DronCompleto");
+    pack.model = Some(model.clone());
+    pack.textures.push(tex.clone());
+    pack.animations.push(anim_set.clone());
+
+    let bytes = pack.to_bytes();
     assert_eq!(&bytes[0..4], &F3P_MAGIC);
 
-    let decoded = PhysicsAsset::from_bytes(&bytes).expect("valid .f3p should decode");
-    assert_eq!(decoded, asset);
-    assert!(!decoded.spec.colliders.is_empty());
+    let decoded = ForjaPack::from_bytes(&bytes).expect("valid .f3p should decode");
+    assert_eq!(decoded.name, "DronCompleto");
+    assert_eq!(decoded.model, Some(model));
+    assert_eq!(decoded.textures.len(), 1);
+    assert_eq!(decoded.textures[0], tex);
+    assert_eq!(decoded.animations.len(), 1);
+    assert_eq!(decoded.animations[0], anim_set);
+    assert_eq!(decoded.total_animation_clips(), 1);
 
     let mut bad = bytes.clone();
     let last = bad.len() - 1;
     bad[last] ^= 0xFF;
     assert!(matches!(
-        PhysicsAsset::from_bytes(&bad),
+        ForjaPack::from_bytes(&bad),
         Err(DecodeError::ChecksumMismatch { .. })
     ));
 }
 
 #[test]
-fn roundtrip_f2d_document_and_f3t_texture() {
+fn roundtrip_f2d_screen_document_and_f3t_texture() {
     let profile = default_extrude_profile();
-    let mut doc = Document2D::from_profile("PerfilAla", profile.clone(), true);
-    doc.sprites.push(SpriteQuad2D {
-        name: String::from("icono"),
-        position: [0.25, -0.5],
-        size: [0.8, 0.4],
-        rotation_deg: 15.0,
-        ..SpriteQuad2D::default()
-    });
+    let mut doc = UiDocument2D::from_profile("PerfilAla", profile.clone(), true);
+    doc.widgets.push(Widget2D::new_container(
+        "panel_hud",
+        "Panel HUD",
+        [10.0, 10.0, 300.0, 120.0],
+        [20, 24, 34, 230],
+    ));
+    doc.widgets.push(Widget2D::new_button(
+        "btn_iniciar",
+        "Boton Iniciar",
+        "Iniciar Misión",
+        "on_start_mission",
+        [20.0, 20.0, 160.0, 44.0],
+    ));
+    doc.actions.push(String::from("on_pause_game"));
+
+    let rust_code = doc.to_rust_code();
+    assert!(rust_code.contains("pub enum PerfilAlaAction"));
+    assert!(rust_code.contains("OnStartMission"));
+    assert!(rust_code.contains("OnPauseGame"));
 
     let f2d_bytes = doc.to_bytes();
     assert_eq!(&f2d_bytes[0..4], &F2D_MAGIC);
-    let dec_doc = Document2D::from_bytes(&f2d_bytes).expect("valid .f2d should decode");
+    let dec_doc = UiDocument2D::from_bytes(&f2d_bytes).expect("valid .f2d should decode");
     assert_eq!(dec_doc, doc);
     assert_eq!(dec_doc.primary_profile(), Some(profile.as_slice()));
+    assert_eq!(dec_doc.widgets.len(), 3);
 
     let tex = Texture::new_rgba(
         "metal_albedo",

@@ -3,11 +3,11 @@ mod renderer;
 
 use eframe::egui;
 use forja3d::{
-    default_extrude_profile, default_lathe_profile, format::fnv1a_32, AnimationClip,
-    AnimationProperty, AnimationSet, AnimationTrack, ColliderShape, Document2D, InterpolationMode,
-    Keyframe, Model, PartSpec, PhysicsAsset, PrimitiveKind, RigidBodyKind, RustExportTarget,
-    SceneDocument, ShadingMode, SpriteQuad2D, Texture, F2D_MAGIC, F3A_MAGIC, F3P_MAGIC,
-    F3T_MAGIC, FLAG_COMPACT, FLAG_PHYSICS,
+    default_extrude_profile, default_lathe_profile, format::fnv1a_32, Anchor2D, AnimationClip,
+    AnimationProperty, AnimationSet, AnimationTrack, ColliderShape, Document2D, ForjaPack,
+    InterpolationMode, Keyframe, Model, PartSpec, PrimitiveKind, RigidBodyKind, RustExportTarget,
+    SceneDocument, ShadingMode, Texture, UiDocument2D, Widget2D, WidgetKind2D, F2D_MAGIC,
+    F3A_MAGIC, F3P_MAGIC, F3T_MAGIC, FLAG_COMPACT, FLAG_PHYSICS,
 };
 use forja3d_physics::{BodyHandle, PhysicsWorld};
 use renderer::{ray_intersects_aabb, GlViewportRenderer, OrbitCamera};
@@ -340,19 +340,35 @@ impl StudioApp {
                 }
             }
         } else if is_f3p_magic || lower.ends_with(".f3p") {
-            match PhysicsAsset::from_bytes(bytes) {
-                Ok(asset) => {
+            match ForjaPack::from_bytes(bytes) {
+                Ok(pack) => {
                     self.push_undo();
-                    let kind_label = asset.spec.body_kind.label();
-                    let collider_count = asset.spec.colliders.len();
-                    let mass = asset.spec.mass;
-                    self.scene.physics_enabled = true;
-                    self.scene.physics = asset.spec;
-                    self.rebuild_outputs();
-                    let src = filename.unwrap_or(&asset.name);
-                    self.status_note = format!(
-                        "Físicas .f3p '{src}' aplicadas ({kind_label}, {mass:.1} kg, {collider_count} colisionadores)"
-                    );
+                    let mut summary = Vec::new();
+                    if let Some(model) = pack.model {
+                        let tri = model.triangle_count();
+                        self.scene = SceneDocument::from_model(model);
+                        self.selection = if self.scene.parts.is_empty() {
+                            None
+                        } else {
+                            Some(Selection::Part(0))
+                        };
+                        self.rebuild_outputs();
+                        self.camera.frame_bounds(self.baked_model.bounds());
+                        summary.push(format!("malla {} tri", tri));
+                    }
+                    if !pack.textures.is_empty() {
+                        summary.push(format!("{} texturas", pack.textures.len()));
+                    }
+                    if !pack.animations.is_empty() {
+                        summary.push(format!("{} animaciones", pack.animations.len()));
+                    }
+                    let src = filename.unwrap_or(&pack.name);
+                    let info = if summary.is_empty() {
+                        String::from("vacío")
+                    } else {
+                        summary.join(", ")
+                    };
+                    self.status_note = format!("Paquete .f3p '{src}' importado ({info})");
                 }
                 Err(err) => {
                     self.status_note = format!("Error al importar .f3p: {err}");
@@ -374,9 +390,10 @@ impl StudioApp {
                 }
             }
         } else if is_f2d_magic || lower.ends_with(".f2d") {
-            match Document2D::from_bytes(bytes) {
+            match UiDocument2D::from_bytes(bytes) {
                 Ok(doc) => {
-                    let pt_count = doc.primary_profile().map_or(0, |p| p.len());
+                    let widget_count = doc.widgets.len();
+                    let action_count = doc.actions.len();
                     if let Some(pts) = doc.primary_profile() {
                         if pts.len() >= 3 {
                             self.push_undo();
@@ -409,9 +426,7 @@ impl StudioApp {
                     }
                     let src = filename.unwrap_or(&doc.name);
                     self.status_note = format!(
-                        "Vector .f2d '{src}' aplicado ({} rutas, {pt_count} pts, {} sprites)",
-                        doc.paths.len(),
-                        doc.sprites.len()
+                        "Pantalla 2D .f2d '{src}' ({widget_count} controles, {action_count} acciones .rs)"
                     );
                 }
                 Err(err) => {
@@ -459,8 +474,12 @@ impl StudioApp {
         }
     }
 
-    fn build_physics_asset(&self) -> PhysicsAsset {
-        PhysicsAsset::from_model(&self.baked_model)
+    fn build_pack_asset(&self) -> ForjaPack {
+        let mut pack = ForjaPack::new(self.scene.model_name.clone());
+        pack.model = Some(self.baked_model.clone());
+        pack.textures.push(self.build_texture_asset());
+        pack.animations.push(self.build_animation_asset());
+        pack
     }
 
     fn build_animation_asset(&self) -> AnimationSet {
@@ -528,7 +547,7 @@ impl StudioApp {
         set
     }
 
-    fn build_2d_asset(&self) -> Document2D {
+    fn build_2d_asset(&self) -> UiDocument2D {
         let (profile_name, points, closed) = match self.selection {
             Some(Selection::Part(idx)) => match self.scene.parts.get(idx) {
                 Some(part) if !part.profile.is_empty() => (
@@ -548,17 +567,34 @@ impl StudioApp {
                 true,
             ),
         };
-        let mut doc = Document2D::from_profile(profile_name, points, closed);
-        for part in self.scene.parts.iter().filter(|p| p.visible).take(16) {
-            doc.sprites.push(SpriteQuad2D {
-                name: part.name.clone(),
-                position: [part.position[0], part.position[1]],
-                size: [part.scale[0].abs().max(0.1), part.scale[1].abs().max(0.1)],
-                rotation_deg: part.rotation_deg[2],
-                uv_rect: [0.0, 0.0, 1.0, 1.0],
-                tint: part.color,
-            });
-        }
+        let mut doc = UiDocument2D::from_profile(profile_name, points, closed);
+        doc.widgets.push(Widget2D::new_container(
+            "panel_hud",
+            "Panel HUD",
+            [20.0, 20.0, 360.0, 200.0],
+            [16, 20, 28, 230],
+        ));
+        doc.widgets.push(Widget2D::new_button(
+            "btn_iniciar",
+            "Boton Iniciar",
+            "Comenzar",
+            "on_iniciar",
+            [40.0, 40.0, 140.0, 42.0],
+        ));
+        doc.widgets.push(Widget2D {
+            id: String::from("lbl_titulo"),
+            name: String::from("Etiqueta Titulo"),
+            rect: [40.0, 100.0, 220.0, 28.0],
+            anchor: Anchor2D::TopLeft,
+            visible: true,
+            kind: WidgetKind2D::Text {
+                content: format!("Interfaz {}", self.scene.model_name),
+                font_size: 15.0,
+                color: [243, 244, 246, 255],
+            },
+        });
+        doc.actions.push(String::from("on_iniciar"));
+        doc.actions.push(String::from("on_pausa"));
         doc
     }
 
@@ -1889,8 +1925,8 @@ impl StudioApp {
             }
             ExportTab::AssetFormats => {
                 let base_name = self.scene.model_name.to_lowercase();
-                let phys_asset = self.build_physics_asset();
-                let phys_bytes = phys_asset.to_bytes();
+                let pack_asset = self.build_pack_asset();
+                let pack_bytes = pack_asset.to_bytes();
                 let anim_asset = self.build_animation_asset();
                 let anim_bytes = anim_asset.to_bytes();
                 let doc2d = self.build_2d_asset();
@@ -1903,20 +1939,20 @@ impl StudioApp {
                     .show(ui, |ui| {
                         let card_fill = egui::Color32::from_rgb(22, 26, 35);
 
-                        // .f3p Physics
+                        // .f3p Pack (Paquete completo todo-en-uno)
                         egui::Frame::new()
                             .fill(card_fill)
                             .inner_margin(8.0)
                             .corner_radius(6.0)
                             .show(ui, |ui| {
-                                ui.label(egui::RichText::new(".f3p · Físicas (F3P1)").strong());
+                                ui.label(egui::RichText::new(".f3p · Paquete Completo Todo-en-Uno (F3P1)").strong());
+                                let m_tri = pack_asset.total_mesh_triangles();
+                                let tex_count = pack_asset.textures.len();
+                                let clip_count = pack_asset.total_animation_clips();
                                 ui.label(
                                     egui::RichText::new(format!(
-                                        "{} · {:.1} kg · {} colisionadores · {} B",
-                                        phys_asset.spec.body_kind.label(),
-                                        phys_asset.spec.mass,
-                                        phys_asset.spec.colliders.len(),
-                                        phys_bytes.len()
+                                        "Malla ({m_tri} tri) + {tex_count} textura + {clip_count} clips de animación · {} B",
+                                        pack_bytes.len()
                                     ))
                                     .size(11.5)
                                     .color(egui::Color32::from_gray(180)),
@@ -1924,9 +1960,9 @@ impl StudioApp {
                                 ui.horizontal_wrapped(|ui| {
                                     if ui.add_sized([114.0, btn_h], egui::Button::new("Descargar .f3p")).clicked() {
                                         let file = format!("{base_name}.f3p");
-                                        match trigger_download(&file, &phys_bytes, "application/octet-stream") {
+                                        match trigger_download(&file, &pack_bytes, "application/octet-stream") {
                                             Ok(Some(saved)) => self.status_note = format!("Guardado: {saved}"),
-                                            Ok(None) => self.status_note = format!("Exportado {file} ({} B)", phys_bytes.len()),
+                                            Ok(None) => self.status_note = format!("Exportado {file} ({} B)", pack_bytes.len()),
                                             Err(err) => self.status_note = err,
                                         }
                                     }
@@ -1934,11 +1970,13 @@ impl StudioApp {
                                         self.request_import(ui.ctx(), ".f3p");
                                     }
                                     if ui.add_sized([110.0, btn_h], egui::Button::new("Probar .f3p")).clicked() {
-                                        match PhysicsAsset::from_bytes(&phys_bytes) {
+                                        match ForjaPack::from_bytes(&pack_bytes) {
                                             Ok(dec) => {
                                                 self.status_note = format!(
-                                                    "Roundtrip .f3p OK ({} colisionadores)",
-                                                    dec.spec.colliders.len()
+                                                    "Roundtrip .f3p OK ({} tri, {} texturas, {} anims)",
+                                                    dec.total_mesh_triangles(),
+                                                    dec.textures.len(),
+                                                    dec.animations.len()
                                                 );
                                             }
                                             Err(err) => self.status_note = format!("Error .f3p: {err}"),
@@ -1954,12 +1992,12 @@ impl StudioApp {
                             .inner_margin(8.0)
                             .corner_radius(6.0)
                             .show(ui, |ui| {
-                                ui.label(egui::RichText::new(".f3a · Animación (F3A1)").strong());
+                                ui.label(egui::RichText::new(".f3a · Animación por Separado (F3A1)").strong());
                                 let track_count: usize =
                                     anim_asset.clips.iter().map(|c| c.tracks.len()).sum();
                                 ui.label(
                                     egui::RichText::new(format!(
-                                        "{} clip · {track_count} pistas · {} keyframes · {} B",
+                                        "{} clips · {track_count} pistas (nodos/huesos) · {} keyframes · {} B",
                                         anim_asset.clips.len(),
                                         anim_asset.total_keyframes(),
                                         anim_bytes.len()
@@ -1994,19 +2032,18 @@ impl StudioApp {
                             });
                         ui.add_space(6.0);
 
-                        // .f2d Vector Profile / Sprites
+                        // .f2d Pantallas e Interfaces
                         egui::Frame::new()
                             .fill(card_fill)
                             .inner_margin(8.0)
                             .corner_radius(6.0)
                             .show(ui, |ui| {
-                                ui.label(egui::RichText::new(".f2d · Vector 2D / Sprites (F2D1)").strong());
-                                let pts = doc2d.primary_profile().map_or(0, |p| p.len());
+                                ui.label(egui::RichText::new(".f2d · Pantallas e Interfaces 2D (F2D1)").strong());
                                 ui.label(
                                     egui::RichText::new(format!(
-                                        "{} ruta ({pts} pts) · {} sprites · {} B",
-                                        doc2d.paths.len(),
-                                        doc2d.sprites.len(),
+                                        "{} controles visuales · {} acciones .rs · {} B",
+                                        doc2d.widgets.len(),
+                                        doc2d.actions.len(),
                                         f2d_bytes.len()
                                     ))
                                     .size(11.5)
@@ -2025,16 +2062,20 @@ impl StudioApp {
                                         self.request_import(ui.ctx(), ".f2d");
                                     }
                                     if ui.add_sized([110.0, btn_h], egui::Button::new("Probar .f2d")).clicked() {
-                                        match Document2D::from_bytes(&f2d_bytes) {
+                                        match UiDocument2D::from_bytes(&f2d_bytes) {
                                             Ok(dec) => {
                                                 self.status_note = format!(
-                                                    "Roundtrip .f2d OK ({} rutas, {} sprites)",
-                                                    dec.paths.len(),
-                                                    dec.sprites.len()
+                                                    "Roundtrip .f2d OK ({} controles, {} acciones)",
+                                                    dec.widgets.len(),
+                                                    dec.actions.len()
                                                 );
                                             }
                                             Err(err) => self.status_note = format!("Error .f2d: {err}"),
                                         }
+                                    }
+                                    if ui.add_sized([114.0, btn_h], egui::Button::new("Copiar .rs UI")).clicked() {
+                                        ui.ctx().copy_text(doc2d.to_rust_code());
+                                        self.status_note = String::from("Código de acciones .rs de pantalla copiado");
                                     }
                                 });
                             });
@@ -2046,10 +2087,10 @@ impl StudioApp {
                             .inner_margin(8.0)
                             .corner_radius(6.0)
                             .show(ui, |ui| {
-                                ui.label(egui::RichText::new(".f3t · Textura RGBA8 (F3T1)").strong());
+                                ui.label(egui::RichText::new(".f3t · Textura Binaria Propia (F3T1)").strong());
                                 ui.label(
                                     egui::RichText::new(format!(
-                                        "{}x{} px · paleta escena · {} B",
+                                        "{}x{} px · paleta sin dependencias externas · {} B",
                                         tex_asset.width,
                                         tex_asset.height,
                                         f3t_bytes.len()

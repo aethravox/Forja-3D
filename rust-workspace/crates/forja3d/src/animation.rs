@@ -53,6 +53,31 @@ impl InterpolationMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum AnimationTargetKind {
+    #[default]
+    Node = 0,
+    Bone = 1,
+}
+
+impl AnimationTargetKind {
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Node),
+            1 => Some(Self::Bone),
+            _ => None,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Node => "Nodo",
+            Self::Bone => "Hueso",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Keyframe {
     pub time: f32,
@@ -63,6 +88,7 @@ pub struct Keyframe {
 pub struct AnimationTrack {
     pub target_name: String,
     pub target_hash: u32,
+    pub target_kind: AnimationTargetKind,
     pub property: AnimationProperty,
     pub interpolation: InterpolationMode,
     pub keyframes: Vec<Keyframe>,
@@ -74,11 +100,29 @@ impl AnimationTrack {
         property: AnimationProperty,
         interpolation: InterpolationMode,
     ) -> Self {
+        Self::new_with_kind(target_name, AnimationTargetKind::Node, property, interpolation)
+    }
+
+    pub fn new_bone(
+        bone_name: impl Into<String>,
+        property: AnimationProperty,
+        interpolation: InterpolationMode,
+    ) -> Self {
+        Self::new_with_kind(bone_name, AnimationTargetKind::Bone, property, interpolation)
+    }
+
+    pub fn new_with_kind(
+        target_name: impl Into<String>,
+        target_kind: AnimationTargetKind,
+        property: AnimationProperty,
+        interpolation: InterpolationMode,
+    ) -> Self {
         let target_name = target_name.into();
         let target_hash = fnv1a_32(target_name.as_bytes());
         Self {
             target_name,
             target_hash,
+            target_kind,
             property,
             interpolation,
             keyframes: Vec::new(),
@@ -197,6 +241,7 @@ impl AnimationSet {
             for track in clip.tracks.iter().take(track_count as usize) {
                 write_str(&mut payload, &track.target_name);
                 payload.extend_from_slice(&track.target_hash.to_le_bytes());
+                payload.push(track.target_kind as u8);
                 payload.push(track.property as u8);
                 payload.push(track.interpolation as u8);
                 let kf_count = track.keyframes.len().min(u32::MAX as usize) as u32;
@@ -257,8 +302,11 @@ impl AnimationSet {
             for _ in 0..track_count {
                 let target_name = cursor.read_str()?;
                 let target_hash = cursor.read_u32()?;
+                let kind_raw = cursor.take(1)?[0];
                 let prop_raw = cursor.take(1)?[0];
                 let interp_raw = cursor.take(1)?[0];
+                let target_kind =
+                    AnimationTargetKind::from_u8(kind_raw).ok_or(DecodeError::InvalidPhysicsData)?;
                 let property =
                     AnimationProperty::from_u8(prop_raw).ok_or(DecodeError::InvalidPhysicsData)?;
                 let interpolation =
@@ -280,6 +328,7 @@ impl AnimationSet {
                 tracks.push(AnimationTrack {
                     target_name,
                     target_hash,
+                    target_kind,
                     property,
                     interpolation,
                     keyframes,

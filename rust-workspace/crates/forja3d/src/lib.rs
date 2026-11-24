@@ -7,15 +7,15 @@ pub mod codegen;
 pub mod format;
 pub mod math;
 pub mod mesh_ops;
-pub mod physics_file;
+pub mod pack;
 pub mod primitives;
 pub mod skeleton;
-pub mod sprite2d;
 pub mod texture;
+pub mod ui2d;
 
 pub use animation::{
-    AnimationClip, AnimationProperty, AnimationSet, AnimationTrack, InterpolationMode, Keyframe,
-    F3A_MAGIC, F3A_VERSION,
+    AnimationClip, AnimationProperty, AnimationSet, AnimationTargetKind, AnimationTrack,
+    InterpolationMode, Keyframe, F3A_MAGIC, F3A_VERSION,
 };
 pub use codegen::RustExportTarget;
 pub use format::{
@@ -27,8 +27,8 @@ pub use mesh_ops::{
     apply_shading, build_extruded_polygon, build_lathe_profile, deduplicate_vertices,
     default_extrude_profile, default_lathe_profile, ShadingMode,
 };
-pub use physics_file::{PhysicsAsset, F3P_MAGIC, F3P_VERSION};
+pub use pack::{ForjaPack, Pack, F3P_MAGIC, F3P_VERSION};
 pub use primitives::{PartSpec, PrimitiveKind, SceneDocument};
 pub use skeleton::{Joint, Skeleton, VertexSkinning};
-pub use sprite2d::{Document2D, Path2D, SpriteQuad2D, F2D_MAGIC, F2D_VERSION};
 pub use texture::{Texture, TextureError, TexturePixelFormat, F3T_MAGIC, F3T_VERSION};
+pub use ui2d::{Anchor2D, Document2D, UiDocument2D, Widget2D, WidgetKind2D, F2D_MAGIC, F2D_VERSION};

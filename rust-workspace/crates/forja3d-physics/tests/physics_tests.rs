@@ -1,5 +1,5 @@
 use forja3d::{
-    ColliderShape, ColliderSpec, Model, PartSpec, PhysicsAsset, PhysicsSpec, PrimitiveKind,
+    ColliderShape, ColliderSpec, ForjaPack, Model, PartSpec, PhysicsSpec, PrimitiveKind,
     RigidBodyKind, SceneDocument,
 };
 use forja3d_physics::PhysicsWorld;
@@ -102,31 +102,34 @@ fn raycast_hits_spawned_f3d_collider() {
 }
 
 #[test]
-fn spawn_from_f3p_bytes_sets_gravity_and_simulates() {
-    let mut asset = PhysicsAsset::new(
-        "CapsulaLunar",
-        PhysicsSpec {
-            body_kind: RigidBodyKind::Dynamic,
-            mass: 2.0,
-            friction: 0.5,
-            restitution: 0.6,
-            linear_damping: 0.01,
-            gravity_scale: 1.0,
-            colliders: vec![ColliderSpec {
-                part_hash: 42,
-                offset: [0.0, 0.0, 0.0],
-                shape: ColliderShape::Sphere { radius: 0.5 },
-            }],
-        },
-    );
-    asset.gravity = [0.0, -5.0, 0.0];
-    let f3p_bytes = asset.to_bytes();
+fn spawn_from_f3p_pack_bytes_simulates() {
+    let mut model = Model::new("CapsulaLunar");
+    let mut part = PartSpec::new("cuerpo", PrimitiveKind::Sphere);
+    part.collider = ColliderShape::Sphere { radius: 0.5 };
+    model.parts.push(part.bake());
+    model.physics = Some(PhysicsSpec {
+        body_kind: RigidBodyKind::Dynamic,
+        mass: 2.0,
+        friction: 0.5,
+        restitution: 0.6,
+        linear_damping: 0.01,
+        gravity_scale: 1.0,
+        colliders: vec![ColliderSpec {
+            part_hash: 42,
+            offset: [0.0, 0.0, 0.0],
+            shape: ColliderShape::Sphere { radius: 0.5 },
+        }],
+    });
+
+    let mut pack = ForjaPack::new("PackLunar");
+    pack.model = Some(model);
+    let f3p_bytes = pack.to_bytes();
 
     let mut world = PhysicsWorld::new();
     let handle = world
         .spawn_from_f3p_bytes(&f3p_bytes, [0.0, 2.5, 0.0])
-        .expect("valid .f3p should spawn");
-    assert_eq!(world.gravity, [0.0, -5.0, 0.0]);
+        .expect("valid .f3p should decode")
+        .expect("model should be present in pack");
 
     for _ in 0..120 {
         world.step(1.0 / 60.0);
