@@ -11,7 +11,7 @@ categories = ["graphics", "gui", "game-development"]
 readme = "README.md"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 forja3d = { version = "0.1.0", path = "../forja3d" }
