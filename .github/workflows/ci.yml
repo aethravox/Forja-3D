@@ -147,4 +147,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Forja3D-Studio-Android-APK
-          path: rust-workspace/crates/forja3d-studio/target/android/apk/*.apk
+          path: |
+            rust-workspace/crates/forja3d-studio/target/**/*.apk
+            rust-workspace/crates/forja3d-studio/target/android/apk/*.apk
+            rust-workspace/crates/forja3d-studio/target/debug/apk/*.apk
+          if-no-files-found: warn
