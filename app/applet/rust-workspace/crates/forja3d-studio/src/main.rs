@@ -1,4 +1,5 @@
-extern crate forja3d_studio;
+#[path = "lib.rs"]
+mod lib;
 
 fn main() -> eframe::Result<()> {
     #[cfg(not(target_arch = "wasm32"))]
@@ -13,7 +14,7 @@ fn main() -> eframe::Result<()> {
         eframe::run_native(
             "Forja3D Studio",
             native_options,
-            Box::new(|cc| Ok(Box::new(forja3d_studio::StudioApp::new(cc)))),
+            Box::new(|cc| Ok(Box::new(lib::StudioApp::new(cc)))),
         )
     }
     #[cfg(target_arch = "wasm32")]
