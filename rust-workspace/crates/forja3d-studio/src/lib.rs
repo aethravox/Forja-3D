@@ -11,7 +11,7 @@ use forja3d::{
     subdivide_triangles, terrain_height_at, AnimationClip, AnimationProperty, AnimationSet,
     AnimationTrack, ColliderShape, F2D_MAGIC, F3A_MAGIC, F3P_MAGIC, F3T_MAGIC, FLAG_COMPACT,
     FLAG_PHYSICS, ForjaPack, InterpolationMode, Keyframe, Mat4, Material, MeshDeformKind,
-    MeshPart, Model, PartSpec, PhysicsSpec, PrimitiveKind, RigidBodyKind, RustExportTarget,
+    MeshPart, Model, PartSpec, PrimitiveKind, RigidBodyKind, RustExportTarget,
     SceneDocument, ShadingMode, TerrainPreset, TerrainStamp, Texture, UiDocument2D, Vec3, Vertex,
 };
 use forja3d_physics::{BodyHandle, PhysicsWorld, RigidBody};
@@ -21,7 +21,7 @@ use editor_2d::{
     ActiveWidgetDrag2D,
 };
 use icons::{
-    icon_btn, icon_btn_enabled, icon_text_btn, icon_text_btn_enabled, svg_img, SvgIcon,
+    icon_btn, icon_btn_enabled, icon_text_btn, icon_text_btn_enabled, SvgIcon,
 };
 use renderer::{ray_intersects_aabb, GlViewportRenderer, OrbitCamera};
 
@@ -417,13 +417,6 @@ impl StudioApp {
                         PrimitiveKind::Sphere => ColliderShape::Sphere {
                             radius: (dx.max(dy).max(dz) * 0.5).max(0.04),
                         },
-                        PrimitiveKind::Capsule => {
-                            let r = (dx.max(dz) * 0.5).max(0.04);
-                            ColliderShape::Capsule {
-                                radius: r,
-                                half_height: (dy * 0.5 - r).max(0.02),
-                            }
-                        }
                         _ => ColliderShape::Box {
                             half_extents: [dx * 0.5, dy * 0.5, dz * 0.5],
                         },
@@ -2362,7 +2355,7 @@ impl StudioApp {
         if !self.show_file_modal {
             return;
         }
-        let screen = ctx.available_rect();
+        let screen = ctx.input(|i| i.content_rect());
         let win_w = if compact { (screen.width() - 20.0).max(280.0) } else { 580.0 };
         let win_h = if compact { (screen.height() - 56.0).max(320.0) } else { 540.0 };
         let mut open = self.show_file_modal;
@@ -3035,7 +3028,7 @@ impl StudioApp {
                             col,
                         ),
                         GizmoMode::Rotate => painter.circle_stroke(tip, handle_r + 1.5, egui::Stroke::new(2.2, col)),
-                    }
+                    };
                     painter.text(
                         tip + egui::vec2(10.0, -10.0),
                         egui::Align2::CENTER_CENTER,

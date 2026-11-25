@@ -19,7 +19,7 @@ pub use animation::{
 };
 pub use codegen::RustExportTarget;
 pub use format::{
-    ColliderShape, ColliderSpec, DecodeError, Material, MeshPart, Model, PhysicsSpec,
+    fnv1a_32, ColliderShape, ColliderSpec, DecodeError, Material, MeshPart, Model, PhysicsSpec,
     RigidBodyKind, Vertex, FLAG_COMPACT, FLAG_PHYSICS, FORMAT_VERSION, MAGIC,
 };
 pub use math::{Aabb, Mat4, Vec3};
