@@ -10,7 +10,6 @@ import android.database.Cursor;
 import android.graphics.Insets;
 import android.net.Uri;
 import android.os.Build;
-import android.os.Bundle;
 import android.provider.OpenableColumns;
 import android.view.DisplayCutout;
 import android.view.View;
@@ -22,7 +21,11 @@ import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 
 public final class SystemBarsHelper {
-    public static native void onFilePicked(long callbackPtr, String name, byte[] data, String error);
+    // 0 = idle, 1 = pending, 2 = picked, 3 = cancelled, 4 = error
+    private static volatile int sPickState = 0;
+    private static volatile String sPickedName = null;
+    private static volatile byte[] sPickedBytes = null;
+    private static volatile String sPickedError = null;
 
     public static void enableImmersive(final Activity activity) {
         if (activity == null) {
@@ -86,7 +89,6 @@ public final class SystemBarsHelper {
         if (wi == null) {
             return out;
         }
-
         if (Build.VERSION.SDK_INT >= 30) {
             Insets ins = wi.getInsets(
                 WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout()
@@ -113,35 +115,87 @@ public final class SystemBarsHelper {
         return out;
     }
 
-    public static boolean openFilePicker(final Activity activity, final long callbackPtr) {
+    public static String openFilePicker(final Activity activity) {
         if (activity == null) {
-            return false;
+            return "ERR:Actividad de Android nula";
         }
-        activity.runOnUiThread(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    FragmentManager fm = activity.getFragmentManager();
-                    if (fm == null) {
-                        onFilePicked(callbackPtr, null, null, "Sin FragmentManager en Android");
-                        return;
+        sPickedName = null;
+        sPickedBytes = null;
+        sPickedError = null;
+        sPickState = 1;
+        try {
+            activity.runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        FragmentManager fm = activity.getFragmentManager();
+                        if (fm == null) {
+                            sPickedError = "Sin FragmentManager en Android";
+                            sPickState = 4;
+                            return;
+                        }
+                        Fragment prev = fm.findFragmentByTag("forja3d_picker");
+                        if (prev != null) {
+                            fm.beginTransaction().remove(prev).commitAllowingStateLoss();
+                        }
+                        PickerFragment frag = new PickerFragment();
+                        fm.beginTransaction().add(frag, "forja3d_picker").commitAllowingStateLoss();
+                        fm.executePendingTransactions();
+                    } catch (Throwable t) {
+                        sPickedError = "Error abriendo selector: " + t.getClass().getSimpleName() + ": " + t.getMessage();
+                        sPickState = 4;
                     }
-                    PickerFragment prev = (PickerFragment) fm.findFragmentByTag("forja3d_picker");
-                    if (prev != null) {
-                        fm.beginTransaction().remove(prev).commitAllowingStateLoss();
-                    }
-                    PickerFragment frag = new PickerFragment();
-                    Bundle args = new Bundle();
-                    args.putLong("callbackPtr", callbackPtr);
-                    frag.setArguments(args);
-                    fm.beginTransaction().add(frag, "forja3d_picker").commitAllowingStateLoss();
-                    fm.executePendingTransactions();
-                } catch (Throwable t) {
-                    onFilePicked(callbackPtr, null, null, "Error abriendo selector: " + t.getMessage());
                 }
-            }
-        });
-        return true;
+            });
+            return "OK";
+        } catch (Throwable t) {
+            sPickState = 0;
+            return "ERR:" + t.getClass().getSimpleName() + ": " + t.getMessage();
+        }
+    }
+
+    public static int pollPickState() {
+        return sPickState;
+    }
+
+    public static String takePickedName() {
+        String n = sPickedName;
+        sPickedName = null;
+        return n;
+    }
+
+    public static byte[] takePickedBytes() {
+        byte[] b = sPickedBytes;
+        sPickedBytes = null;
+        sPickState = 0;
+        return b;
+    }
+
+    public static String takePickedError() {
+        String e = sPickedError;
+        sPickedError = null;
+        sPickState = 0;
+        return e;
+    }
+
+    public static void clearPickState() {
+        sPickedName = null;
+        sPickedBytes = null;
+        sPickedError = null;
+        sPickState = 0;
+    }
+
+    static void deliverResult(final String name, final byte[] data, final String error) {
+        if (error != null) {
+            sPickedError = error;
+            sPickState = 4;
+        } else if (data != null) {
+            sPickedName = name;
+            sPickedBytes = data;
+            sPickState = 2;
+        } else {
+            sPickState = 3;
+        }
     }
 
     @SuppressWarnings("deprecation")
@@ -152,20 +206,12 @@ public final class SystemBarsHelper {
 
         public PickerFragment() {}
 
-        private long callbackPtr() {
-            Bundle args = getArguments();
-            return args != null ? args.getLong("callbackPtr", 0L) : 0L;
-        }
-
-        private void deliverOnce(final String name, final byte[] data, final String error) {
+        private void finishOnce(final String name, final byte[] data, final String error) {
             if (delivered) {
                 return;
             }
             delivered = true;
-            final long ptr = callbackPtr();
-            if (ptr != 0L) {
-                onFilePicked(ptr, name, data, error);
-            }
+            deliverResult(name, data, error);
             try {
                 FragmentManager fm = getFragmentManager();
                 if (fm != null) {
@@ -195,7 +241,7 @@ public final class SystemBarsHelper {
                     startActivityForResult(getContent, REQ_CODE);
                 }
             } catch (Throwable t) {
-                deliverOnce(null, null, "No se encontró gestor de archivos: " + t.getMessage());
+                finishOnce(null, null, "No se encontró gestor de archivos: " + t.getMessage());
             }
         }
 
@@ -206,13 +252,13 @@ public final class SystemBarsHelper {
                 return;
             }
             if (resultCode != Activity.RESULT_OK || data == null || data.getData() == null) {
-                deliverOnce(null, null, null);
+                finishOnce(null, null, null);
                 return;
             }
             final Activity act = getActivity();
             final Uri uri = data.getData();
             if (act == null || uri == null) {
-                deliverOnce(null, null, "Actividad no disponible tras seleccionar archivo");
+                finishOnce(null, null, "Actividad no disponible tras seleccionar archivo");
                 return;
             }
             final ContentResolver resolver = act.getContentResolver();
@@ -227,7 +273,7 @@ public final class SystemBarsHelper {
                         }
                         InputStream is = resolver.openInputStream(uri);
                         if (is == null) {
-                            deliverOnce(null, null, "No se pudo abrir el stream del archivo");
+                            finishOnce(null, null, "No se pudo abrir el stream del archivo");
                             return;
                         }
                         ByteArrayOutputStream bos = new ByteArrayOutputStream();
@@ -237,9 +283,9 @@ public final class SystemBarsHelper {
                             bos.write(buf, 0, n);
                         }
                         is.close();
-                        deliverOnce(fileName, bos.toByteArray(), null);
+                        finishOnce(fileName, bos.toByteArray(), null);
                     } catch (Throwable t) {
-                        deliverOnce(null, null, "Error leyendo archivo: " + t.getMessage());
+                        finishOnce(null, null, "Error leyendo archivo: " + t.getMessage());
                     }
                 }
             }, "Forja3DFileReader").start();

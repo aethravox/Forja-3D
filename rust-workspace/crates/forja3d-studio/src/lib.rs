@@ -172,6 +172,7 @@ pub struct StudioApp {
     dragging_widget_2d: Option<ActiveWidgetDrag2D>,
     pending_import: Arc<Mutex<Option<(String, Vec<u8>, Option<std::path::PathBuf>)>>>,
     pending_status: Arc<Mutex<Option<String>>>,
+    android_picking: bool,
     safe_insets_dp: [f32; 4],
     last_inset_poll: f64,
     was_focused: bool,
@@ -253,6 +254,7 @@ impl StudioApp {
             dragging_widget_2d: None,
             pending_import: Arc::new(Mutex::new(None)),
             pending_status: Arc::new(Mutex::new(None)),
+            android_picking: false,
             safe_insets_dp: [0.0; 4],
             last_inset_poll: -1.0,
             was_focused: false,
@@ -3284,6 +3286,27 @@ impl eframe::App for StudioApp {
         if let Some(note) = pending_note {
             self.status_note = note;
         }
+        #[cfg(target_os = "android")]
+        if self.android_picking {
+            match android_poll_file_picker() {
+                Some(Ok((name, bytes))) => {
+                    self.android_picking = false;
+                    self.import_model_bytes(Some(&name), &bytes, None);
+                }
+                Some(Err(Some(err))) => {
+                    self.android_picking = false;
+                    self.status_note = err;
+                }
+                Some(Err(None)) => {
+                    self.android_picking = false;
+                    self.status_note = String::from("Importación cancelada");
+                }
+                None => {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(100));
+                }
+            }
+        }
 
         let dropped = ui.ctx().input(|i| i.raw.dropped_files.clone());
         if let Some(file) = dropped.into_iter().next() {
@@ -3699,64 +3722,91 @@ static SYSTEM_BARS_CLASS: std::sync::OnceLock<jni::objects::GlobalRef> =
     std::sync::OnceLock::new();
 
 #[cfg(target_os = "android")]
-static PICKER_JNI_REGISTERED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+static SYSTEM_BARS_DEX_HEAP: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 
 #[cfg(target_os = "android")]
 const SYSTEM_BARS_DEX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/classes.dex"));
 
 #[cfg(target_os = "android")]
-type AndroidPickCallback = Box<dyn FnOnce(Option<String>, Option<Vec<u8>>, Option<String>) + Send + 'static>;
+fn with_android_activity<F, R>(f: F) -> Result<R, String>
+where
+    F: for<'a, 'b, 'c, 'd> FnOnce(&'a mut jni::JNIEnv<'b>, &'c jni::objects::JObject<'d>) -> R,
+{
+    if let Some(app) = ANDROID_APP.get() {
+        let vm = unsafe { jni::JavaVM::from_raw(app.vm_as_ptr().cast()) }
+            .map_err(|e| format!("JavaVM::from_raw: {e}"))?;
+        let mut guard = vm
+            .attach_current_thread()
+            .map_err(|e| format!("attach_current_thread: {e}"))?;
+        let activity = unsafe { jni::objects::JObject::from_raw(app.activity_as_ptr().cast()) };
+        return Ok(f(&mut guard, &activity));
+    }
+    robius_android_env::with_activity(|env, activity| f(env, activity))
+        .map_err(|e| format!("robius_android_env: {e}"))
+}
 
 #[cfg(target_os = "android")]
-extern "system" fn android_on_file_picked_native<'local>(
-    mut env: jni::JNIEnv<'local>,
-    _cls: jni::objects::JClass<'local>,
-    callback_ptr: jni::sys::jlong,
-    name: jni::objects::JString<'local>,
-    data: jni::objects::JByteArray<'local>,
-    error: jni::objects::JString<'local>,
-) {
-    if callback_ptr == 0 {
-        return;
+fn jni_take_exception<'local>(env: &mut jni::JNIEnv<'local>) -> Option<String> {
+    if !env.exception_check().unwrap_or(false) {
+        return None;
     }
-    let cb: Box<AndroidPickCallback> = unsafe { Box::from_raw(callback_ptr as *mut AndroidPickCallback) };
-    let name_opt = if !name.is_null() {
-        env.get_string(&name).ok().map(|s| s.to_string_lossy().into_owned())
-    } else {
-        None
-    };
-    let data_opt = if !data.is_null() {
-        env.convert_byte_array(&data).ok()
-    } else {
-        None
-    };
-    let err_opt = if !error.is_null() {
-        env.get_string(&error).ok().map(|s| s.to_string_lossy().into_owned())
-    } else {
-        None
-    };
-    cb(name_opt, data_opt, err_opt);
+    let exc = env.exception_occurred().ok();
+    let _ = env.exception_clear();
+    if let Some(exc) = exc {
+        if let Ok(msg_val) = env.call_method(&exc, "toString", "()Ljava/lang/String;", &[]) {
+            if let Ok(msg_obj) = msg_val.l() {
+                let jstr: jni::objects::JString<'_> = msg_obj.into();
+                if let Ok(s) = env.get_string(&jstr) {
+                    return Some(s.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    Some(String::from("Excepción JNI desconocida"))
 }
 
 #[cfg(target_os = "android")]
 fn android_system_bars_class<'a>(
     env: &mut jni::JNIEnv<'a>,
-) -> jni::errors::Result<&'static jni::objects::GlobalRef> {
+    activity: &jni::objects::JObject<'_>,
+) -> Result<&'static jni::objects::GlobalRef, String> {
     if let Some(cls) = SYSTEM_BARS_CLASS.get() {
         return Ok(cls);
     }
+    let dex_buf = SYSTEM_BARS_DEX_HEAP.get_or_init(|| SYSTEM_BARS_DEX.to_vec());
     let byte_buffer = unsafe {
-        env.new_direct_byte_buffer(SYSTEM_BARS_DEX.as_ptr() as *mut u8, SYSTEM_BARS_DEX.len())
-    }?;
-    let loader = env.new_object(
-        "dalvik/system/InMemoryDexClassLoader",
-        "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V",
-        &[
-            jni::objects::JValueGen::Object(&jni::objects::JObject::from(byte_buffer)),
-            jni::objects::JValueGen::Object(&jni::objects::JObject::null()),
-        ],
-    )?;
-    let class_name = env.new_string("dev.aethravox.forja3d.SystemBarsHelper")?;
+        env.new_direct_byte_buffer(dex_buf.as_ptr() as *mut u8, dex_buf.len())
+    }
+    .map_err(|e| {
+        let ex = jni_take_exception(env).unwrap_or_default();
+        format!("new_direct_byte_buffer: {e} {ex}")
+    })?;
+
+    let parent_loader = env
+        .call_method(activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
+        .and_then(|v| v.l())
+        .unwrap_or_else(|_| {
+            let _ = jni_take_exception(env);
+            jni::objects::JObject::null()
+        });
+
+    let loader = env
+        .new_object(
+            "dalvik/system/InMemoryDexClassLoader",
+            "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V",
+            &[
+                jni::objects::JValueGen::Object(&jni::objects::JObject::from(byte_buffer)),
+                jni::objects::JValueGen::Object(&parent_loader),
+            ],
+        )
+        .map_err(|e| {
+            let ex = jni_take_exception(env).unwrap_or_default();
+            format!("InMemoryDexClassLoader: {e} {ex}")
+        })?;
+
+    let class_name = env
+        .new_string("dev.aethravox.forja3d.SystemBarsHelper")
+        .map_err(|e| format!("new_string: {e}"))?;
     let cls_obj = env
         .call_method(
             &loader,
@@ -3765,42 +3815,142 @@ fn android_system_bars_class<'a>(
             &[jni::objects::JValueGen::Object(&jni::objects::JObject::from(
                 class_name,
             ))],
-        )?
-        .l()?;
-    let global = env.new_global_ref(cls_obj)?;
-    let cls_ref = SYSTEM_BARS_CLASS.get_or_init(|| global);
-    if PICKER_JNI_REGISTERED.get().is_none() {
-        let method = jni::NativeMethod {
-            name: "onFilePicked".into(),
-            sig: "(JLjava/lang/String;[BLjava/lang/String;)V".into(),
-            fn_ptr: android_on_file_picked_native as *mut core::ffi::c_void,
-        };
-        if env.register_native_methods(cls_ref, &[method]).is_ok() {
-            let _ = PICKER_JNI_REGISTERED.set(());
-        }
-    }
-    Ok(cls_ref)
+        )
+        .and_then(|v| v.l())
+        .map_err(|e| {
+            let ex = jni_take_exception(env).unwrap_or_default();
+            format!("loadClass: {e} {ex}")
+        })?;
+    let global = env
+        .new_global_ref(cls_obj)
+        .map_err(|e| format!("new_global_ref: {e}"))?;
+    Ok(SYSTEM_BARS_CLASS.get_or_init(|| global))
 }
 
 #[cfg(target_os = "android")]
 fn android_enable_immersive() {
-    let _ = robius_android_env::with_activity(|env, activity| {
-        if let Ok(cls) = android_system_bars_class(env) {
-            let _ = env.call_static_method(
-                cls,
-                "enableImmersive",
-                "(Landroid/app/Activity;)V",
-                &[jni::objects::JValueGen::Object(activity)],
-            );
+    let _ = with_android_activity(|env, activity| {
+        if let Ok(cls) = android_system_bars_class(env, activity) {
+            if env
+                .call_static_method(
+                    cls,
+                    "enableImmersive",
+                    "(Landroid/app/Activity;)V",
+                    &[jni::objects::JValueGen::Object(activity)],
+                )
+                .is_err()
+            {
+                let _ = jni_take_exception(env);
+            }
         }
     });
 }
 
 #[cfg(target_os = "android")]
+fn android_open_file_picker() -> Result<(), String> {
+    with_android_activity(|env, activity| -> Result<(), String> {
+        let cls = android_system_bars_class(env, activity)?;
+        let res = env
+            .call_static_method(
+                cls,
+                "openFilePicker",
+                "(Landroid/app/Activity;)Ljava/lang/String;",
+                &[jni::objects::JValueGen::Object(activity)],
+            )
+            .and_then(|v| v.l())
+            .map_err(|e| {
+                let ex = jni_take_exception(env).unwrap_or_default();
+                format!("openFilePicker: {e} {ex}")
+            })?;
+        let jstr: jni::objects::JString<'_> = res.into();
+        let status = env
+            .get_string(&jstr)
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| String::from("ERR:Cadena vacía"));
+        if status == "OK" {
+            Ok(())
+        } else {
+            Err(status.strip_prefix("ERR:").unwrap_or(&status).to_string())
+        }
+    })?
+}
+
+#[cfg(target_os = "android")]
+fn android_poll_file_picker() -> Option<Result<(String, Vec<u8>), Option<String>>> {
+    with_android_activity(|env, activity| -> Option<Result<(String, Vec<u8>), Option<String>>> {
+        let cls = android_system_bars_class(env, activity).ok()?;
+        let state = env
+            .call_static_method(cls, "pollPickState", "()I", &[])
+            .and_then(|v| v.i())
+            .unwrap_or_else(|_| {
+                let _ = jni_take_exception(env);
+                0
+            });
+        match state {
+            2 => {
+                let name = env
+                    .call_static_method(cls, "takePickedName", "()Ljava/lang/String;", &[])
+                    .and_then(|v| v.l())
+                    .ok()
+                    .and_then(|obj| {
+                        if obj.is_null() {
+                            None
+                        } else {
+                            let jstr: jni::objects::JString<'_> = obj.into();
+                            env.get_string(&jstr)
+                                .ok()
+                                .map(|s| s.to_string_lossy().into_owned())
+                        }
+                    })
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| String::from("modelo.glb"));
+                let bytes_obj = env
+                    .call_static_method(cls, "takePickedBytes", "()[B", &[])
+                    .and_then(|v| v.l())
+                    .ok()?;
+                if bytes_obj.is_null() {
+                    return Some(Err(Some(String::from("Archivo vacío en Android"))));
+                }
+                let arr: jni::objects::JByteArray<'_> = bytes_obj.into();
+                match env.convert_byte_array(&arr) {
+                    Ok(bytes) => Some(Ok((name, bytes))),
+                    Err(e) => Some(Err(Some(format!("Error leyendo bytes: {e}")))),
+                }
+            }
+            3 => {
+                let _ = env.call_static_method(cls, "clearPickState", "()V", &[]);
+                Some(Err(None))
+            }
+            4 => {
+                let err = env
+                    .call_static_method(cls, "takePickedError", "()Ljava/lang/String;", &[])
+                    .and_then(|v| v.l())
+                    .ok()
+                    .and_then(|obj| {
+                        if obj.is_null() {
+                            None
+                        } else {
+                            let jstr: jni::objects::JString<'_> = obj.into();
+                            env.get_string(&jstr)
+                                .ok()
+                                .map(|s| s.to_string_lossy().into_owned())
+                        }
+                    })
+                    .unwrap_or_else(|| String::from("Error desconocido en selector de Android"));
+                Some(Err(Some(err)))
+            }
+            _ => None,
+        }
+    })
+    .ok()
+    .flatten()
+}
+
+#[cfg(target_os = "android")]
 fn android_safe_insets_dp(ctx: &egui::Context, screen_rect: egui::Rect) -> [f32; 4] {
     let ppp = ctx.pixels_per_point().max(1.0);
-    let jni_px = robius_android_env::with_activity(|env, activity| -> [i32; 4] {
-        let Ok(cls) = android_system_bars_class(env) else {
+    let jni_px = with_android_activity(|env, activity| -> [i32; 4] {
+        let Ok(cls) = android_system_bars_class(env, activity) else {
             return [0; 4];
         };
         let Ok(val) = env.call_static_method(
@@ -3809,6 +3959,7 @@ fn android_safe_insets_dp(ctx: &egui::Context, screen_rect: egui::Rect) -> [f32;
             "(Landroid/app/Activity;)[I",
             &[jni::objects::JValueGen::Object(activity)],
         ) else {
+            let _ = jni_take_exception(env);
             return [0; 4];
         };
         let Ok(obj) = val.l() else {
@@ -3902,58 +4053,16 @@ impl StudioApp {
         }
         #[cfg(target_os = "android")]
         {
-            let _ = accept;
-            let pending = Arc::clone(&self.pending_import);
-            let pending_status = Arc::clone(&self.pending_status);
-            let ctx_clone = ctx.clone();
-
-            let cb: AndroidPickCallback = Box::new(move |name_opt, bytes_opt, err_opt| {
-                if let Some(err) = err_opt {
-                    if let Ok(mut guard) = pending_status.lock() {
-                        *guard = Some(err);
-                    }
-                } else if let Some(bytes) = bytes_opt {
-                    let name = name_opt
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or_else(|| String::from("modelo.glb"));
-                    if let Ok(mut guard) = pending.lock() {
-                        *guard = Some((name, bytes, None));
-                    }
-                } else if let Ok(mut guard) = pending_status.lock() {
-                    *guard = Some(String::from("Importación cancelada"));
+            let _ = (accept, ctx);
+            match android_open_file_picker() {
+                Ok(()) => {
+                    self.android_picking = true;
+                    self.status_note = String::from("Abriendo gestor de archivos...");
                 }
-                ctx_clone.request_repaint();
-            });
-
-            let ptr = Box::into_raw(Box::new(cb)) as jni::sys::jlong;
-            let launched = robius_android_env::with_activity(|env, activity| -> bool {
-                let Ok(cls) = android_system_bars_class(env) else {
-                    return false;
-                };
-                if PICKER_JNI_REGISTERED.get().is_none() {
-                    return false;
+                Err(err) => {
+                    self.android_picking = false;
+                    self.status_note = format!("No se pudo abrir el gestor de archivos: {err}");
                 }
-                env.call_static_method(
-                    cls,
-                    "openFilePicker",
-                    "(Landroid/app/Activity;J)Z",
-                    &[
-                        jni::objects::JValueGen::Object(activity),
-                        jni::objects::JValueGen::Long(ptr),
-                    ],
-                )
-                .and_then(|v| v.z())
-                .unwrap_or(false)
-            })
-            .unwrap_or(false);
-
-            if launched {
-                self.status_note = String::from("Abriendo gestor de archivos...");
-            } else {
-                unsafe {
-                    drop(Box::from_raw(ptr as *mut AndroidPickCallback));
-                }
-                self.status_note = String::from("No se pudo abrir el gestor de archivos de Android");
             }
         }
     }
