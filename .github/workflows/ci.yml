@@ -118,11 +118,30 @@ jobs:
       - name: Create Universal .app bundle and tar.gz
         run: |
           mkdir -p "dist-macos/Forja3D Studio.app/Contents/MacOS"
+          mkdir -p "dist-macos/Forja3D Studio.app/Contents/Resources"
           lipo -create \
             rust-workspace/target/aarch64-apple-darwin/release/forja3d-studio \
             rust-workspace/target/x86_64-apple-darwin/release/forja3d-studio \
             -output "dist-macos/Forja3D Studio.app/Contents/MacOS/forja3d-studio"
           chmod +x "dist-macos/Forja3D Studio.app/Contents/MacOS/forja3d-studio"
+          cp rust-workspace/crates/forja3d-studio/assets/AppIcon.icns "dist-macos/Forja3D Studio.app/Contents/Resources/AppIcon.icns"
+          sed 's/^          //' > "dist-macos/Forja3D Studio.app/Contents/Info.plist" << 'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Forja3D Studio</string>
+            <key>CFBundleDisplayName</key><string>Forja3D Studio</string>
+            <key>CFBundleIdentifier</key><string>dev.aethravox.forja3d</string>
+            <key>CFBundleVersion</key><string>0.1.0</string>
+            <key>CFBundleShortVersionString</key><string>0.1.0</string>
+            <key>CFBundleExecutable</key><string>forja3d-studio</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
           tar -C dist-macos -czf forja3d-studio-macos-universal.tar.gz "Forja3D Studio.app"
       - uses: actions/upload-artifact@v4
         with:
@@ -151,6 +170,30 @@ jobs:
           cargo build --manifest-path rust-workspace/Cargo.toml -p forja3d-studio --lib --target wasm32-unknown-unknown --release
           mkdir -p wasm-dist
           wasm-bindgen --out-dir wasm-dist --target web rust-workspace/target/wasm32-unknown-unknown/release/forja3d_studio.wasm
+          cp rust-workspace/crates/forja3d-studio/assets/icon.png wasm-dist/icon.png
+          sed 's/^          //' > wasm-dist/index.html << 'HTML'
+          <!doctype html>
+          <html lang="es">
+          <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+            <title>Forja3D Studio</title>
+            <link rel="icon" type="image/png" href="./icon.png" />
+            <style>
+              html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #0d1016; }
+              canvas { width: 100%; height: 100%; display: block; outline: none; }
+            </style>
+          </head>
+          <body>
+            <canvas id="forja3d_canvas"></canvas>
+            <script type="module">
+              import init, { start_forja3d_canvas } from './forja3d_studio.js';
+              await init();
+              start_forja3d_canvas("forja3d_canvas");
+            </script>
+          </body>
+          </html>
+          HTML
           tar -C wasm-dist -czf forja3d-studio-wasm-web.tar.gz .
       - uses: actions/upload-artifact@v4
         with:

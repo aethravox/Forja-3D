@@ -4,6 +4,17 @@ const JAVA_FILE_RELATIVE_PATH: &str = "src/android/SystemBarsHelper.java";
 
 fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
+    #[cfg(windows)]
+    if target_os == "windows" {
+        println!("cargo:rerun-if-changed=assets/icon.ico");
+        let mut res = winresource::WindowsResource::new();
+        res.set_icon("assets/icon.ico");
+        if let Err(err) = res.compile() {
+            println!("cargo:warning=winresource failed: {err}");
+        }
+    }
+
     if target_os == "android" {
         println!("cargo:rerun-if-changed={JAVA_FILE_RELATIVE_PATH}");
         let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());

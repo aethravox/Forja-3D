@@ -87,6 +87,7 @@ pub struct PartSpec {
     pub collider: ColliderShape,
     pub collider_auto_fit: bool,
     pub collider_offset: [f32; 3],
+    pub body_kind: RigidBodyKind,
 }
 
 impl PartSpec {
@@ -118,7 +119,47 @@ impl PartSpec {
             collider: ColliderShape::None,
             collider_auto_fit: true,
             collider_offset: [0.0; 3],
+            body_kind: if matches!(kind, PrimitiveKind::Plane | PrimitiveKind::Terrain) {
+                RigidBodyKind::Static
+            } else {
+                RigidBodyKind::Dynamic
+            },
         }
+    }
+
+    /// Convert this primitive into an editable `CustomMesh` in local space (`position`, `rotation_deg`, `scale` preserved).
+    pub fn convert_to_custom_mesh(&mut self) {
+        if self.kind == PrimitiveKind::CustomMesh && self.custom_mesh.is_some() {
+            return;
+        }
+        let (base_verts, base_indices) = match self.kind {
+            PrimitiveKind::Extrude => build_extruded_polygon(&self.profile, self.extrude_depth, self.color),
+            PrimitiveKind::Lathe => build_lathe_profile(&self.profile, self.segments.max(6), self.color),
+            PrimitiveKind::Terrain => build_terrain(&self.terrain, self.segments.max(6), self.color),
+            _ => generate_primitive(self.kind, self.segments.max(6), self.color),
+        };
+        let (shaded_verts, shaded_indices) = apply_shading(base_verts, base_indices, self.shading);
+        let (verts, indices) = if self.deduplicate && self.shading != ShadingMode::Flat {
+            deduplicate_vertices(shaded_verts, shaded_indices)
+        } else {
+            (shaded_verts, shaded_indices)
+        };
+        let mut bounds = Aabb::EMPTY;
+        for v in &verts {
+            bounds.include_point(v.position);
+        }
+        self.kind = PrimitiveKind::CustomMesh;
+        self.custom_mesh = Some(MeshPart {
+            name: self.name.clone(),
+            material: Material {
+                base_color: self.color,
+                metallic: self.metallic,
+                roughness: self.roughness,
+            },
+            vertices: verts,
+            indices,
+            bounds,
+        });
     }
 
     pub fn recommended_collider_shape(&self) -> ColliderShape {
@@ -244,6 +285,7 @@ impl PartSpec {
             collider: ColliderShape::None,
             collider_auto_fit: true,
             collider_offset: [0.0; 3],
+            body_kind: RigidBodyKind::Dynamic,
         }
     }
 
@@ -414,6 +456,7 @@ impl SceneDocument {
 
         let (physics_enabled, physics) = if let Some(phys) = phys_opt {
             for part in &mut parts {
+                part.body_kind = phys.body_kind;
                 let h = fnv1a_32(part.name.as_bytes());
                 if let Some(c) = phys.colliders.iter().find(|c| c.part_hash == h) {
                     part.collider = c.shape;

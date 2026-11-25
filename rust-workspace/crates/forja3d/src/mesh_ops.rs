@@ -734,3 +734,136 @@ pub fn build_terrain(
     (verts, indices)
 }
 
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshDeformKind {
+    Taper,
+    Twist,
+    Bend,
+}
+
+/// Subdivide each triangle into 4 smaller triangles using edge midpoints.
+pub fn subdivide_triangles(vertices: &[Vertex], indices: &[u32]) -> (Vec<Vertex>, Vec<u32>) {
+    let mut out_verts = vertices.to_vec();
+    let mut out_indices = Vec::with_capacity(indices.len() * 4);
+    let mut mid_cache: BTreeMap<(u32, u32), u32> = BTreeMap::new();
+
+    let mut get_mid = |a: u32, b: u32, verts: &mut Vec<Vertex>| -> u32 {
+        let key = if a < b { (a, b) } else { (b, a) };
+        if let Some(&idx) = mid_cache.get(&key) {
+            return idx;
+        }
+        let va = verts[a as usize];
+        let vb = verts[b as usize];
+        let pos = [
+            (va.position[0] + vb.position[0]) * 0.5,
+            (va.position[1] + vb.position[1]) * 0.5,
+            (va.position[2] + vb.position[2]) * 0.5,
+        ];
+        let normal = Vec3::new(
+            va.normal[0] + vb.normal[0],
+            va.normal[1] + vb.normal[1],
+            va.normal[2] + vb.normal[2],
+        )
+        .normalized()
+        .to_array();
+        let color = [
+            ((va.color[0] as u16 + vb.color[0] as u16) / 2) as u8,
+            ((va.color[1] as u16 + vb.color[1] as u16) / 2) as u8,
+            ((va.color[2] as u16 + vb.color[2] as u16) / 2) as u8,
+            ((va.color[3] as u16 + vb.color[3] as u16) / 2) as u8,
+        ];
+        let uv = [(va.uv[0] + vb.uv[0]) * 0.5, (va.uv[1] + vb.uv[1]) * 0.5];
+        let idx = verts.len() as u32;
+        verts.push(Vertex { position: pos, normal, color, uv });
+        mid_cache.insert(key, idx);
+        idx
+    };
+
+    for tri in indices.chunks_exact(3) {
+        let a = tri[0];
+        let b = tri[1];
+        let c = tri[2];
+        if (a as usize) >= out_verts.len() || (b as usize) >= out_verts.len() || (c as usize) >= out_verts.len() {
+            continue;
+        }
+        let ab = get_mid(a, b, &mut out_verts);
+        let bc = get_mid(b, c, &mut out_verts);
+        let ca = get_mid(c, a, &mut out_verts);
+        out_indices.extend_from_slice(&[a, ab, ca, ab, b, bc, ca, bc, c, ab, bc, ca]);
+    }
+    (out_verts, out_indices)
+}
+
+/// Apply a modeling deformation (Taper, Twist, or Bend) along the Y axis and recompute face normals.
+pub fn deform_vertices(
+    vertices: &[Vertex],
+    indices: &[u32],
+    kind: MeshDeformKind,
+    amount: f32,
+) -> (Vec<Vertex>, Vec<u32>) {
+    if vertices.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for v in vertices {
+        if v.position[1] < min_y { min_y = v.position[1]; }
+        if v.position[1] > max_y { max_y = v.position[1]; }
+    }
+    let span_y = (max_y - min_y).max(0.001);
+    let mut out_verts: Vec<Vertex> = vertices
+        .iter()
+        .map(|v| {
+            let t = ((v.position[1] - min_y) / span_y).clamp(0.0, 1.0);
+            let mut p = v.position;
+            match kind {
+                MeshDeformKind::Taper => {
+                    let s = (1.0 + amount * (t - 0.5)).max(0.05);
+                    p[0] *= s;
+                    p[2] *= s;
+                }
+                MeshDeformKind::Twist => {
+                    let angle = amount * (t - 0.5);
+                    let (sn, cs) = sin_cos(angle);
+                    let x = p[0] * cs - p[2] * sn;
+                    let z = p[0] * sn + p[2] * cs;
+                    p[0] = x;
+                    p[2] = z;
+                }
+                MeshDeformKind::Bend => {
+                    let angle = amount * t;
+                    let (sn, cs) = sin_cos(angle);
+                    let dx = p[0];
+                    let dy = p[1] - min_y;
+                    p[0] = dx * cs + dy * sn;
+                    p[1] = min_y + (-dx * sn + dy * cs);
+                }
+            }
+            Vertex { position: p, ..*v }
+        })
+        .collect();
+    // Recompute normals smoothly across shared positions
+    let mut acc_normals = vec![Vec3::ZERO; out_verts.len()];
+    for tri in indices.chunks_exact(3) {
+        let (Some(va), Some(vb), Some(vc)) = (
+            out_verts.get(tri[0] as usize),
+            out_verts.get(tri[1] as usize),
+            out_verts.get(tri[2] as usize),
+        ) else { continue };
+        let pa = Vec3::new(va.position[0], va.position[1], va.position[2]);
+        let pb = Vec3::new(vb.position[0], vb.position[1], vb.position[2]);
+        let pc = Vec3::new(vc.position[0], vc.position[1], vc.position[2]);
+        let w = (pb - pa).cross(pc - pa);
+        acc_normals[tri[0] as usize] = acc_normals[tri[0] as usize] + w;
+        acc_normals[tri[1] as usize] = acc_normals[tri[1] as usize] + w;
+        acc_normals[tri[2] as usize] = acc_normals[tri[2] as usize] + w;
+    }
+    for (i, v) in out_verts.iter_mut().enumerate() {
+        let n = acc_normals[i];
+        if n.dot(n) > 1e-8 {
+            v.normal = n.normalized().to_array();
+        }
+    }
+    (out_verts, indices.to_vec())
+}

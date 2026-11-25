@@ -1,16 +1,29 @@
 package dev.aethravox.forja3d;
 
 import android.app.Activity;
+import android.app.Fragment;
+import android.app.FragmentManager;
+import android.content.ActivityNotFoundException;
+import android.content.ContentResolver;
+import android.content.Intent;
+import android.database.Cursor;
 import android.graphics.Insets;
+import android.net.Uri;
 import android.os.Build;
+import android.os.Bundle;
+import android.provider.OpenableColumns;
 import android.view.DisplayCutout;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 
 public final class SystemBarsHelper {
+    public static native void onFilePicked(long callbackPtr, String name, byte[] data, String error);
+
     public static void enableImmersive(final Activity activity) {
         if (activity == null) {
             return;
@@ -98,5 +111,163 @@ public final class SystemBarsHelper {
             }
         }
         return out;
+    }
+
+    public static boolean openFilePicker(final Activity activity, final long callbackPtr) {
+        if (activity == null) {
+            return false;
+        }
+        activity.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    FragmentManager fm = activity.getFragmentManager();
+                    if (fm == null) {
+                        onFilePicked(callbackPtr, null, null, "Sin FragmentManager en Android");
+                        return;
+                    }
+                    PickerFragment prev = (PickerFragment) fm.findFragmentByTag("forja3d_picker");
+                    if (prev != null) {
+                        fm.beginTransaction().remove(prev).commitAllowingStateLoss();
+                    }
+                    PickerFragment frag = new PickerFragment();
+                    Bundle args = new Bundle();
+                    args.putLong("callbackPtr", callbackPtr);
+                    frag.setArguments(args);
+                    fm.beginTransaction().add(frag, "forja3d_picker").commitAllowingStateLoss();
+                    fm.executePendingTransactions();
+                } catch (Throwable t) {
+                    onFilePicked(callbackPtr, null, null, "Error abriendo selector: " + t.getMessage());
+                }
+            }
+        });
+        return true;
+    }
+
+    @SuppressWarnings("deprecation")
+    public static class PickerFragment extends Fragment {
+        private static final int REQ_CODE = 40921;
+        private boolean launched = false;
+        private boolean delivered = false;
+
+        public PickerFragment() {}
+
+        private long callbackPtr() {
+            Bundle args = getArguments();
+            return args != null ? args.getLong("callbackPtr", 0L) : 0L;
+        }
+
+        private void deliverOnce(final String name, final byte[] data, final String error) {
+            if (delivered) {
+                return;
+            }
+            delivered = true;
+            final long ptr = callbackPtr();
+            if (ptr != 0L) {
+                onFilePicked(ptr, name, data, error);
+            }
+            try {
+                FragmentManager fm = getFragmentManager();
+                if (fm != null) {
+                    fm.beginTransaction().remove(this).commitAllowingStateLoss();
+                }
+            } catch (Throwable ignored) {}
+        }
+
+        @Override
+        public void onResume() {
+            super.onResume();
+            if (launched) {
+                return;
+            }
+            launched = true;
+            try {
+                Intent openDoc = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                openDoc.addCategory(Intent.CATEGORY_OPENABLE);
+                openDoc.setType("*/*");
+                openDoc.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                try {
+                    startActivityForResult(openDoc, REQ_CODE);
+                } catch (ActivityNotFoundException e) {
+                    Intent getContent = new Intent(Intent.ACTION_GET_CONTENT);
+                    getContent.addCategory(Intent.CATEGORY_OPENABLE);
+                    getContent.setType("*/*");
+                    startActivityForResult(getContent, REQ_CODE);
+                }
+            } catch (Throwable t) {
+                deliverOnce(null, null, "No se encontró gestor de archivos: " + t.getMessage());
+            }
+        }
+
+        @Override
+        public void onActivityResult(final int requestCode, final int resultCode, final Intent data) {
+            super.onActivityResult(requestCode, resultCode, data);
+            if (requestCode != REQ_CODE) {
+                return;
+            }
+            if (resultCode != Activity.RESULT_OK || data == null || data.getData() == null) {
+                deliverOnce(null, null, null);
+                return;
+            }
+            final Activity act = getActivity();
+            final Uri uri = data.getData();
+            if (act == null || uri == null) {
+                deliverOnce(null, null, "Actividad no disponible tras seleccionar archivo");
+                return;
+            }
+            final ContentResolver resolver = act.getContentResolver();
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        String fileName = queryDisplayName(resolver, uri);
+                        if (fileName == null || fileName.isEmpty()) {
+                            String seg = uri.getLastPathSegment();
+                            fileName = (seg != null && !seg.isEmpty()) ? seg : "modelo.glb";
+                        }
+                        InputStream is = resolver.openInputStream(uri);
+                        if (is == null) {
+                            deliverOnce(null, null, "No se pudo abrir el stream del archivo");
+                            return;
+                        }
+                        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                        byte[] buf = new byte[16384];
+                        int n;
+                        while ((n = is.read(buf)) != -1) {
+                            bos.write(buf, 0, n);
+                        }
+                        is.close();
+                        deliverOnce(fileName, bos.toByteArray(), null);
+                    } catch (Throwable t) {
+                        deliverOnce(null, null, "Error leyendo archivo: " + t.getMessage());
+                    }
+                }
+            }, "Forja3DFileReader").start();
+        }
+
+        private static String queryDisplayName(final ContentResolver resolver, final Uri uri) {
+            Cursor cursor = null;
+            try {
+                cursor = resolver.query(
+                    uri,
+                    new String[] { OpenableColumns.DISPLAY_NAME },
+                    null,
+                    null,
+                    null
+                );
+                if (cursor != null && cursor.moveToFirst()) {
+                    int idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                    if (idx >= 0) {
+                        return cursor.getString(idx);
+                    }
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                if (cursor != null) {
+                    cursor.close();
+                }
+            }
+            return null;
+        }
     }
 }

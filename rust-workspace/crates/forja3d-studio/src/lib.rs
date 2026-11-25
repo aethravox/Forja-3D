@@ -1,25 +1,34 @@
+mod editor_2d;
 mod gltf_import;
+mod icons;
 mod renderer;
+
+use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 use forja3d::{
-    default_extrude_profile, default_lathe_profile, format::fnv1a_32, terrain_height_at,
-    Anchor2D, AnimationClip, AnimationProperty, AnimationSet, AnimationTrack, ColliderShape,
-    ForjaPack, InterpolationMode, Keyframe, Model, PartSpec, PrimitiveKind,
-    RigidBodyKind, RustExportTarget, SceneDocument, ShadingMode, TerrainPreset, TerrainStamp,
-    Texture, UiDocument2D, Widget2D, WidgetKind2D, F2D_MAGIC, F3A_MAGIC, F3P_MAGIC, F3T_MAGIC,
-    FLAG_COMPACT, FLAG_PHYSICS,
+    default_extrude_profile, default_lathe_profile, deform_vertices, fnv1a_32,
+    subdivide_triangles, terrain_height_at, AnimationClip, AnimationProperty, AnimationSet,
+    AnimationTrack, ColliderShape, F2D_MAGIC, F3A_MAGIC, F3P_MAGIC, F3T_MAGIC, FLAG_COMPACT,
+    FLAG_PHYSICS, ForjaPack, InterpolationMode, Keyframe, Mat4, Material, MeshDeformKind,
+    MeshPart, Model, PartSpec, PhysicsSpec, PrimitiveKind, RigidBodyKind, RustExportTarget,
+    SceneDocument, ShadingMode, TerrainPreset, TerrainStamp, Texture, UiDocument2D, Vec3, Vertex,
 };
-use forja3d_physics::{BodyHandle, PhysicsWorld};
+use forja3d_physics::{BodyHandle, PhysicsWorld, RigidBody};
+
+use editor_2d::{
+    default_ui_document_2d, render_inspector_2d, render_scene_panel_2d, render_viewport_2d,
+    ActiveWidgetDrag2D,
+};
+use icons::{
+    icon_btn, icon_btn_enabled, icon_text_btn, icon_text_btn_enabled, svg_img, SvgIcon,
+};
 use renderer::{ray_intersects_aabb, GlViewportRenderer, OrbitCamera};
-use std::sync::{Arc, Mutex};
 
-const MAX_UNDO_HISTORY: usize = 60;
+const MAX_UNDO_HISTORY: usize = 32;
 
-const QUICK_PALETTE: [(&str, [u8; 4]); 10] = [
-    ("Ámbar", [224, 159, 62, 255]),
-    ("Acero", [148, 163, 184, 255]),
-    ("Carbón", [46, 52, 64, 255]),
+const QUICK_PALETTE: [(&str, [u8; 4]); 8] = [
+    ("Ambar", [224, 159, 62, 255]),
     ("Rojo", [220, 68, 68, 255]),
     ("Bosque", [84, 148, 76, 255]),
     ("Cielo", [56, 189, 248, 255]),
@@ -28,6 +37,12 @@ const QUICK_PALETTE: [(&str, [u8; 4]); 10] = [
     ("Piedra", [112, 118, 128, 255]),
     ("Blanco", [240, 244, 248, 255]),
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Mode3D,
+    Mode2D,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExportTab {
@@ -42,7 +57,6 @@ enum MobileTab {
     Viewport,
     Scene,
     Inspect,
-    Export,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +64,7 @@ enum GizmoMode {
     Translate,
     Rotate,
     Scale,
+    Vertices,
 }
 
 impl GizmoMode {
@@ -58,6 +73,16 @@ impl GizmoMode {
             Self::Translate => "Mover",
             Self::Rotate => "Rotar",
             Self::Scale => "Escalar",
+            Self::Vertices => "Vértices",
+        }
+    }
+
+    const fn icon(self) -> SvgIcon {
+        match self {
+            Self::Translate => SvgIcon::Move,
+            Self::Rotate => SvgIcon::Rotate,
+            Self::Scale => SvgIcon::Scale,
+            Self::Vertices => SvgIcon::Vertices,
         }
     }
 }
@@ -88,7 +113,17 @@ struct ActiveGizmoDrag {
     accum_pixels: f32,
 }
 
+struct ActiveVertexDrag {
+    part_idx: usize,
+    local_anchor: [f32; 3],
+    world_anchor: [f32; 3],
+    start_vertices: Vec<Vertex>,
+    start_pointer_px: egui::Pos2,
+}
+
 pub struct StudioApp {
+    view_mode: ViewMode,
+    show_file_modal: bool,
     scene: SceneDocument,
     baked_model: Model,
     part_map: Vec<usize>,
@@ -100,11 +135,17 @@ pub struct StudioApp {
     show_colliders: bool,
     snap_enabled: bool,
     sim_world: Option<PhysicsWorld>,
-    sim_body: Option<BodyHandle>,
-    sim_offset: [f32; 3],
+    sim_part_bodies: Vec<(usize, BodyHandle, [f32; 3])>,
+    sim_part_transforms: Vec<([f32; 3], [f32; 4], [f32; 3])>,
     sim_last_time: Option<f64>,
     gizmo_mode: GizmoMode,
     active_gizmo_drag: Option<ActiveGizmoDrag>,
+    selected_vertex_idx: Option<usize>,
+    active_vertex_drag: Option<ActiveVertexDrag>,
+    deform_amount: f32,
+    array_count: usize,
+    array_step: [f32; 3],
+    array_radial: bool,
     undo_stack: Vec<HistoryEntry>,
     redo_stack: Vec<HistoryEntry>,
     continuous_edit_snapshot: Option<HistoryEntry>,
@@ -126,6 +167,9 @@ pub struct StudioApp {
     cached_f3d_compact_bytes: Vec<u8>,
     cached_rust_src: String,
     cached_obj_src: String,
+    doc2d: UiDocument2D,
+    selected_widget_2d: Option<usize>,
+    dragging_widget_2d: Option<ActiveWidgetDrag2D>,
     pending_import: Arc<Mutex<Option<(String, Vec<u8>, Option<std::path::PathBuf>)>>>,
     pending_status: Arc<Mutex<Option<String>>>,
     safe_insets_dp: [f32; 4],
@@ -139,6 +183,7 @@ pub struct StudioApp {
 
 impl StudioApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         Self::configure_style(&cc.egui_ctx);
 
         let gl_renderer = if let Some(gl) = &cc.gl {
@@ -155,8 +200,11 @@ impl StudioApp {
         let rust_target = RustExportTarget::ZeroDepConst;
         let cached_rust_src = baked_model.to_rust_source(&scene.model_name, rust_target);
         let cached_obj_src = baked_model.to_obj();
+        let doc2d = default_ui_document_2d(&scene.model_name);
 
         Self {
+            view_mode: ViewMode::Mode3D,
+            show_file_modal: false,
             scene,
             baked_model,
             part_map,
@@ -168,11 +216,17 @@ impl StudioApp {
             show_colliders: true,
             snap_enabled: false,
             sim_world: None,
-            sim_body: None,
-            sim_offset: [0.0; 3],
+            sim_part_bodies: Vec::new(),
+            sim_part_transforms: Vec::new(),
             sim_last_time: None,
             gizmo_mode: GizmoMode::Translate,
             active_gizmo_drag: None,
+            selected_vertex_idx: None,
+            active_vertex_drag: None,
+            deform_amount: 0.45,
+            array_count: 3,
+            array_step: [1.2, 0.0, 0.0],
+            array_radial: false,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             continuous_edit_snapshot: None,
@@ -194,6 +248,9 @@ impl StudioApp {
             cached_f3d_compact_bytes,
             cached_rust_src,
             cached_obj_src,
+            doc2d,
+            selected_widget_2d: Some(0),
+            dragging_widget_2d: None,
             pending_import: Arc::new(Mutex::new(None)),
             pending_status: Arc::new(Mutex::new(None)),
             safe_insets_dp: [0.0; 4],
@@ -245,6 +302,7 @@ impl StudioApp {
             self.redo_stack.push(current);
             self.scene = prev.scene;
             self.selection = prev.selection;
+            self.selected_vertex_idx = None;
             self.rebuild_outputs();
             self.status_note = String::from("Deshacer aplicado");
         }
@@ -256,6 +314,7 @@ impl StudioApp {
             self.undo_stack.push(current);
             self.scene = next.scene;
             self.selection = next.selection;
+            self.selected_vertex_idx = None;
             self.rebuild_outputs();
             self.status_note = String::from("Rehacer aplicado");
         }
@@ -263,28 +322,146 @@ impl StudioApp {
 
     fn stop_physics_sim(&mut self) {
         self.sim_world = None;
-        self.sim_body = None;
-        self.sim_offset = [0.0; 3];
+        self.sim_part_bodies.clear();
+        self.sim_part_transforms.clear();
         self.sim_last_time = None;
     }
 
-    fn start_physics_sim(&mut self, drop_y: f32) {
+    fn start_physics_sim(&mut self) {
+        self.stop_physics_sim();
         let mut world = PhysicsWorld::new();
-        let is_dynamic = self
-            .baked_model
-            .physics
-            .as_ref()
-            .map_or(true, |p| p.body_kind == RigidBodyKind::Dynamic);
-        let start_y = if is_dynamic { drop_y } else { 0.0 };
-        let handle = world.spawn_from_model(&self.baked_model, [0.0, start_y, 0.0]);
+        let part_count = self.baked_model.parts.len();
+        self.sim_part_transforms = vec![([0.0; 3], [0.0, 0.0, 0.0, 1.0], [0.0; 3]); part_count];
+
+        let mut dyn_count = 0usize;
+        for (mesh_idx, mesh_part) in self.baked_model.parts.iter().enumerate() {
+            let src_idx = self.part_map.get(mesh_idx).copied().unwrap_or(0);
+            let Some(part_spec) = self.scene.parts.get(src_idx) else {
+                continue;
+            };
+            let pivot = if mesh_part.bounds.is_valid() {
+                [
+                    (mesh_part.bounds.min[0] + mesh_part.bounds.max[0]) * 0.5,
+                    (mesh_part.bounds.min[1] + mesh_part.bounds.max[1]) * 0.5,
+                    (mesh_part.bounds.min[2] + mesh_part.bounds.max[2]) * 0.5,
+                ]
+            } else {
+                part_spec.position
+            };
+
+            let mut part_phys = self.scene.physics.clone();
+            part_phys.body_kind = part_spec.body_kind;
+            part_phys.colliders.clear();
+
+            let use_exact_mesh = matches!(
+                part_spec.kind,
+                PrimitiveKind::Pyramid
+                    | PrimitiveKind::Cone
+                    | PrimitiveKind::Torus
+                    | PrimitiveKind::Terrain
+                    | PrimitiveKind::Extrude
+                    | PrimitiveKind::Lathe
+                    | PrimitiveKind::CustomMesh
+            ) && (mesh_part.indices.len() / 3) <= 4096;
+
+            let local_bounds = forja3d::Aabb {
+                min: [
+                    mesh_part.bounds.min[0] - pivot[0],
+                    mesh_part.bounds.min[1] - pivot[1],
+                    mesh_part.bounds.min[2] - pivot[2],
+                ],
+                max: [
+                    mesh_part.bounds.max[0] - pivot[0],
+                    mesh_part.bounds.max[1] - pivot[1],
+                    mesh_part.bounds.max[2] - pivot[2],
+                ],
+            };
+
+            let mut body = if use_exact_mesh {
+                let mut tris = Vec::with_capacity(mesh_part.indices.len() / 3);
+                for tri in mesh_part.indices.chunks_exact(3) {
+                    if let (Some(a), Some(b), Some(c)) = (
+                        mesh_part.vertices.get(tri[0] as usize),
+                        mesh_part.vertices.get(tri[1] as usize),
+                        mesh_part.vertices.get(tri[2] as usize),
+                    ) {
+                        tris.push([
+                            [a.position[0] - pivot[0], a.position[1] - pivot[1], a.position[2] - pivot[2]],
+                            [b.position[0] - pivot[0], b.position[1] - pivot[1], b.position[2] - pivot[2]],
+                            [c.position[0] - pivot[0], c.position[1] - pivot[1], c.position[2] - pivot[2]],
+                        ]);
+                    }
+                }
+                let mut rb = RigidBody::from_physics_spec(
+                    mesh_part.name.clone(),
+                    pivot,
+                    &part_phys,
+                    local_bounds,
+                );
+                // Keep exact triangle mesh collision as primary without an oversized bounding box
+                if part_spec.collider == ColliderShape::None || !part_spec.collider_auto_fit {
+                    rb.colliders.clear();
+                }
+                rb.with_mesh_triangles(tris)
+            } else {
+                let mut shape_spec = if part_spec.collider != ColliderShape::None {
+                    part_spec.fitted_collider_for_mesh(mesh_part)
+                } else {
+                    None
+                };
+                if shape_spec.is_none() {
+                    let dx = (local_bounds.max[0] - local_bounds.min[0]).max(0.05);
+                    let dy = (local_bounds.max[1] - local_bounds.min[1]).max(0.05);
+                    let dz = (local_bounds.max[2] - local_bounds.min[2]).max(0.05);
+                    let shape = match part_spec.kind {
+                        PrimitiveKind::Sphere => ColliderShape::Sphere {
+                            radius: (dx.max(dy).max(dz) * 0.5).max(0.04),
+                        },
+                        PrimitiveKind::Capsule => {
+                            let r = (dx.max(dz) * 0.5).max(0.04);
+                            ColliderShape::Capsule {
+                                radius: r,
+                                half_height: (dy * 0.5 - r).max(0.02),
+                            }
+                        }
+                        _ => ColliderShape::Box {
+                            half_extents: [dx * 0.5, dy * 0.5, dz * 0.5],
+                        },
+                    };
+                    shape_spec = Some(forja3d::ColliderSpec {
+                        part_hash: fnv1a_32(mesh_part.name.as_bytes()),
+                        offset: pivot,
+                        shape,
+                    });
+                }
+                if let Some(mut spec) = shape_spec {
+                    spec.offset[0] -= pivot[0];
+                    spec.offset[1] -= pivot[1];
+                    spec.offset[2] -= pivot[2];
+                    part_phys.colliders.push(spec);
+                }
+                RigidBody::from_physics_spec(mesh_part.name.clone(), pivot, &part_phys, local_bounds)
+            };
+
+            body.body_kind = part_spec.body_kind;
+            body.inv_mass = match body.body_kind {
+                RigidBodyKind::Dynamic => 1.0 / body.mass.max(0.01),
+                RigidBodyKind::Static | RigidBodyKind::Kinematic | RigidBodyKind::Sensor => 0.0,
+            };
+            if body.body_kind == RigidBodyKind::Dynamic {
+                dyn_count += 1;
+            }
+            let handle = world.add_body(body);
+            self.sim_part_bodies.push((mesh_idx, handle, pivot));
+            self.sim_part_transforms[mesh_idx] = (pivot, [0.0, 0.0, 0.0, 1.0], [0.0; 3]);
+        }
+
         self.sim_world = Some(world);
-        self.sim_body = Some(handle);
-        self.sim_offset = [0.0, start_y, 0.0];
         self.sim_last_time = None;
-        self.status_note = if is_dynamic {
-            String::from("Simulación física activa (forja3d-physics)")
+        self.status_note = if dyn_count > 0 {
+            format!("Física activa ({} cuerpos independientes)", self.sim_part_bodies.len())
         } else {
-            String::from("Cuerpo no dinámico (cambia Tipo a Dinámico para caer)")
+            String::from("Escena estática: cambia una pieza a Dinámico para caer")
         };
     }
 
@@ -300,9 +477,19 @@ impl StudioApp {
         self.sim_last_time = Some(now);
         let dt = dt.clamp(0.001, 0.05);
         world.step(dt);
-        if let Some(handle) = self.sim_body {
+        for &(mesh_idx, handle, initial_pivot) in &self.sim_part_bodies {
             if let Some(body) = world.body(handle) {
-                self.sim_offset = body.position;
+                if let Some(slot) = self.sim_part_transforms.get_mut(mesh_idx) {
+                    *slot = (
+                        initial_pivot,
+                        body.orientation,
+                        [
+                            body.position[0] - initial_pivot[0],
+                            body.position[1] - initial_pivot[1],
+                            body.position[2] - initial_pivot[2],
+                        ],
+                    );
+                }
             }
         }
         ctx.request_repaint();
@@ -316,7 +503,9 @@ impl StudioApp {
         self.generation += 1;
         self.cached_f3d_bytes = self.baked_model.to_bytes();
         self.cached_f3d_compact_bytes = self.baked_model.to_bytes_compact();
-        self.cached_rust_src = self.baked_model.to_rust_source(&self.scene.model_name, self.rust_target);
+        self.cached_rust_src = self
+            .baked_model
+            .to_rust_source(&self.scene.model_name, self.rust_target);
         self.cached_obj_src = self.baked_model.to_obj();
     }
 
@@ -353,6 +542,7 @@ impl StudioApp {
                     } else {
                         Some(Selection::Part(0))
                     };
+                    self.selected_vertex_idx = None;
                     self.rebuild_outputs();
                     self.camera.frame_bounds(self.baked_model.bounds());
                     let src = filename.unwrap_or(&self.scene.model_name);
@@ -363,6 +553,7 @@ impl StudioApp {
                         self.scene.parts.len(),
                         self.baked_model.triangle_count()
                     );
+                    self.view_mode = ViewMode::Mode3D;
                 }
                 Err(err) => {
                     self.status_note = format!("Error al importar .f3d: {err}");
@@ -382,6 +573,7 @@ impl StudioApp {
                         } else {
                             Some(Selection::Part(0))
                         };
+                        self.selected_vertex_idx = None;
                         self.rebuild_outputs();
                         self.camera.frame_bounds(self.baked_model.bounds());
                         summary.push(format!("malla {} tri", tri));
@@ -424,39 +616,12 @@ impl StudioApp {
                 Ok(doc) => {
                     let widget_count = doc.widgets.len();
                     let action_count = doc.actions.len();
-                    if let Some(pts) = doc.primary_profile() {
-                        if pts.len() >= 3 {
-                            self.push_undo();
-                            let applied_existing = match self.selection {
-                                Some(Selection::Part(idx)) => {
-                                    if let Some(part) = self.scene.parts.get_mut(idx) {
-                                        if part.kind.uses_profile() {
-                                            part.profile = pts.to_vec();
-                                            true
-                                        } else {
-                                            false
-                                        }
-                                    } else {
-                                        false
-                                    }
-                                }
-                                _ => false,
-                            };
-                            if !applied_existing {
-                                let mut part = PartSpec::new(
-                                    format!("perfil_{}", self.scene.parts.len() + 1),
-                                    PrimitiveKind::Extrude,
-                                );
-                                part.profile = pts.to_vec();
-                                self.scene.parts.push(part);
-                                self.selection = Some(Selection::Part(self.scene.parts.len() - 1));
-                            }
-                            self.rebuild_outputs();
-                        }
-                    }
-                    let src = filename.unwrap_or(&doc.name);
+                    let src = filename.unwrap_or(&doc.name).to_string();
+                    self.doc2d = doc;
+                    self.selected_widget_2d = if widget_count > 0 { Some(0) } else { None };
+                    self.view_mode = ViewMode::Mode2D;
                     self.status_note = format!(
-                        "Pantalla 2D .f2d '{src}' ({widget_count} controles, {action_count} acciones .rs)"
+                        "Pantalla 2D .f2d '{src}' cargada ({widget_count} controles, {action_count} acciones .rs)"
                     );
                 }
                 Err(err) => {
@@ -490,6 +655,7 @@ impl StudioApp {
                     } else {
                         Some(Selection::Part(0))
                     };
+                    self.selected_vertex_idx = None;
                     self.rebuild_outputs();
                     self.camera.frame_bounds(self.baked_model.bounds());
                     let src = filename.unwrap_or(&self.scene.model_name);
@@ -503,6 +669,7 @@ impl StudioApp {
                         self.scene.parts.len(),
                         self.baked_model.triangle_count()
                     );
+                    self.view_mode = ViewMode::Mode3D;
                 }
                 Err(err) => {
                     self.status_note = err;
@@ -588,57 +755,6 @@ impl StudioApp {
         set
     }
 
-    fn build_2d_asset(&self) -> UiDocument2D {
-        let (profile_name, points, closed) = match self.selection {
-            Some(Selection::Part(idx)) => match self.scene.parts.get(idx) {
-                Some(part) if !part.profile.is_empty() => (
-                    part.name.clone(),
-                    part.profile.clone(),
-                    part.kind != PrimitiveKind::Lathe,
-                ),
-                _ => (
-                    format!("{}_perfil", self.scene.model_name),
-                    default_extrude_profile(),
-                    true,
-                ),
-            },
-            _ => (
-                format!("{}_perfil", self.scene.model_name),
-                default_extrude_profile(),
-                true,
-            ),
-        };
-        let mut doc = UiDocument2D::from_profile(profile_name, points, closed);
-        doc.widgets.push(Widget2D::new_container(
-            "panel_hud",
-            "Panel HUD",
-            [20.0, 20.0, 360.0, 200.0],
-            [16, 20, 28, 230],
-        ));
-        doc.widgets.push(Widget2D::new_button(
-            "btn_iniciar",
-            "Boton Iniciar",
-            "Comenzar",
-            "on_iniciar",
-            [40.0, 40.0, 140.0, 42.0],
-        ));
-        doc.widgets.push(Widget2D {
-            id: String::from("lbl_titulo"),
-            name: String::from("Etiqueta Titulo"),
-            rect: [40.0, 100.0, 220.0, 28.0],
-            anchor: Anchor2D::TopLeft,
-            visible: true,
-            kind: WidgetKind2D::Text {
-                content: format!("Interfaz {}", self.scene.model_name),
-                font_size: 15.0,
-                color: [243, 244, 246, 255],
-            },
-        });
-        doc.actions.push(String::from("on_iniciar"));
-        doc.actions.push(String::from("on_pausa"));
-        doc
-    }
-
     fn build_texture_asset(&self) -> Texture {
         const SIZE: u16 = 16;
         let palette: Vec<[u8; 4]> = if self.scene.parts.is_empty() {
@@ -676,6 +792,7 @@ impl StudioApp {
         } else {
             Some(Selection::Part(0))
         };
+        self.selected_vertex_idx = None;
         self.rebuild_outputs();
         self.camera.frame_bounds(self.baked_model.bounds());
         self.status_note = format!("Escena: {}", self.scene.model_name);
@@ -693,7 +810,235 @@ impl StudioApp {
         }
         self.scene.parts.push(part);
         self.selection = Some(Selection::Part(self.scene.parts.len() - 1));
+        self.selected_vertex_idx = None;
         self.rebuild_outputs();
+    }
+
+    fn stack_selected_on_below(&mut self) {
+        let Some(Selection::Part(sel_idx)) = self.selection else {
+            self.status_note = String::from("Selecciona una pieza para apilar");
+            return;
+        };
+        if sel_idx >= self.scene.parts.len() {
+            return;
+        }
+        let sel_bounds = self.scene.parts[sel_idx].bake().bounds;
+        if !sel_bounds.is_valid() {
+            return;
+        }
+        // Prefer the visible part immediately preceding sel_idx, or the highest other visible part
+        let target_bounds = if sel_idx > 0 && self.scene.parts[sel_idx - 1].visible {
+            Some(self.scene.parts[sel_idx - 1].bake().bounds)
+        } else {
+            self.scene
+                .parts
+                .iter()
+                .enumerate()
+                .filter(|(i, p)| *i != sel_idx && p.visible)
+                .map(|(_, p)| p.bake().bounds)
+                .filter(|b| b.is_valid())
+                .max_by(|a, b| a.max[1].total_cmp(&b.max[1]))
+        };
+
+        let Some(tb) = target_bounds else {
+            self.push_undo();
+            self.scene.parts[sel_idx].position[1] -= sel_bounds.min[1];
+            self.rebuild_outputs();
+            self.status_note = String::from("Pieza apoyada en el suelo Y=0");
+            return;
+        };
+
+        self.push_undo();
+        let tc_x = (tb.min[0] + tb.max[0]) * 0.5;
+        let tc_z = (tb.min[2] + tb.max[2]) * 0.5;
+        let sc_x = (sel_bounds.min[0] + sel_bounds.max[0]) * 0.5;
+        let sc_z = (sel_bounds.min[2] + sel_bounds.max[2]) * 0.5;
+        let p = &mut self.scene.parts[sel_idx];
+        p.position[0] += tc_x - sc_x;
+        p.position[2] += tc_z - sc_z;
+        p.position[1] += tb.max[1] - sel_bounds.min[1] + 0.02;
+        self.rebuild_outputs();
+        self.status_note = String::from("Pieza apilada encima");
+    }
+
+    fn merge_visible_parts(&mut self) {
+        let visible_indices: Vec<usize> = self
+            .scene
+            .parts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| p.visible.then_some(i))
+            .collect();
+        if visible_indices.len() < 2 {
+            self.status_note = String::from("Se necesitan al menos 2 piezas visibles para combinar");
+            return;
+        }
+        self.push_undo();
+        let mut combined_verts = Vec::new();
+        let mut combined_indices = Vec::new();
+        let mut combined_bounds = forja3d::Aabb::EMPTY;
+        let mut mat = Material::default();
+        if let Some(first) = self.scene.parts.get(visible_indices[0]) {
+            mat.base_color = first.color;
+            mat.metallic = first.metallic;
+            mat.roughness = first.roughness;
+        }
+
+        for &idx in &visible_indices {
+            for baked in self.scene.parts[idx].bake_all() {
+                let base_v = combined_verts.len() as u32;
+                for v in baked.vertices {
+                    combined_bounds.include_point(v.position);
+                    combined_verts.push(v);
+                }
+                for i in baked.indices {
+                    combined_indices.push(base_v + i);
+                }
+            }
+        }
+
+        let center = if combined_bounds.is_valid() {
+            [
+                (combined_bounds.min[0] + combined_bounds.max[0]) * 0.5,
+                (combined_bounds.min[1] + combined_bounds.max[1]) * 0.5,
+                (combined_bounds.min[2] + combined_bounds.max[2]) * 0.5,
+            ]
+        } else {
+            [0.0; 3]
+        };
+        let mut local_bounds = forja3d::Aabb::EMPTY;
+        for v in &mut combined_verts {
+            v.position[0] -= center[0];
+            v.position[1] -= center[1];
+            v.position[2] -= center[2];
+            local_bounds.include_point(v.position);
+        }
+
+        let merged_mesh = MeshPart {
+            name: format!("{}_combinada", self.scene.model_name),
+            material: mat,
+            vertices: combined_verts,
+            indices: combined_indices,
+            bounds: local_bounds,
+        };
+        let mut merged_part = PartSpec::from_mesh_part(merged_mesh);
+        merged_part.position = center;
+
+        self.scene.parts.retain(|p| !p.visible);
+        self.scene.parts.push(merged_part);
+        self.selection = Some(Selection::Part(self.scene.parts.len() - 1));
+        self.selected_vertex_idx = None;
+        self.rebuild_outputs();
+        self.status_note = String::from("Piezas visibles combinadas en Malla Editable");
+    }
+
+    fn convert_selected_to_mesh(&mut self) -> Option<usize> {
+        let Some(Selection::Part(idx)) = self.selection else {
+            return None;
+        };
+        if idx >= self.scene.parts.len() {
+            return None;
+        }
+        if self.scene.parts[idx].kind != PrimitiveKind::CustomMesh {
+            self.push_undo();
+            self.scene.parts[idx].convert_to_custom_mesh();
+            self.selected_vertex_idx = Some(0);
+            self.rebuild_outputs();
+            self.status_note = String::from("Convertida a Malla Editable");
+        }
+        Some(idx)
+    }
+
+    fn subdivide_selected(&mut self) {
+        let Some(Selection::Part(idx)) = self.selection else {
+            self.status_note = String::from("Selecciona una pieza para subdividir");
+            return;
+        };
+        if idx >= self.scene.parts.len() {
+            return;
+        }
+        self.push_undo();
+        if self.scene.parts[idx].kind != PrimitiveKind::CustomMesh {
+            self.scene.parts[idx].convert_to_custom_mesh();
+        }
+        if let Some(mesh) = self.scene.parts[idx].custom_mesh.as_mut() {
+            if mesh.indices.len() / 3 > 16_000 {
+                self.status_note = String::from("Malla ya es muy densa (>16k tri)");
+                return;
+            }
+            let (v, i) = subdivide_triangles(&mesh.vertices, &mesh.indices);
+            mesh.vertices = v;
+            mesh.indices = i;
+            recompute_mesh_normals(mesh);
+            self.status_note = format!("Subdividida ({} tri)", mesh.indices.len() / 3);
+        }
+        self.rebuild_outputs();
+    }
+
+    fn deform_selected(&mut self, kind: MeshDeformKind) {
+        let Some(Selection::Part(idx)) = self.selection else {
+            self.status_note = String::from("Selecciona una pieza para deformar");
+            return;
+        };
+        if idx >= self.scene.parts.len() {
+            return;
+        }
+        self.push_undo();
+        if self.scene.parts[idx].kind != PrimitiveKind::CustomMesh {
+            self.scene.parts[idx].convert_to_custom_mesh();
+        }
+        let amount = self.deform_amount;
+        if let Some(mesh) = self.scene.parts[idx].custom_mesh.as_mut() {
+            let (v, i) = deform_vertices(&mesh.vertices, &mesh.indices, kind, amount);
+            mesh.vertices = v;
+            mesh.indices = i;
+            recompute_mesh_normals(mesh);
+        }
+        let label = match kind {
+            MeshDeformKind::Taper => "Afilado (Taper)",
+            MeshDeformKind::Twist => "Torsión (Twist)",
+            MeshDeformKind::Bend => "Doblado (Bend)",
+        };
+        self.status_note = format!("{label} aplicado");
+        self.rebuild_outputs();
+    }
+
+    fn array_clone_selected(&mut self) {
+        let Some(Selection::Part(idx)) = self.selection else {
+            self.status_note = String::from("Selecciona una pieza para clonar en matriz");
+            return;
+        };
+        if idx >= self.scene.parts.len() {
+            return;
+        }
+        let count = self.array_count.clamp(1, 24);
+        self.push_undo();
+        let template = self.scene.parts[idx].clone();
+        if self.array_radial {
+            let total = count + 1;
+            let radius = template.position[0].hypot(template.position[2]).max(1.0);
+            let base_angle = template.position[2].atan2(template.position[0]);
+            for k in 1..=count {
+                let mut c = template.clone();
+                c.name = format!("{}_r{k}", template.name);
+                let ang = base_angle + (k as f32 / total as f32) * core::f32::consts::TAU;
+                c.position[0] = radius * ang.cos();
+                c.position[2] = radius * ang.sin();
+                c.rotation_deg[1] += (k as f32 / total as f32) * 360.0;
+                self.scene.parts.push(c);
+            }
+        } else {
+            for k in 1..=count {
+                let mut c = template.clone();
+                c.name = format!("{}_m{k}", template.name);
+                c.position[0] += self.array_step[0] * k as f32;
+                c.position[1] += self.array_step[1] * k as f32;
+                c.position[2] += self.array_step[2] * k as f32;
+                self.scene.parts.push(c);
+            }
+        }
+        self.rebuild_outputs();
+        self.status_note = format!("Matriz creada ({count} copias)");
     }
 
     fn selected_part_indices(&self) -> Vec<usize> {
@@ -756,159 +1101,204 @@ impl StudioApp {
     }
 
     fn render_scene_panel(&mut self, ui: &mut egui::Ui, dirty: &mut bool, compact: bool) {
-        if !compact {
-            ui.add_space(6.0);
-            ui.heading("Forja3D Studio");
-            ui.label(
-                egui::RichText::new("Motor 3D en Rust · .f3d & .rs")
-                    .size(11.5)
-                    .color(egui::Color32::from_gray(145)),
-            );
-            ui.separator();
-        }
-
-        ui.label(egui::RichText::new("Modelo").strong());
+        ui.label(egui::RichText::new("Nombre del modelo").strong());
         if ui.text_edit_singleline(&mut self.scene.model_name).changed() {
             *dirty = true;
         }
 
-        ui.add_space(8.0);
-        ui.label(egui::RichText::new("Escenas base").strong());
-        let btn_h = if compact { 34.0 } else { 24.0 };
-        ui.horizontal_wrapped(|ui| {
-            if ui.add_sized([74.0, btn_h], egui::Button::new("Dron")).clicked() {
-                self.load_preset(SceneDocument::preset_drone());
-            }
-            if ui.add_sized([82.0, btn_h], egui::Button::new("Monolito")).clicked() {
-                self.load_preset(SceneDocument::preset_obelisk());
-            }
-            if ui.add_sized([78.0, btn_h], egui::Button::new("Terreno")).clicked() {
-                self.load_preset(SceneDocument::preset_terrain());
-            }
-            if ui.add_sized([70.0, btn_h], egui::Button::new("Vacío")).clicked() {
-                self.load_preset(SceneDocument::new("MiModelo"));
-            }
-            if ui
-                .add_sized([124.0, btn_h], egui::Button::new("Importar GLB/GLTF"))
-                .on_hover_text("Importar archivo .glb / .gltf con el crate gltf")
-                .clicked()
-            {
-                self.request_import(ui.ctx(), ".glb,.gltf");
-            }
-            if ui
-                .add_sized([96.0, btn_h], egui::Button::new("Abrir .f3*"))
-                .on_hover_text("Importar .f3d / .f3a / .f3p / .f2d / .f3t / .glb / .gltf")
-                .clicked()
-            {
-                self.request_import(ui.ctx(), ".f3d,.f3a,.f3p,.f2d,.f3t,.glb,.gltf");
-            }
-        });
+        let btn_h = if compact { 32.0 } else { 24.0 };
+        ui.add_space(6.0);
 
-        ui.add_space(8.0);
-        ui.label(egui::RichText::new("Añadir primitiva").strong());
-        let cols = if compact { 3 } else { 2 };
-        let prim_w = if compact { 98.0 } else { 100.0 };
-        let prim_h = if compact { 34.0 } else { 26.0 };
-        egui::Grid::new("add_primitives_grid")
-            .num_columns(cols)
-            .spacing([6.0, 6.0])
+        egui::CollapsingHeader::new(egui::RichText::new("Escenas base").strong())
+            .default_open(!compact)
             .show(ui, |ui| {
-                for (i, kind) in PrimitiveKind::ALL.iter().enumerate() {
-                    if ui
-                        .add_sized([prim_w, prim_h], egui::Button::new(format!("+ {}", kind.label())))
-                        .clicked()
-                    {
-                        self.add_primitive(*kind);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_sized([74.0, btn_h], egui::Button::new("Dron")).clicked() {
+                        self.load_preset(SceneDocument::preset_drone());
                     }
-                    if (i + 1) % cols == 0 {
-                        ui.end_row();
+                    if ui.add_sized([82.0, btn_h], egui::Button::new("Monolito")).clicked() {
+                        self.load_preset(SceneDocument::preset_obelisk());
                     }
+                    if ui.add_sized([78.0, btn_h], egui::Button::new("Terreno")).clicked() {
+                        self.load_preset(SceneDocument::preset_terrain());
+                    }
+                    if ui.add_sized([70.0, btn_h], egui::Button::new("Vacío")).clicked() {
+                        self.load_preset(SceneDocument::new("MiModelo"));
+                    }
+                });
+            });
+
+        egui::CollapsingHeader::new(egui::RichText::new("Añadir primitiva").strong())
+            .default_open(true)
+            .show(ui, |ui| {
+                let cols = if compact { 3 } else { 2 };
+                let prim_w = if compact { 102.0 } else { 112.0 };
+                let prim_h = if compact { 32.0 } else { 25.0 };
+                egui::Grid::new("add_primitives_grid")
+                    .num_columns(cols)
+                    .spacing([6.0, 6.0])
+                    .show(ui, |ui| {
+                        for (i, kind) in PrimitiveKind::ALL.iter().enumerate() {
+                            if icon_text_btn(ui, SvgIcon::Plus, 13.0, kind.label(), [prim_w, prim_h], false)
+                                .clicked()
+                            {
+                                self.add_primitive(*kind);
+                            }
+                            if (i + 1) % cols == 0 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+            });
+
+        egui::CollapsingHeader::new(egui::RichText::new("Herramientas de modelado").strong())
+            .default_open(false)
+            .show(ui, |ui| {
+                let has_sel = matches!(self.selection, Some(Selection::Part(_)));
+                ui.horizontal_wrapped(|ui| {
+                    if icon_text_btn_enabled(ui, has_sel, SvgIcon::Stack, 14.0, "Apilar encima", [118.0, btn_h]).clicked() {
+                        self.stack_selected_on_below();
+                    }
+                    if icon_text_btn(ui, SvgIcon::Merge, 14.0, "Combinar", [100.0, btn_h], false).clicked() {
+                        self.merge_visible_parts();
+                    }
+                    if icon_text_btn_enabled(ui, has_sel, SvgIcon::Vertices, 14.0, "A Malla", [92.0, btn_h]).clicked() {
+                        self.convert_selected_to_mesh();
+                    }
+                    if icon_text_btn_enabled(ui, has_sel, SvgIcon::Subdivide, 14.0, "Subdividir", [104.0, btn_h]).clicked() {
+                        self.subdivide_selected();
+                    }
+                });
+                ui.add_space(4.0);
+                ui.add(egui::Slider::new(&mut self.deform_amount, -1.5..=1.5).text("Deformación"));
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled(has_sel, egui::Button::new("Afilar").min_size(egui::vec2(68.0, btn_h))).clicked() {
+                        self.deform_selected(MeshDeformKind::Taper);
+                    }
+                    if ui.add_enabled(has_sel, egui::Button::new("Torcer").min_size(egui::vec2(68.0, btn_h))).clicked() {
+                        self.deform_selected(MeshDeformKind::Twist);
+                    }
+                    if ui.add_enabled(has_sel, egui::Button::new("Doblar").min_size(egui::vec2(68.0, btn_h))).clicked() {
+                        self.deform_selected(MeshDeformKind::Bend);
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Matriz 3D / Clonar").size(11.5).strong());
+                ui.horizontal(|ui| {
+                    ui.label("Copias:");
+                    ui.add(egui::DragValue::new(&mut self.array_count).range(1..=24));
+                    ui.checkbox(&mut self.array_radial, "Radial Y");
+                });
+                if !self.array_radial {
+                    ui.horizontal(|ui| {
+                        ui.label("Paso:");
+                        for axis in 0..3 {
+                            ui.add_sized(
+                                [46.0, 22.0],
+                                egui::DragValue::new(&mut self.array_step[axis])
+                                    .speed(0.05)
+                                    .fixed_decimals(2),
+                            );
+                        }
+                    });
+                }
+                if icon_text_btn_enabled(ui, has_sel, SvgIcon::Duplicate, 14.0, "Generar matriz", [124.0, btn_h]).clicked() {
+                    self.array_clone_selected();
                 }
             });
 
         // Groups Section
         let groups = self.scene.group_names();
-        ui.add_space(10.0);
-        ui.separator();
-        ui.label(egui::RichText::new(format!("Grupos ({})", groups.len())).strong());
-        if groups.is_empty() {
-            ui.label(
-                egui::RichText::new("Sin grupos · asigna uno en Editar")
-                    .size(11.0)
-                    .color(egui::Color32::from_gray(140)),
-            );
-        } else {
-            let mut toggle_group_vis: Option<String> = None;
-            let mut dup_group: Option<String> = None;
-            for g in &groups {
-                let count = self
-                    .scene
-                    .parts
-                    .iter()
-                    .filter(|p| p.group.as_deref() == Some(g.as_str()))
-                    .count();
-                let all_vis = self
-                    .scene
-                    .parts
-                    .iter()
-                    .filter(|p| p.group.as_deref() == Some(g.as_str()))
-                    .all(|p| p.visible);
-                let is_sel = self.selection.as_ref() == Some(&Selection::Group(g.clone()));
-                ui.horizontal(|ui| {
-                    let mut vis = all_vis;
-                    if ui.checkbox(&mut vis, "").on_hover_text("Mostrar/ocultar grupo").changed() {
-                        toggle_group_vis = Some(g.clone());
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new(egui::RichText::new(format!("Grupos ({})", groups.len())).strong())
+            .default_open(!groups.is_empty())
+            .show(ui, |ui| {
+                if groups.is_empty() {
+                    ui.label(
+                        egui::RichText::new("Sin grupos · asigna uno en Editar")
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(140)),
+                    );
+                } else {
+                    let mut toggle_group_vis: Option<String> = None;
+                    let mut dup_group: Option<String> = None;
+                    for g in &groups {
+                        let count = self
+                            .scene
+                            .parts
+                            .iter()
+                            .filter(|p| p.group.as_deref() == Some(g.as_str()))
+                            .count();
+                        let all_vis = self
+                            .scene
+                            .parts
+                            .iter()
+                            .filter(|p| p.group.as_deref() == Some(g.as_str()))
+                            .all(|p| p.visible);
+                        let is_sel = self.selection.as_ref() == Some(&Selection::Group(g.clone()));
+                        ui.horizontal(|ui| {
+                            let eye_sz = if compact { [30.0, 28.0] } else { [24.0, 22.0] };
+                            if icon_btn(ui, SvgIcon::Eye, 13.0, eye_sz, all_vis)
+                                .on_hover_text("Mostrar/ocultar grupo")
+                                .clicked()
+                            {
+                                toggle_group_vis = Some(g.clone());
+                            }
+                            if ui.selectable_label(is_sel, format!("{g} ({count})")).clicked() {
+                                self.selection = Some(Selection::Group(g.clone()));
+                                self.status_note = format!("Grupo '{g}' seleccionado");
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let dup_sz = if compact { [34.0, 28.0] } else { [26.0, 22.0] };
+                                if icon_btn(ui, SvgIcon::Duplicate, 13.0, dup_sz, false)
+                                    .on_hover_text("Duplicar grupo")
+                                    .clicked()
+                                {
+                                    dup_group = Some(g.clone());
+                                }
+                            });
+                        });
                     }
-                    if ui.selectable_label(is_sel, format!("[G] {g} ({count})")).clicked() {
-                        self.selection = Some(Selection::Group(g.clone()));
-                        self.status_note = format!("Grupo '{g}' seleccionado");
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let dup_sz = if compact { [44.0, 28.0] } else { [34.0, 20.0] };
-                        if ui.add_sized(dup_sz, egui::Button::new("Dup")).on_hover_text("Duplicar grupo").clicked() {
-                            dup_group = Some(g.clone());
+                    if let Some(g_name) = toggle_group_vis {
+                        self.push_undo();
+                        let target_vis = !self
+                            .scene
+                            .parts
+                            .iter()
+                            .filter(|p| p.group.as_deref() == Some(g_name.as_str()))
+                            .all(|p| p.visible);
+                        for p in &mut self.scene.parts {
+                            if p.group.as_deref() == Some(g_name.as_str()) {
+                                p.visible = target_vis;
+                            }
                         }
-                    });
-                });
-            }
-            if let Some(g_name) = toggle_group_vis {
-                self.push_undo();
-                let target_vis = !self
-                    .scene
-                    .parts
-                    .iter()
-                    .filter(|p| p.group.as_deref() == Some(g_name.as_str()))
-                    .all(|p| p.visible);
-                for p in &mut self.scene.parts {
-                    if p.group.as_deref() == Some(g_name.as_str()) {
-                        p.visible = target_vis;
+                        *dirty = true;
+                    }
+                    if let Some(g_name) = dup_group {
+                        self.push_undo();
+                        let new_group_name = format!("{g_name}_copia");
+                        let clones: Vec<PartSpec> = self
+                            .scene
+                            .parts
+                            .iter()
+                            .filter(|p| p.group.as_deref() == Some(g_name.as_str()))
+                            .map(|p| {
+                                let mut c = p.clone();
+                                c.name = format!("{}_copia", c.name);
+                                c.position[0] += 0.6;
+                                c.group = Some(new_group_name.clone());
+                                c
+                            })
+                            .collect();
+                        self.scene.parts.extend(clones);
+                        self.selection = Some(Selection::Group(new_group_name));
+                        *dirty = true;
                     }
                 }
-                *dirty = true;
-            }
-            if let Some(g_name) = dup_group {
-                self.push_undo();
-                let new_group_name = format!("{g_name}_copia");
-                let clones: Vec<PartSpec> = self
-                    .scene
-                    .parts
-                    .iter()
-                    .filter(|p| p.group.as_deref() == Some(g_name.as_str()))
-                    .map(|p| {
-                        let mut c = p.clone();
-                        c.name = format!("{}_copia", c.name);
-                        c.position[0] += 0.6;
-                        c.group = Some(new_group_name.clone());
-                        c
-                    })
-                    .collect();
-                self.scene.parts.extend(clones);
-                self.selection = Some(Selection::Group(new_group_name));
-                *dirty = true;
-            }
-        }
+            });
 
-        ui.add_space(10.0);
+        // Parts list WITHOUT nested ScrollArea so it never gets crushed to 2 rows
+        ui.add_space(8.0);
         ui.separator();
         ui.label(egui::RichText::new(format!("Piezas ({})", self.scene.parts.len())).strong());
 
@@ -916,36 +1306,45 @@ impl StudioApp {
         let mut to_duplicate: Option<usize> = None;
         let mut vis_toggled = false;
 
-        egui::ScrollArea::vertical().id_salt("parts_list").show(ui, |ui| {
-            for (idx, part) in self.scene.parts.iter_mut().enumerate() {
-                let is_sel = self.selection == Some(Selection::Part(idx));
-                ui.horizontal(|ui| {
-                    if ui.checkbox(&mut part.visible, "").changed() {
-                        vis_toggled = true;
+        for (idx, part) in self.scene.parts.iter_mut().enumerate() {
+            let is_sel = self.selection == Some(Selection::Part(idx));
+            ui.horizontal(|ui| {
+                let eye_sz = if compact { [30.0, 28.0] } else { [24.0, 22.0] };
+                if icon_btn(ui, SvgIcon::Eye, 13.0, eye_sz, part.visible)
+                    .on_hover_text("Mostrar/ocultar pieza")
+                    .clicked()
+                {
+                    part.visible = !part.visible;
+                    vis_toggled = true;
+                }
+                let mirror_tag = if part.mirror.iter().any(|&m| m) { " [M]" } else { "" };
+                let phys_tag = if part.body_kind == RigidBodyKind::Static { " [Fijo]" } else { "" };
+                let label = format!("{}{}{}", part.name, mirror_tag, phys_tag);
+                if ui.selectable_label(is_sel, label).clicked() {
+                    self.selection = Some(Selection::Part(idx));
+                    self.selected_vertex_idx = None;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let act_sz = if compact { [32.0, 28.0] } else { [24.0, 22.0] };
+                    if icon_btn(ui, SvgIcon::Trash, 13.0, act_sz, false)
+                        .on_hover_text("Eliminar")
+                        .clicked()
+                    {
+                        to_delete = Some(idx);
                     }
-                    let mirror_tag = if part.mirror.iter().any(|&m| m) { " [M]" } else { "" };
-                    let label = format!("{}{}", part.name, mirror_tag);
-                    if ui.selectable_label(is_sel, label).clicked() {
-                        self.selection = Some(Selection::Part(idx));
+                    if icon_btn(ui, SvgIcon::Duplicate, 13.0, act_sz, false)
+                        .on_hover_text("Duplicar")
+                        .clicked()
+                    {
+                        to_duplicate = Some(idx);
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let action_sz = if compact { [34.0, 30.0] } else { [24.0, 20.0] };
-                        if ui.add_sized(action_sz, egui::Button::new("×")).on_hover_text("Eliminar").clicked() {
-                            to_delete = Some(idx);
-                        }
-                        let dup_sz = if compact { [44.0, 30.0] } else { [34.0, 20.0] };
-                        if ui.add_sized(dup_sz, egui::Button::new("Dup")).on_hover_text("Duplicar").clicked() {
-                            to_duplicate = Some(idx);
-                        }
-                    });
                 });
-            }
-        });
+            });
+        }
 
         if vis_toggled {
             *dirty = true;
         }
-
         if let Some(idx) = to_duplicate {
             self.push_undo();
             let mut cloned = self.scene.parts[idx].clone();
@@ -963,208 +1362,133 @@ impl StudioApp {
             } else {
                 Some(Selection::Part(idx.min(self.scene.parts.len() - 1)))
             };
+            self.selected_vertex_idx = None;
             *dirty = true;
         }
     }
 
-    fn render_palette_swatches(&mut self, ui: &mut egui::Ui, compact: bool) -> Option<[u8; 4]> {
-        let mut picked = None;
-        let sz = if compact { 22.0 } else { 18.0 };
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-            for &(name, col) in &QUICK_PALETTE {
-                let c32 = egui::Color32::from_rgba_unmultiplied(col[0], col[1], col[2], col[3]);
-                let (rect, resp) = ui.allocate_exact_size(egui::vec2(sz, sz), egui::Sense::click());
-                ui.painter().rect_filled(rect, 3.0, c32);
-                ui.painter().rect_stroke(
-                    rect,
-                    3.0,
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 78, 92)),
-                    egui::StrokeKind::Inside,
-                );
-                if resp.on_hover_text(name).clicked() {
-                    picked = Some(col);
-                }
-            }
-        });
-        picked
-    }
-
     fn render_inspector(&mut self, ui: &mut egui::Ui, dirty: &mut bool, compact: bool) {
-        let btn_h = if compact { 32.0 } else { 22.0 };
-        match self.selection.clone() {
-            Some(Selection::Group(group_name)) => {
-                let first_color = self
-                    .scene
-                    .parts
-                    .iter()
-                    .find(|p| p.group.as_deref() == Some(group_name.as_str()))
-                    .map(|p| p.color)
-                    .unwrap_or([224, 159, 62, 255]);
-                let count = self
-                    .scene
-                    .parts
-                    .iter()
-                    .filter(|p| p.group.as_deref() == Some(group_name.as_str()))
-                    .count();
-                ui.label(egui::RichText::new(format!("Grupo: {group_name} ({count} piezas)")).strong());
-                ui.label(
-                    egui::RichText::new("Arrastra el gizmo 3D o rellena el color/posición de todo el grupo.")
-                        .size(11.5)
-                        .color(egui::Color32::from_gray(165)),
-                );
+        let btn_h = if compact { 32.0 } else { 24.0 };
+        let selected_part = match &self.selection {
+            Some(Selection::Part(i)) if *i < self.scene.parts.len() => Some(*i),
+            _ => None,
+        };
 
-                ui.add_space(6.0);
-                let mut group_rgba = first_color;
-                let mut apply_group_color: Option<[u8; 4]> = None;
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Rellenar color:");
-                    if ui.color_edit_button_srgba_unmultiplied(&mut group_rgba).changed() {
-                        apply_group_color = Some(group_rgba);
-                    }
-                    if ui.add_sized([68.0, btn_h], egui::Button::new("Copiar")).clicked() {
-                        self.copied_color = Some(first_color);
-                        self.status_note = String::from("Color del grupo copiado");
-                    }
-                    if ui
-                        .add_enabled(
-                            self.copied_color.is_some(),
-                            egui::Button::new("Pegar").min_size(egui::vec2(64.0, btn_h)),
-                        )
-                        .clicked()
-                    {
-                        apply_group_color = self.copied_color;
-                    }
-                });
-                if let Some(swatch) = self.render_palette_swatches(ui, compact) {
-                    apply_group_color = Some(swatch);
-                }
-                if let Some(new_col) = apply_group_color {
-                    self.push_undo();
-                    for p in &mut self.scene.parts {
-                        if p.group.as_deref() == Some(group_name.as_str()) {
-                            p.color = new_col;
-                        }
-                    }
-                    self.status_note = format!("Color aplicado al grupo '{group_name}'");
-                    *dirty = true;
-                }
-
-                ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui.add_sized([120.0, btn_h], egui::Button::new("Espejo X grupo")).clicked() {
+        if let Some(Selection::Group(g_name)) = self.selection.clone() {
+            let group_parts: Vec<usize> = self
+                .scene
+                .parts
+                .iter()
+                .enumerate()
+                .filter_map(|(i, p)| (p.group.as_deref() == Some(g_name.as_str())).then_some(i))
+                .collect();
+            ui.label(egui::RichText::new(format!("Grupo: {g_name} ({} piezas)", group_parts.len())).strong());
+            ui.label(
+                egui::RichText::new("Usa el gizmo 3D para mover, rotar o escalar todo el grupo.")
+                    .size(11.5)
+                    .color(egui::Color32::from_gray(165)),
+            );
+            ui.horizontal_wrapped(|ui| {
+                for &(name, col) in &QUICK_PALETTE {
+                    let c32 = egui::Color32::from_rgba_unmultiplied(col[0], col[1], col[2], col[3]);
+                    let sz = if compact { 24.0 } else { 20.0 };
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(sz, sz), egui::Sense::click());
+                    ui.painter().rect_filled(rect, 3.0, c32);
+                    if resp.on_hover_text(format!("Teñir grupo: {name}")).clicked() {
                         self.push_undo();
-                        for p in &mut self.scene.parts {
-                            if p.group.as_deref() == Some(group_name.as_str()) {
-                                p.mirror[0] = !p.mirror[0];
-                            }
+                        for &idx in &group_parts {
+                            self.scene.parts[idx].color = col;
                         }
                         *dirty = true;
                     }
-                    if ui.add_sized([120.0, btn_h], egui::Button::new("Al suelo (Y=0)")).clicked() {
-                        let min_y = self
-                            .part_map
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(m_idx, &src)| {
-                                let p = self.scene.parts.get(src)?;
-                                if p.group.as_deref() == Some(group_name.as_str()) {
-                                    let b = self.baked_model.parts[m_idx].bounds;
-                                    b.is_valid().then_some(b.min[1])
-                                } else {
-                                    None
-                                }
-                            })
-                            .fold(f32::INFINITY, f32::min);
-                        if min_y.is_finite() {
-                            self.push_undo();
-                            for p in &mut self.scene.parts {
-                                if p.group.as_deref() == Some(group_name.as_str()) {
-                                    p.position[1] -= min_y;
-                                }
-                            }
-                            self.status_note = String::from("Grupo apoyado en Y=0");
-                            *dirty = true;
-                        }
-                    }
-                    if ui.add_sized([102.0, btn_h], egui::Button::new("Desagrupar")).clicked() {
-                        self.push_undo();
-                        let mut first_idx = None;
-                        for (i, p) in self.scene.parts.iter_mut().enumerate() {
-                            if p.group.as_deref() == Some(group_name.as_str()) {
-                                p.group = None;
-                                if first_idx.is_none() {
-                                    first_idx = Some(i);
-                                }
-                            }
-                        }
-                        self.selection = first_idx.map(Selection::Part);
-                        *dirty = true;
-                    }
-                });
+                }
+            });
+            ui.add_space(6.0);
+            if icon_text_btn(ui, SvgIcon::Trash, 14.0, "Disolver grupo", [132.0, btn_h], false).clicked() {
+                self.push_undo();
+                for &idx in &group_parts {
+                    self.scene.parts[idx].group = None;
+                }
+                self.selection = group_parts.first().copied().map(Selection::Part);
+                *dirty = true;
             }
-            Some(Selection::Part(sel_idx)) => {
-                if sel_idx >= self.scene.parts.len() {
-                    ui.label("Toca una pieza en el 3D o añádela en Piezas.");
-                    return;
-                }
-                let snap = self.snap_enabled;
+            ui.add_space(8.0);
+            ui.separator();
+            self.render_model_physics_section(ui, dirty, compact);
+            return;
+        }
+
+        match selected_part {
+            Some(sel_idx) => {
                 let existing_groups = self.scene.group_names();
-                let (part_verts, part_tris, part_bounds) = self
-                    .part_map
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, &src)| src == sel_idx)
-                    .fold((0usize, 0usize, forja3d::Aabb::EMPTY), |(vc, tc, ab), (m_idx, _)| {
-                        let m = &self.baked_model.parts[m_idx];
-                        (vc + m.vertices.len(), tc + m.indices.len() / 3, ab.merge(m.bounds))
-                    });
+                let baked_part = self.scene.parts[sel_idx].bake();
+                let part_verts = baked_part.vertices.len();
+                let part_tris = baked_part.indices.len() / 3;
+                let part_bounds = baked_part.bounds;
+                let snap = self.snap_enabled;
                 let mut changed_continuous = false;
-                let mut discrete_mirror_toggle: Option<usize> = None;
+                let mut discrete_action: Option<&'static str> = None;
                 let mut discrete_shading_change: Option<ShadingMode> = None;
                 let mut discrete_dedup_toggle: Option<bool> = None;
-                let mut discrete_profile_replace: Option<(Vec<[f32; 2]>, Option<usize>, &'static str)> = None;
+                let mut discrete_mirror_toggle: Option<usize> = None;
                 let mut new_group_assign: Option<Option<String>> = None;
+                let mut discrete_profile_replace: Option<(Vec<[f32; 2]>, Option<usize>, &'static str)> = None;
                 let mut discrete_collider_change: Option<ColliderShape> = None;
                 let mut discrete_autofit_toggle: Option<bool> = None;
-                let mut discrete_action: Option<&'static str> = None;
                 let mut fill_color_group: Option<[u8; 4]> = None;
                 let mut fill_color_all: Option<[u8; 4]> = None;
-                let mut selected_pt = self.selected_profile_pt;
-                let mut dragging_pt = self.dragging_profile_pt;
-                let copied_col_snapshot = self.copied_color;
-                let copied_mat_snapshot = self.copied_material;
                 let mut copy_color_req: Option<[u8; 4]> = None;
                 let mut copy_mat_req: Option<([u8; 4], f32, f32)> = None;
+                let copied_col_snapshot = self.copied_color;
+                let copied_mat_snapshot = self.copied_material;
+                let mut selected_pt = self.selected_profile_pt;
+                let mut dragging_pt = self.dragging_profile_pt;
                 let mut sculpt_raise = self.terrain_sculpt_raise;
                 let mut brush_radius = self.terrain_brush_radius;
                 let mut brush_strength = self.terrain_brush_strength;
                 let mut sculpt_last = self.terrain_sculpt_last;
+                let mut sel_vert_idx = self.selected_vertex_idx;
 
                 {
                     let part = &mut self.scene.parts[sel_idx];
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Inspector de pieza").strong());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add_sized([68.0, btn_h], egui::Button::new("Eliminar")).clicked() {
+                            if icon_btn(ui, SvgIcon::Trash, 14.0, [30.0, btn_h], false)
+                                .on_hover_text("Eliminar pieza")
+                                .clicked()
+                            {
                                 discrete_action = Some("delete");
                             }
-                            if ui.add_sized([68.0, btn_h], egui::Button::new("Duplicar")).clicked() {
+                            if icon_btn(ui, SvgIcon::Duplicate, 14.0, [30.0, btn_h], false)
+                                .on_hover_text("Duplicar pieza")
+                                .clicked()
+                            {
                                 discrete_action = Some("duplicate");
                             }
                         });
                     });
-                    if part.kind == PrimitiveKind::CustomMesh {
-                        ui.label(
-                            egui::RichText::new("Malla importada (.glb / .gltf / .f3d) · editable con gizmo/color/espejo")
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(251, 191, 36)),
-                        );
-                    }
+
                     ui.horizontal(|ui| {
                         ui.label("Nombre:");
                         if ui.text_edit_singleline(&mut part.name).changed() {
                             *dirty = true;
+                        }
+                    });
+
+                    // Per-part RigidBodyKind selector
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Física:");
+                        for kind in RigidBodyKind::ALL {
+                            if ui
+                                .add_sized([74.0, btn_h], egui::Button::selectable(part.body_kind == kind, kind.label()))
+                                .clicked()
+                                && part.body_kind != kind
+                            {
+                                part.body_kind = kind;
+                                changed_continuous = true;
+                                *dirty = true;
+                            }
                         }
                     });
 
@@ -1223,7 +1547,58 @@ impl StudioApp {
                         ui.end_row();
                     });
 
-                    // Uniform scale & alignment utilities
+                    // Vertex editing controls when CustomMesh
+                    if part.kind == PrimitiveKind::CustomMesh {
+                        if let Some(mesh) = part.custom_mesh.as_mut() {
+                            if !mesh.vertices.is_empty() {
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new(format!("Vértices editables ({})", mesh.vertices.len())).strong());
+                                let max_v = mesh.vertices.len().saturating_sub(1);
+                                let mut v_idx = sel_vert_idx.unwrap_or(0).min(max_v);
+                                ui.horizontal(|ui| {
+                                    ui.label("Índice:");
+                                    if ui.add(egui::DragValue::new(&mut v_idx).range(0..=max_v)).changed() {
+                                        sel_vert_idx = Some(v_idx);
+                                    }
+                                });
+                                let anchor = mesh.vertices[v_idx].position;
+                                let mut edited = anchor;
+                                ui.horizontal(|ui| {
+                                    ui.label("V:");
+                                    for axis in 0..3 {
+                                        if ui
+                                            .add_sized(
+                                                [58.0, 22.0],
+                                                egui::DragValue::new(&mut edited[axis])
+                                                    .speed(0.02)
+                                                    .fixed_decimals(2),
+                                            )
+                                            .changed()
+                                        {
+                                            let dx = edited[0] - anchor[0];
+                                            let dy = edited[1] - anchor[1];
+                                            let dz = edited[2] - anchor[2];
+                                            for v in &mut mesh.vertices {
+                                                if (v.position[0] - anchor[0]).abs() < 1e-4
+                                                    && (v.position[1] - anchor[1]).abs() < 1e-4
+                                                    && (v.position[2] - anchor[2]).abs() < 1e-4
+                                                {
+                                                    v.position[0] += dx;
+                                                    v.position[1] += dy;
+                                                    v.position[2] += dz;
+                                                }
+                                            }
+                                            recompute_mesh_normals(mesh);
+                                            changed_continuous = true;
+                                            *dirty = true;
+                                        }
+                                    }
+                                });
+                                sel_vert_idx = Some(v_idx);
+                            }
+                        }
+                    }
+
                     let mut uni_scale = (part.scale[0] + part.scale[1] + part.scale[2]) / 3.0;
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Escala U:");
@@ -1249,14 +1624,13 @@ impl StudioApp {
                         if ui.add_sized([84.0, btn_h], egui::Button::new("Al suelo Y=0")).clicked() {
                             discrete_action = Some("ground");
                         }
+                        if icon_text_btn(ui, SvgIcon::Stack, 13.0, "Apilar", [74.0, btn_h], false).clicked() {
+                            discrete_action = Some("stack");
+                        }
                         if ui.add_sized([74.0, btn_h], egui::Button::new("Centrar XZ")).clicked() {
                             discrete_action = Some("center_xz");
                         }
-                        if ui
-                            .add_sized([88.0, btn_h], egui::Button::new("Ajustar 2m"))
-                            .on_hover_text("Escala uniformemente la pieza a ~2 metros (ideal tras importar .glb)")
-                            .clicked()
-                        {
+                        if ui.add_sized([84.0, btn_h], egui::Button::new("Ajustar 2m")).clicked() {
                             discrete_action = Some("normalize_2m");
                         }
                     });
@@ -1270,7 +1644,7 @@ impl StudioApp {
                             changed_continuous = true;
                             *dirty = true;
                         }
-                        if ui.add_sized([62.0, btn_h], egui::Button::new("Copiar")).clicked() {
+                        if icon_text_btn(ui, SvgIcon::Copy, 13.0, "Copiar", [74.0, btn_h], false).clicked() {
                             copy_color_req = Some(part.color);
                             copy_mat_req = Some((part.color, part.metallic, part.roughness));
                         }
@@ -1288,25 +1662,12 @@ impl StudioApp {
                                 copied_mat_snapshot.is_some(),
                                 egui::Button::new("Pegar Mat").min_size(egui::vec2(76.0, btn_h)),
                             )
-                            .on_hover_text("Pega color, metálico y rugosidad copiados")
                             .clicked()
                         {
                             discrete_action = Some("paste_material");
                         }
-                        if let Some(c) = copied_col_snapshot {
-                            let c32 = egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
-                            let (r, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                            ui.painter().rect_filled(r, 3.0, c32);
-                            ui.painter().rect_stroke(
-                                r,
-                                3.0,
-                                egui::Stroke::new(1.0, egui::Color32::WHITE),
-                                egui::StrokeKind::Inside,
-                            );
-                        }
                     });
 
-                    // Quick palette swatches & fill buttons
                     let sz = if compact { 22.0 } else { 18.0 };
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
@@ -1384,7 +1745,6 @@ impl StudioApp {
                         let dedup_enabled = part.shading != ShadingMode::Flat;
                         if ui
                             .add_enabled(dedup_enabled, egui::Checkbox::new(&mut dedup, "Deduplicar vértices"))
-                            .on_hover_text("Fusiona vértices idénticos para reducir tamaño .f3d/.rs")
                             .changed()
                         {
                             discrete_dedup_toggle = Some(dedup);
@@ -1419,34 +1779,22 @@ impl StudioApp {
                                 }
                             }
                         });
-                        if ui
-                            .add(egui::Slider::new(&mut part.terrain.amplitude, 0.0..=2.5).text("Relieve"))
-                            .changed()
-                        {
+                        if ui.add(egui::Slider::new(&mut part.terrain.amplitude, 0.0..=2.5).text("Relieve")).changed() {
                             changed_continuous = true;
                             *dirty = true;
                         }
-                        if ui
-                            .add(egui::Slider::new(&mut part.terrain.frequency, 0.5..=8.0).text("Frecuencia"))
-                            .changed()
-                        {
+                        if ui.add(egui::Slider::new(&mut part.terrain.frequency, 0.5..=8.0).text("Frecuencia")).changed() {
                             changed_continuous = true;
                             *dirty = true;
                         }
                         ui.horizontal_wrapped(|ui| {
                             ui.label("Octavas:");
-                            if ui
-                                .add(egui::DragValue::new(&mut part.terrain.octaves).range(1..=6))
-                                .changed()
-                            {
+                            if ui.add(egui::DragValue::new(&mut part.terrain.octaves).range(1..=6)).changed() {
                                 changed_continuous = true;
                                 *dirty = true;
                             }
                             ui.label("Semilla:");
-                            if ui
-                                .add(egui::DragValue::new(&mut part.terrain.seed).speed(1.0))
-                                .changed()
-                            {
+                            if ui.add(egui::DragValue::new(&mut part.terrain.seed).speed(1.0)).changed() {
                                 changed_continuous = true;
                                 *dirty = true;
                             }
@@ -1456,31 +1804,16 @@ impl StudioApp {
                                 *dirty = true;
                             }
                         });
-                        if ui
-                            .checkbox(&mut part.terrain.biome_tint, "Colorear por elevación (bioma)")
-                            .changed()
-                        {
+                        if ui.checkbox(&mut part.terrain.biome_tint, "Colorear por elevación (bioma)").changed() {
                             changed_continuous = true;
                             *dirty = true;
                         }
-
                         ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new("Esculpir relieve 2D (toca o arrastra para elevar/hundir):")
-                                .size(11.5)
-                                .color(egui::Color32::from_gray(180)),
-                        );
                         ui.horizontal_wrapped(|ui| {
-                            if ui
-                                .add_sized([82.0, btn_h], egui::Button::selectable(sculpt_raise, "Elevar (+)"))
-                                .clicked()
-                            {
+                            if icon_text_btn(ui, SvgIcon::Plus, 13.0, "Elevar", [78.0, btn_h], sculpt_raise).clicked() {
                                 sculpt_raise = true;
                             }
-                            if ui
-                                .add_sized([82.0, btn_h], egui::Button::selectable(!sculpt_raise, "Hundir (-)"))
-                                .clicked()
-                            {
+                            if icon_text_btn(ui, SvgIcon::Minus, 13.0, "Hundir", [78.0, btn_h], !sculpt_raise).clicked() {
                                 sculpt_raise = false;
                             }
                             if ui
@@ -1506,20 +1839,14 @@ impl StudioApp {
                                 *dirty = true;
                             }
                         });
-                        ui.horizontal(|ui| {
-                            ui.add(egui::Slider::new(&mut brush_radius, 0.06..=0.45).text("Radio"));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.add(egui::Slider::new(&mut brush_strength, 0.05..=0.80).text("Fuerza"));
-                        });
+                        ui.add(egui::Slider::new(&mut brush_radius, 0.06..=0.45).text("Radio"));
+                        ui.add(egui::Slider::new(&mut brush_strength, 0.05..=0.80).text("Fuerza"));
 
                         let pad_w = ui.available_width().clamp(180.0, 260.0);
                         let pad_h = (pad_w * 0.65).clamp(115.0, 170.0);
                         let (pad_resp, painter) =
                             ui.allocate_painter(egui::vec2(pad_w, pad_h), egui::Sense::click_and_drag());
                         let prect = pad_resp.rect;
-
-                        // Top-down heightmap preview grid
                         let grid_n = 20usize;
                         let cw = prect.width() / grid_n as f32;
                         let ch = prect.height() / grid_n as f32;
@@ -1556,7 +1883,6 @@ impl StudioApp {
                             egui::Stroke::new(1.0, egui::Color32::from_rgb(72, 82, 98)),
                             egui::StrokeKind::Inside,
                         );
-
                         if (pad_resp.clicked() || pad_resp.dragged()) && pad_resp.interact_pointer_pos().is_some() {
                             if let Some(ptr) = pad_resp.interact_pointer_pos() {
                                 let nx = ((ptr.x - prect.left()) / prect.width()).clamp(0.0, 1.0) - 0.5;
@@ -1600,10 +1926,7 @@ impl StudioApp {
                         ui.label(egui::RichText::new(title).strong());
 
                         if part.kind == PrimitiveKind::Extrude {
-                            let resp = ui.add(
-                                egui::Slider::new(&mut part.extrude_depth, 0.05..=3.0)
-                                    .text("Profundidad Z"),
-                            );
+                            let resp = ui.add(egui::Slider::new(&mut part.extrude_depth, 0.05..=3.0).text("Profundidad Z"));
                             if resp.changed() {
                                 if snap {
                                     part.extrude_depth = Self::snap_step(part.extrude_depth, 0.25).max(0.25);
@@ -1620,13 +1943,7 @@ impl StudioApp {
                                 default_extrude_profile()
                             };
                         }
-                        if let Some(s) = selected_pt {
-                            if s >= part.profile.len() {
-                                selected_pt = Some(part.profile.len().saturating_sub(1));
-                            }
-                        } else {
-                            selected_pt = Some(0);
-                        }
+                        selected_pt = Some(selected_pt.unwrap_or(0).min(part.profile.len().saturating_sub(1)));
 
                         let avail_w = ui.available_width().max(220.0);
                         let canvas_h = if compact { 190.0 } else { 166.0 };
@@ -1634,7 +1951,6 @@ impl StudioApp {
                             ui.allocate_painter(egui::vec2(avail_w, canvas_h), egui::Sense::click_and_drag());
                         let crect = canvas_resp.rect;
                         let is_lathe = part.kind == PrimitiveKind::Lathe;
-
                         let scale = if is_lathe {
                             (crect.height() * 0.43).min(crect.width() * 0.64 / 0.95).max(36.0)
                         } else {
@@ -1645,18 +1961,13 @@ impl StudioApp {
                         } else {
                             crect.center()
                         };
-
                         let to_px = |p: [f32; 2]| -> egui::Pos2 {
                             egui::pos2(origin.x + p[0] * scale, origin.y - p[1] * scale)
                         };
                         let to_2d = |px: egui::Pos2| -> [f32; 2] {
                             let mut x = (px.x - origin.x) / scale;
                             let mut y = (origin.y - px.y) / scale;
-                            if is_lathe {
-                                x = x.clamp(0.0, 0.95);
-                            } else {
-                                x = x.clamp(-0.95, 0.95);
-                            }
+                            x = if is_lathe { x.clamp(0.0, 0.95) } else { x.clamp(-0.95, 0.95) };
                             y = y.clamp(-0.95, 0.95);
                             if snap {
                                 x = Self::snap_step(x, 0.05);
@@ -1667,8 +1978,6 @@ impl StudioApp {
                             }
                             [x, y]
                         };
-
-                        // Canvas background + grid
                         painter.rect_filled(crect, 6.0, egui::Color32::from_rgb(11, 14, 20));
                         painter.rect_stroke(
                             crect,
@@ -1676,39 +1985,6 @@ impl StudioApp {
                             egui::Stroke::new(1.0, egui::Color32::from_rgb(42, 48, 60)),
                             egui::StrokeKind::Inside,
                         );
-                        let grid_col = egui::Color32::from_rgb(27, 32, 42);
-                        for step in [-0.75_f32, -0.5, -0.25, 0.25, 0.5, 0.75] {
-                            let gx = origin.x + step * scale;
-                            if gx > crect.left() + 2.0 && gx < crect.right() - 2.0 {
-                                painter.line_segment(
-                                    [egui::pos2(gx, crect.top() + 2.0), egui::pos2(gx, crect.bottom() - 2.0)],
-                                    egui::Stroke::new(1.0, grid_col),
-                                );
-                            }
-                            let gy = origin.y - step * scale;
-                            if gy > crect.top() + 2.0 && gy < crect.bottom() - 2.0 {
-                                painter.line_segment(
-                                    [egui::pos2(crect.left() + 2.0, gy), egui::pos2(crect.right() - 2.0, gy)],
-                                    egui::Stroke::new(1.0, grid_col),
-                                );
-                            }
-                        }
-                        // Axes
-                        painter.line_segment(
-                            [egui::pos2(crect.left() + 2.0, origin.y), egui::pos2(crect.right() - 2.0, origin.y)],
-                            egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 66, 82)),
-                        );
-                        let y_axis_col = if is_lathe {
-                            egui::Color32::from_rgb(245, 158, 11)
-                        } else {
-                            egui::Color32::from_rgb(58, 66, 82)
-                        };
-                        painter.line_segment(
-                            [egui::pos2(origin.x, crect.top() + 2.0), egui::pos2(origin.x, crect.bottom() - 2.0)],
-                            egui::Stroke::new(if is_lathe { 1.6 } else { 1.0 }, y_axis_col),
-                        );
-
-                        // Interaction: pick or drag 2D profile point
                         let hit_r = if compact { 20.0 } else { 13.0 };
                         if let Some(pointer) = canvas_resp.interact_pointer_pos() {
                             if canvas_resp.drag_started() || canvas_resp.clicked() {
@@ -1741,23 +2017,6 @@ impl StudioApp {
                         if canvas_resp.drag_stopped() {
                             dragging_pt = None;
                         }
-
-                        // Draw Lathe mirrored ghost silhouette
-                        if is_lathe && part.profile.len() >= 2 {
-                            let ghost_pts: Vec<egui::Pos2> = part
-                                .profile
-                                .iter()
-                                .map(|&[r, y]| to_px([-r.max(0.0), y]))
-                                .collect();
-                            for w in ghost_pts.windows(2) {
-                                painter.line_segment(
-                                    [w[0], w[1]],
-                                    egui::Stroke::new(1.2, egui::Color32::from_rgba_unmultiplied(120, 145, 180, 90)),
-                                );
-                            }
-                        }
-
-                        // Draw profile edges
                         let screen_pts: Vec<egui::Pos2> = part.profile.iter().map(|&p| to_px(p)).collect();
                         let edge_col = egui::Color32::from_rgb(56, 189, 248);
                         if is_lathe {
@@ -1766,68 +2025,25 @@ impl StudioApp {
                             }
                         } else if screen_pts.len() >= 2 {
                             for i in 0..screen_pts.len() {
-                                let a = screen_pts[i];
-                                let b = screen_pts[(i + 1) % screen_pts.len()];
-                                painter.line_segment([a, b], egui::Stroke::new(2.0, edge_col));
+                                painter.line_segment(
+                                    [screen_pts[i], screen_pts[(i + 1) % screen_pts.len()]],
+                                    egui::Stroke::new(2.0, edge_col),
+                                );
                             }
                         }
-
-                        // Draw vertex handles
                         let pt_r = if compact { 6.5 } else { 4.8 };
                         for (i, &pos_px) in screen_pts.iter().enumerate() {
-                            let is_sel_pt = selected_pt == Some(i);
-                            let fill = if is_sel_pt {
+                            let fill = if selected_pt == Some(i) {
                                 egui::Color32::from_rgb(251, 191, 36)
                             } else {
                                 egui::Color32::from_rgb(226, 232, 240)
                             };
                             painter.circle_filled(pos_px, pt_r, fill);
-                            painter.circle_stroke(
-                                pos_px,
-                                pt_r + 1.0,
-                                egui::Stroke::new(1.2, egui::Color32::from_rgb(15, 23, 42)),
-                            );
-                        }
-
-                        // Selected point numeric coords + Add/Remove point
-                        if let Some(s_idx) = selected_pt.filter(|&i| i < part.profile.len()) {
-                            ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(format!("P{}:", s_idx + 1)).strong());
-                                let min_x = if is_lathe { 0.0 } else { -0.95 };
-                                let x_lbl = if is_lathe { "R" } else { "X" };
-                                ui.label(x_lbl);
-                                if ui
-                                    .add(
-                                        egui::DragValue::new(&mut part.profile[s_idx][0])
-                                            .speed(0.01)
-                                            .range(min_x..=0.95)
-                                            .fixed_decimals(2),
-                                    )
-                                    .changed()
-                                {
-                                    changed_continuous = true;
-                                    *dirty = true;
-                                }
-                                ui.label("Y");
-                                if ui
-                                    .add(
-                                        egui::DragValue::new(&mut part.profile[s_idx][1])
-                                            .speed(0.01)
-                                            .range(-0.95..=0.95)
-                                            .fixed_decimals(2),
-                                    )
-                                    .changed()
-                                {
-                                    changed_continuous = true;
-                                    *dirty = true;
-                                }
-                            });
                         }
 
                         let min_pts = if is_lathe { 2 } else { 3 };
                         ui.horizontal_wrapped(|ui| {
-                            if ui.add_sized([74.0, btn_h], egui::Button::new("+ Punto")).clicked() {
+                            if icon_text_btn(ui, SvgIcon::Plus, 13.0, "Punto", [74.0, btn_h], false).clicked() {
                                 let mut next_prof = part.profile.clone();
                                 let cur = selected_pt.unwrap_or(0).min(next_prof.len() - 1);
                                 let next_i = if is_lathe {
@@ -1843,86 +2059,12 @@ impl StudioApp {
                                 next_prof.insert(insert_at, mid);
                                 discrete_profile_replace = Some((next_prof, Some(insert_at), "Punto añadido al perfil"));
                             }
-                            if ui
-                                .add_enabled(
-                                    part.profile.len() > min_pts,
-                                    egui::Button::new("- Punto").min_size(egui::vec2(74.0, btn_h)),
-                                )
-                                .clicked()
-                            {
+                            if icon_text_btn_enabled(ui, part.profile.len() > min_pts, SvgIcon::Minus, 13.0, "Punto", [74.0, btn_h]).clicked() {
                                 let mut next_prof = part.profile.clone();
                                 let cur = selected_pt.unwrap_or(0).min(next_prof.len() - 1);
                                 next_prof.remove(cur);
                                 let new_sel = cur.min(next_prof.len() - 1);
                                 discrete_profile_replace = Some((next_prof, Some(new_sel), "Punto eliminado del perfil"));
-                            }
-
-                            if is_lathe {
-                                if ui.add_sized([68.0, btn_h], egui::Button::new("Tobera")).clicked() {
-                                    discrete_profile_replace =
-                                        Some((default_lathe_profile(), Some(0), "Perfil: Tobera"));
-                                }
-                                if ui.add_sized([58.0, btn_h], egui::Button::new("Copa")).clicked() {
-                                    discrete_profile_replace = Some((
-                                        vec![
-                                            [0.0, -0.5],
-                                            [0.32, -0.5],
-                                            [0.08, -0.4],
-                                            [0.08, -0.05],
-                                            [0.42, 0.25],
-                                            [0.36, 0.5],
-                                            [0.0, 0.5],
-                                        ],
-                                        Some(0),
-                                        "Perfil: Copa",
-                                    ));
-                                }
-                                if ui.add_sized([66.0, btn_h], egui::Button::new("Cohete")).clicked() {
-                                    discrete_profile_replace = Some((
-                                        vec![
-                                            [0.0, -0.5],
-                                            [0.38, -0.5],
-                                            [0.32, -0.15],
-                                            [0.34, 0.18],
-                                            [0.18, 0.42],
-                                            [0.0, 0.55],
-                                        ],
-                                        Some(0),
-                                        "Perfil: Cohete",
-                                    ));
-                                }
-                            } else {
-                                if ui.add_sized([68.0, btn_h], egui::Button::new("Corona")).clicked() {
-                                    discrete_profile_replace =
-                                        Some((default_extrude_profile(), Some(0), "Perfil: Corona"));
-                                }
-                                if ui.add_sized([52.0, btn_h], egui::Button::new("Ala")).clicked() {
-                                    discrete_profile_replace = Some((
-                                        vec![
-                                            [-0.55, -0.22],
-                                            [0.55, -0.08],
-                                            [0.42, 0.14],
-                                            [-0.15, 0.26],
-                                            [-0.50, 0.12],
-                                        ],
-                                        Some(0),
-                                        "Perfil: Ala",
-                                    ));
-                                }
-                                if ui.add_sized([68.0, btn_h], egui::Button::new("Perfil L")).clicked() {
-                                    discrete_profile_replace = Some((
-                                        vec![
-                                            [-0.45, -0.45],
-                                            [0.45, -0.45],
-                                            [0.45, -0.12],
-                                            [-0.10, -0.12],
-                                            [-0.10, 0.45],
-                                            [-0.45, 0.45],
-                                        ],
-                                        Some(0),
-                                        "Perfil: L cóncava",
-                                    ));
-                                }
                             }
                         });
                     }
@@ -1931,10 +2073,7 @@ impl StudioApp {
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Simetría:");
                         for (axis, lbl) in [(0, "Espejo X"), (1, "Espejo Y"), (2, "Espejo Z")] {
-                            if ui
-                                .add_sized([74.0, btn_h], egui::Button::selectable(part.mirror[axis], lbl))
-                                .clicked()
-                            {
+                            if ui.add_sized([74.0, btn_h], egui::Button::selectable(part.mirror[axis], lbl)).clicked() {
                                 discrete_mirror_toggle = Some(axis);
                             }
                         }
@@ -1958,6 +2097,7 @@ impl StudioApp {
                                 }
                             });
                     });
+
                     ui.add_space(6.0);
                     ui.label(egui::RichText::new("Colisionador de pieza").strong());
                     ui.horizontal_wrapped(|ui| {
@@ -1978,63 +2118,10 @@ impl StudioApp {
                             discrete_collider_change = Some(ColliderShape::Capsule { radius: 0.35, half_height: 0.4 });
                         }
                     });
-
                     if !matches!(part.collider, ColliderShape::None) {
                         let mut auto_fit = part.collider_auto_fit;
                         if ui.checkbox(&mut auto_fit, "Auto-ajustar a geometría").changed() {
                             discrete_autofit_toggle = Some(auto_fit);
-                        }
-                        if !part.collider_auto_fit {
-                            ui.horizontal(|ui| {
-                                ui.label("Offset:");
-                                for axis in 0..3 {
-                                    if ui
-                                        .add(egui::DragValue::new(&mut part.collider_offset[axis]).speed(0.02).fixed_decimals(2))
-                                        .changed()
-                                    {
-                                        changed_continuous = true;
-                                        *dirty = true;
-                                    }
-                                }
-                            });
-                            match &mut part.collider {
-                                ColliderShape::Box { half_extents } => {
-                                    ui.horizontal(|ui| {
-                                        ui.label("Mitades:");
-                                        for axis in 0..3 {
-                                            if ui
-                                                .add(
-                                                    egui::DragValue::new(&mut half_extents[axis])
-                                                        .speed(0.02)
-                                                        .range(0.02..=25.0)
-                                                        .fixed_decimals(2),
-                                                )
-                                                .changed()
-                                            {
-                                                changed_continuous = true;
-                                                *dirty = true;
-                                            }
-                                        }
-                                    });
-                                }
-                                ColliderShape::Sphere { radius } => {
-                                    if ui.add(egui::Slider::new(radius, 0.02..=25.0).text("Radio")).changed() {
-                                        changed_continuous = true;
-                                        *dirty = true;
-                                    }
-                                }
-                                ColliderShape::Capsule { radius, half_height } => {
-                                    if ui.add(egui::Slider::new(radius, 0.02..=25.0).text("Radio")).changed() {
-                                        changed_continuous = true;
-                                        *dirty = true;
-                                    }
-                                    if ui.add(egui::Slider::new(half_height, 0.01..=25.0).text("Semi-alto")).changed() {
-                                        changed_continuous = true;
-                                        *dirty = true;
-                                    }
-                                }
-                                ColliderShape::None => {}
-                            }
                         }
                     }
                 }
@@ -2045,6 +2132,7 @@ impl StudioApp {
                 self.terrain_brush_radius = brush_radius;
                 self.terrain_brush_strength = brush_strength;
                 self.terrain_sculpt_last = sculpt_last;
+                self.selected_vertex_idx = sel_vert_idx;
 
                 if let Some(c) = copy_color_req {
                     self.copied_color = Some(c);
@@ -2053,7 +2141,6 @@ impl StudioApp {
                 if let Some(m) = copy_mat_req {
                     self.copied_material = Some(m);
                 }
-
                 if changed_continuous {
                     self.begin_continuous_edit(ui);
                 }
@@ -2067,7 +2154,6 @@ impl StudioApp {
                                 p.color = col;
                             }
                         }
-                        self.status_note = format!("Grupo '{g_name}' rellenado");
                         *dirty = true;
                     }
                 }
@@ -2076,7 +2162,6 @@ impl StudioApp {
                     for p in &mut self.scene.parts {
                         p.color = col;
                     }
-                    self.status_note = String::from("Todas las piezas rellenadas con el color");
                     *dirty = true;
                 }
                 if let Some(act) = discrete_action {
@@ -2085,7 +2170,6 @@ impl StudioApp {
                             if let Some(c) = self.copied_color {
                                 self.push_undo();
                                 self.scene.parts[sel_idx].color = c;
-                                self.status_note = String::from("Color pegado");
                                 *dirty = true;
                             }
                         }
@@ -2095,7 +2179,6 @@ impl StudioApp {
                                 self.scene.parts[sel_idx].color = c;
                                 self.scene.parts[sel_idx].metallic = met;
                                 self.scene.parts[sel_idx].roughness = rough;
-                                self.status_note = String::from("Material pegado (color + metálico + rugosidad)");
                                 *dirty = true;
                             }
                         }
@@ -2107,7 +2190,6 @@ impl StudioApp {
                             {
                                 self.push_undo();
                                 self.scene.parts[sel_idx].color = orig;
-                                self.status_note = String::from("Color original de malla restaurado");
                                 *dirty = true;
                             }
                         }
@@ -2115,23 +2197,21 @@ impl StudioApp {
                             if part_bounds.is_valid() {
                                 self.push_undo();
                                 self.scene.parts[sel_idx].position[1] -= part_bounds.min[1];
-                                self.status_note = String::from("Pieza apoyada en el suelo (Y=0)");
                                 *dirty = true;
                             }
                         }
+                        "stack" => self.stack_selected_on_below(),
                         "center_xz" => {
                             self.push_undo();
                             self.scene.parts[sel_idx].position[0] = 0.0;
                             self.scene.parts[sel_idx].position[2] = 0.0;
-                            self.status_note = String::from("Pieza centrada en XZ");
                             *dirty = true;
                         }
                         "normalize_2m" => {
                             if part_bounds.is_valid() {
-                                let dx = part_bounds.max[0] - part_bounds.min[0];
-                                let dy = part_bounds.max[1] - part_bounds.min[1];
-                                let dz = part_bounds.max[2] - part_bounds.min[2];
-                                let max_dim = dx.max(dy).max(dz);
+                                let max_dim = (part_bounds.max[0] - part_bounds.min[0])
+                                    .max(part_bounds.max[1] - part_bounds.min[1])
+                                    .max(part_bounds.max[2] - part_bounds.min[2]);
                                 if max_dim > 1e-4 {
                                     let factor = 2.0 / max_dim;
                                     self.push_undo();
@@ -2139,7 +2219,6 @@ impl StudioApp {
                                     for axis in 0..3 {
                                         p.scale[axis] = (p.scale[axis] * factor).clamp(0.01, 100.0);
                                     }
-                                    self.status_note = String::from("Pieza ajustada a 2m");
                                     *dirty = true;
                                 }
                             }
@@ -2151,7 +2230,6 @@ impl StudioApp {
                             cloned.position[0] += 0.45;
                             self.scene.parts.push(cloned);
                             self.selection = Some(Selection::Part(self.scene.parts.len() - 1));
-                            self.status_note = String::from("Pieza duplicada");
                             *dirty = true;
                         }
                         "delete" => {
@@ -2162,27 +2240,20 @@ impl StudioApp {
                             } else {
                                 Some(Selection::Part(sel_idx.min(self.scene.parts.len() - 1)))
                             };
-                            self.status_note = String::from("Pieza eliminada");
+                            self.selected_vertex_idx = None;
                             *dirty = true;
                         }
                         _ => {}
                     }
                 }
-
                 if let Some(mode) = discrete_shading_change {
                     self.push_undo();
                     self.scene.parts[sel_idx].shading = mode;
-                    self.status_note = format!("Sombreado: {}", mode.label());
                     *dirty = true;
                 }
                 if let Some(dedup) = discrete_dedup_toggle {
                     self.push_undo();
                     self.scene.parts[sel_idx].deduplicate = dedup;
-                    self.status_note = if dedup {
-                        String::from("Deduplicación de vértices activada")
-                    } else {
-                        String::from("Deduplicación desactivada")
-                    };
                     *dirty = true;
                 }
                 if let Some((next_profile, next_sel, note)) = discrete_profile_replace {
@@ -2211,26 +2282,17 @@ impl StudioApp {
                         self.scene.parts[sel_idx].collider_offset = [0.0; 3];
                     }
                     self.scene.parts[sel_idx].collider = shape;
-                    self.status_note = format!("Colisionador: {}", shape.label());
                     *dirty = true;
                 }
                 if let Some(auto_fit) = discrete_autofit_toggle {
                     self.push_undo();
-                    if !auto_fit {
-                        // Seed manual collider dimensions from current baked mesh bounds
-                        let baked = self.scene.parts[sel_idx].bake();
-                        if let Some(fitted) = self.scene.parts[sel_idx].fitted_collider_for_mesh(&baked) {
-                            self.scene.parts[sel_idx].collider = fitted.shape;
-                            self.scene.parts[sel_idx].collider_offset = [0.0; 3];
-                        }
-                    }
                     self.scene.parts[sel_idx].collider_auto_fit = auto_fit;
                     *dirty = true;
                 }
 
                 ui.horizontal(|ui| {
                     ui.add_sized([120.0, btn_h], egui::TextEdit::singleline(&mut self.new_group_draft));
-                    if ui.add_sized([105.0, btn_h], egui::Button::new("Crear grupo")).clicked() {
+                    if icon_text_btn(ui, SvgIcon::Plus, 13.0, "Crear grupo", [106.0, btn_h], false).clicked() {
                         let trimmed = self.new_group_draft.trim().to_string();
                         if !trimmed.is_empty() {
                             self.push_undo();
@@ -2253,563 +2315,299 @@ impl StudioApp {
     fn render_model_physics_section(&mut self, ui: &mut egui::Ui, dirty: &mut bool, compact: bool) {
         let btn_h = if compact { 32.0 } else { 22.0 };
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Físicas del modelo (.f3d)").strong());
+            ui.label(egui::RichText::new("Físicas globales (.f3d)").strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_sized([116.0, btn_h], egui::Button::new("Auto-colisión"))
-                    .on_hover_text("Activa físicas .f3d y genera colisionadores para todas las piezas")
-                    .clicked()
-                {
+                if ui.add_sized([116.0, btn_h], egui::Button::new("Auto-colisión")).clicked() {
                     self.push_undo();
                     self.scene.auto_generate_colliders();
                     self.show_colliders = true;
-                    self.status_note = String::from("Físicas y colisionadores generados en .f3d");
                     *dirty = true;
                 }
             });
         });
-
-        let mut phys_on = self.scene.physics_enabled;
-        if ui
-            .checkbox(&mut phys_on, "Embeber físicas en binario .f3d (FLAG_PHYSICS)")
-            .changed()
-        {
+        let mut enabled = self.scene.physics_enabled;
+        if ui.checkbox(&mut enabled, "Incluir colisionadores y propiedades en .f3d").changed() {
             self.push_undo();
-            self.scene.physics_enabled = phys_on;
-            if phys_on
-                && self
-                    .scene
-                    .parts
-                    .iter()
-                    .all(|p| matches!(p.collider, ColliderShape::None))
-            {
+            self.scene.physics_enabled = enabled;
+            if enabled {
                 self.scene.auto_generate_colliders();
+                self.show_colliders = true;
             }
             *dirty = true;
         }
-
-        if self.scene.physics_enabled {
-            let mut body_kind_change = None;
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Tipo:");
-                for kind in RigidBodyKind::ALL {
-                    if ui
-                        .add_sized([74.0, btn_h], egui::Button::selectable(self.scene.physics.body_kind == kind, kind.label()))
-                        .clicked()
-                        && self.scene.physics.body_kind != kind
-                    {
-                        body_kind_change = Some(kind);
-                    }
-                }
-            });
-            if let Some(kind) = body_kind_change {
-                self.push_undo();
-                self.scene.physics.body_kind = kind;
-                *dirty = true;
-            }
-
-            let mut changed_continuous = false;
-            if ui
-                .add(egui::Slider::new(&mut self.scene.physics.mass, 0.1..=100.0).text("Masa (kg)"))
-                .changed()
-            {
-                changed_continuous = true;
-                *dirty = true;
-            }
-            if ui
-                .add(egui::Slider::new(&mut self.scene.physics.friction, 0.0..=1.5).text("Fricción"))
-                .changed()
-            {
-                changed_continuous = true;
-                *dirty = true;
-            }
-            if ui
-                .add(egui::Slider::new(&mut self.scene.physics.restitution, 0.0..=1.0).text("Rebote"))
-                .changed()
-            {
-                changed_continuous = true;
-                *dirty = true;
-            }
-            if ui
-                .add(egui::Slider::new(&mut self.scene.physics.gravity_scale, -2.0..=3.0).text("Escala gravedad"))
-                .changed()
-            {
-                changed_continuous = true;
-                *dirty = true;
-            }
-            if changed_continuous {
-                self.begin_continuous_edit(ui);
-            }
-            self.flush_continuous_edit(ui);
+        let mut changed_continuous = false;
+        if ui.add(egui::Slider::new(&mut self.scene.physics.mass, 0.1..=100.0).text("Masa (kg)")).changed() {
+            changed_continuous = true;
+            *dirty = true;
         }
+        if ui.add(egui::Slider::new(&mut self.scene.physics.friction, 0.0..=1.5).text("Fricción")).changed() {
+            changed_continuous = true;
+            *dirty = true;
+        }
+        if ui.add(egui::Slider::new(&mut self.scene.physics.restitution, 0.0..=1.0).text("Rebote")).changed() {
+            changed_continuous = true;
+            *dirty = true;
+        }
+        if ui.add(egui::Slider::new(&mut self.scene.physics.gravity_scale, -2.0..=3.0).text("Escala gravedad")).changed() {
+            changed_continuous = true;
+            *dirty = true;
+        }
+        if changed_continuous {
+            self.begin_continuous_edit(ui);
+        }
+        self.flush_continuous_edit(ui);
     }
 
-    fn render_exporter(&mut self, ui: &mut egui::Ui, compact: bool) {
-        ui.label(egui::RichText::new("Exportador e Importador").strong());
-        if compact && !self.status_note.is_empty() {
-            ui.label(
-                egui::RichText::new(&self.status_note)
-                    .size(11.5)
-                    .color(egui::Color32::from_rgb(251, 191, 36)),
-            );
+    fn render_file_modal(&mut self, ctx: &egui::Context, compact: bool) {
+        if !self.show_file_modal {
+            return;
         }
+        let screen = ctx.available_rect();
+        let win_w = if compact { (screen.width() - 20.0).max(280.0) } else { 580.0 };
+        let win_h = if compact { (screen.height() - 56.0).max(320.0) } else { 540.0 };
+        let mut open = self.show_file_modal;
 
-        let btn_h = if compact { 34.0 } else { 24.0 };
-        let tab_w = if compact { 88.0 } else { 92.0 };
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_sized([tab_w, btn_h], egui::Button::selectable(self.export_tab == ExportTab::F3dBinary, "Modelo .f3d"))
-                .clicked()
-            {
-                self.export_tab = ExportTab::F3dBinary;
-            }
-            if ui
-                .add_sized([tab_w, btn_h], egui::Button::selectable(self.export_tab == ExportTab::AssetFormats, "Assets .f3*"))
-                .clicked()
-            {
-                self.export_tab = ExportTab::AssetFormats;
-            }
-            if ui
-                .add_sized([tab_w, btn_h], egui::Button::selectable(self.export_tab == ExportTab::RustSource, "Código .rs"))
-                .clicked()
-            {
-                self.export_tab = ExportTab::RustSource;
-            }
-            if ui
-                .add_sized([tab_w, btn_h], egui::Button::selectable(self.export_tab == ExportTab::WavefrontObj, "Malla .obj"))
-                .clicked()
-            {
-                self.export_tab = ExportTab::WavefrontObj;
-            }
-        });
-        ui.add_space(6.0);
+        egui::Window::new("Archivo · Importar y Exportar")
+            .open(&mut open)
+            .resizable(true)
+            .collapsible(false)
+            .default_size([win_w, win_h])
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().id_salt("file_modal_scroll").show(ui, |ui| {
+                    let btn_h = if compact { 34.0 } else { 26.0 };
 
-        match self.export_tab {
-            ExportTab::F3dBinary => {
-                ui.checkbox(&mut self.f3d_compact, "Compresión compacta (17 B/vértice + u16 idx)");
+                    if !self.status_note.is_empty() {
+                        ui.label(
+                            egui::RichText::new(&self.status_note)
+                                .size(11.5)
+                                .color(egui::Color32::from_rgb(251, 191, 36)),
+                        );
+                        ui.add_space(4.0);
+                    }
 
-                let std_len = self.cached_f3d_bytes.len();
-                let cmp_len = self.cached_f3d_compact_bytes.len();
-                let savings_pct = if std_len > 0 && cmp_len < std_len {
-                    ((std_len - cmp_len) * 100) / std_len
-                } else {
-                    0
-                };
-
-                let active_bytes = if self.f3d_compact {
-                    &self.cached_f3d_compact_bytes
-                } else {
-                    &self.cached_f3d_bytes
-                };
-
-                let checksum = if active_bytes.len() >= 16 {
-                    u32::from_le_bytes([
-                        active_bytes[12],
-                        active_bytes[13],
-                        active_bytes[14],
-                        active_bytes[15],
-                    ])
-                } else {
-                    0
-                };
-
-                ui.label(format!(
-                    "Magic: F3D1  ·  Partes: {}  ·  Vértices: {}  ·  Triángulos: {}",
-                    self.baked_model.parts.len(),
-                    self.baked_model.vertex_count(),
-                    self.baked_model.triangle_count()
-                ));
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Estándar: {std_len} B  ·  Compacto: {cmp_len} B (-{savings_pct}%)"
-                    ))
-                    .size(11.5)
-                    .color(egui::Color32::from_rgb(251, 191, 36)),
-                );
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Activo: {} bytes  ·  FNV-1a: 0x{:08X}",
-                        active_bytes.len(),
-                        checksum
-                    ))
-                    .monospace()
-                    .size(11.5),
-                );
-                let phys_summary = match &self.baked_model.physics {
-                    Some(p) => format!(
-                        "Física .f3d: Activa ({} · {} colisionadores · {:.1} kg)",
-                        p.body_kind.label(),
-                        p.colliders.len(),
-                        p.mass
-                    ),
-                    None => String::from("Física .f3d: Desactivada (solo malla)"),
-                };
-                ui.label(
-                    egui::RichText::new(phys_summary)
-                        .size(11.5)
-                        .color(if self.baked_model.physics.is_some() {
-                            egui::Color32::from_rgb(52, 211, 153)
-                        } else {
-                            egui::Color32::from_gray(145)
-                        }),
-                );
-
-                ui.add_space(6.0);
-                let active_bytes_owned = active_bytes.clone();
-                ui.horizontal_wrapped(|ui| {
-                    if ui.add_sized([124.0, btn_h], egui::Button::new("Descargar .f3d")).clicked() {
-                        let file = format!("{}.f3d", self.scene.model_name.to_lowercase());
-                        match trigger_download(&file, &active_bytes_owned, "application/octet-stream") {
-                            Ok(Some(saved)) => {
-                                self.status_note = format!("Guardado: {saved}");
-                            }
-                            Ok(None) => {
-                                self.status_note = format!("Exportado {file} ({} B)", active_bytes_owned.len());
-                            }
-                            Err(err) => {
-                                self.status_note = err;
-                            }
+                    ui.label(egui::RichText::new("Importar archivo 3D / 2D / Assets").strong());
+                    ui.horizontal_wrapped(|ui| {
+                        if icon_text_btn(ui, SvgIcon::Upload, 15.0, "Importar GLB / GLTF", [164.0, btn_h], false)
+                            .clicked()
+                        {
+                            self.request_import(ui.ctx(), ".glb,.gltf");
                         }
-                    }
-                    if ui.add_sized([110.0, btn_h], egui::Button::new("Importar .f3d")).clicked() {
-                        self.request_import(ui.ctx(), ".f3d,.glb,.gltf");
-                    }
-                    if ui.add_sized([126.0, btn_h], egui::Button::new("Importar GLB/GLTF")).clicked() {
-                        self.request_import(ui.ctx(), ".glb,.gltf");
-                    }
-                    if ui.add_sized([148.0, btn_h], egui::Button::new("Probar from_bytes")).clicked() {
-                        match Model::from_bytes(&active_bytes_owned) {
-                            Ok(decoded) => {
-                                let h = fnv1a_32(&active_bytes_owned[16..]);
-                                self.status_note = format!(
-                                    "Roundtrip OK: '{}' ({} tri, 0x{:08X})",
-                                    decoded.name,
-                                    decoded.triangle_count(),
-                                    h
-                                );
-                            }
-                            Err(err) => {
-                                self.status_note = format!("Error loader: {err}");
-                            }
-                        }
-                    }
-                });
-
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new("Cabecera Hex (.f3d)")
-                        .size(11.5)
-                        .color(egui::Color32::from_gray(165)),
-                );
-                let hex_preview: String = active_bytes_owned
-                    .iter()
-                    .take(80)
-                    .enumerate()
-                    .map(|(i, b)| if i % 16 == 15 { format!("{b:02X}\n") } else { format!("{b:02X} ") })
-                    .collect();
-                egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(10, 12, 16))
-                    .inner_margin(8.0)
-                    .corner_radius(4.0)
-                    .show(ui, |ui| {
-                        ui.add(egui::Label::new(egui::RichText::new(hex_preview).monospace().size(11.0)));
-                    });
-            }
-            ExportTab::AssetFormats => {
-                let base_name = self.scene.model_name.to_lowercase();
-                let pack_asset = self.build_pack_asset();
-                let pack_bytes = pack_asset.to_bytes();
-                let anim_asset = self.build_animation_asset();
-                let anim_bytes = anim_asset.to_bytes();
-                let doc2d = self.build_2d_asset();
-                let f2d_bytes = doc2d.to_bytes();
-                let tex_asset = self.build_texture_asset();
-                let f3t_bytes = tex_asset.to_bytes();
-
-                egui::ScrollArea::vertical()
-                    .id_salt("assets_f3_scroll")
-                    .show(ui, |ui| {
-                        let card_fill = egui::Color32::from_rgb(22, 26, 35);
-
-                        // .f3p Pack (Paquete completo todo-en-uno)
-                        egui::Frame::new()
-                            .fill(card_fill)
-                            .inner_margin(8.0)
-                            .corner_radius(6.0)
-                            .show(ui, |ui| {
-                                ui.label(egui::RichText::new(".f3p · Paquete Completo Todo-en-Uno (F3P1)").strong());
-                                let m_tri = pack_asset.total_mesh_triangles();
-                                let tex_count = pack_asset.textures.len();
-                                let clip_count = pack_asset.total_animation_clips();
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Malla ({m_tri} tri) + {tex_count} textura + {clip_count} clips de animación · {} B",
-                                        pack_bytes.len()
-                                    ))
-                                    .size(11.5)
-                                    .color(egui::Color32::from_gray(180)),
-                                );
-                                ui.horizontal_wrapped(|ui| {
-                                    if ui.add_sized([114.0, btn_h], egui::Button::new("Descargar .f3p")).clicked() {
-                                        let file = format!("{base_name}.f3p");
-                                        match trigger_download(&file, &pack_bytes, "application/octet-stream") {
-                                            Ok(Some(saved)) => self.status_note = format!("Guardado: {saved}"),
-                                            Ok(None) => self.status_note = format!("Exportado {file} ({} B)", pack_bytes.len()),
-                                            Err(err) => self.status_note = err,
-                                        }
-                                    }
-                                    if ui.add_sized([102.0, btn_h], egui::Button::new("Importar .f3p")).clicked() {
-                                        self.request_import(ui.ctx(), ".f3p");
-                                    }
-                                    if ui.add_sized([110.0, btn_h], egui::Button::new("Probar .f3p")).clicked() {
-                                        match ForjaPack::from_bytes(&pack_bytes) {
-                                            Ok(dec) => {
-                                                self.status_note = format!(
-                                                    "Roundtrip .f3p OK ({} tri, {} texturas, {} anims)",
-                                                    dec.total_mesh_triangles(),
-                                                    dec.textures.len(),
-                                                    dec.animations.len()
-                                                );
-                                            }
-                                            Err(err) => self.status_note = format!("Error .f3p: {err}"),
-                                        }
-                                    }
-                                });
-                            });
-                        ui.add_space(6.0);
-
-                        // .f3a Animation
-                        egui::Frame::new()
-                            .fill(card_fill)
-                            .inner_margin(8.0)
-                            .corner_radius(6.0)
-                            .show(ui, |ui| {
-                                ui.label(egui::RichText::new(".f3a · Animación por Separado (F3A1)").strong());
-                                let track_count: usize =
-                                    anim_asset.clips.iter().map(|c| c.tracks.len()).sum();
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{} clips · {track_count} pistas (nodos/huesos) · {} keyframes · {} B",
-                                        anim_asset.clips.len(),
-                                        anim_asset.total_keyframes(),
-                                        anim_bytes.len()
-                                    ))
-                                    .size(11.5)
-                                    .color(egui::Color32::from_gray(180)),
-                                );
-                                ui.horizontal_wrapped(|ui| {
-                                    if ui.add_sized([114.0, btn_h], egui::Button::new("Descargar .f3a")).clicked() {
-                                        let file = format!("{base_name}.f3a");
-                                        match trigger_download(&file, &anim_bytes, "application/octet-stream") {
-                                            Ok(Some(saved)) => self.status_note = format!("Guardado: {saved}"),
-                                            Ok(None) => self.status_note = format!("Exportado {file} ({} B)", anim_bytes.len()),
-                                            Err(err) => self.status_note = err,
-                                        }
-                                    }
-                                    if ui.add_sized([102.0, btn_h], egui::Button::new("Importar .f3a")).clicked() {
-                                        self.request_import(ui.ctx(), ".f3a");
-                                    }
-                                    if ui.add_sized([110.0, btn_h], egui::Button::new("Probar .f3a")).clicked() {
-                                        match AnimationSet::from_bytes(&anim_bytes) {
-                                            Ok(dec) => {
-                                                self.status_note = format!(
-                                                    "Roundtrip .f3a OK ({} keyframes)",
-                                                    dec.total_keyframes()
-                                                );
-                                            }
-                                            Err(err) => self.status_note = format!("Error .f3a: {err}"),
-                                        }
-                                    }
-                                });
-                            });
-                        ui.add_space(6.0);
-
-                        // .f2d Pantallas e Interfaces
-                        egui::Frame::new()
-                            .fill(card_fill)
-                            .inner_margin(8.0)
-                            .corner_radius(6.0)
-                            .show(ui, |ui| {
-                                ui.label(egui::RichText::new(".f2d · Pantallas e Interfaces 2D (F2D1)").strong());
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{} controles visuales · {} acciones .rs · {} B",
-                                        doc2d.widgets.len(),
-                                        doc2d.actions.len(),
-                                        f2d_bytes.len()
-                                    ))
-                                    .size(11.5)
-                                    .color(egui::Color32::from_gray(180)),
-                                );
-                                ui.horizontal_wrapped(|ui| {
-                                    if ui.add_sized([114.0, btn_h], egui::Button::new("Descargar .f2d")).clicked() {
-                                        let file = format!("{base_name}.f2d");
-                                        match trigger_download(&file, &f2d_bytes, "application/octet-stream") {
-                                            Ok(Some(saved)) => self.status_note = format!("Guardado: {saved}"),
-                                            Ok(None) => self.status_note = format!("Exportado {file} ({} B)", f2d_bytes.len()),
-                                            Err(err) => self.status_note = err,
-                                        }
-                                    }
-                                    if ui.add_sized([102.0, btn_h], egui::Button::new("Importar .f2d")).clicked() {
-                                        self.request_import(ui.ctx(), ".f2d");
-                                    }
-                                    if ui.add_sized([110.0, btn_h], egui::Button::new("Probar .f2d")).clicked() {
-                                        match UiDocument2D::from_bytes(&f2d_bytes) {
-                                            Ok(dec) => {
-                                                self.status_note = format!(
-                                                    "Roundtrip .f2d OK ({} controles, {} acciones)",
-                                                    dec.widgets.len(),
-                                                    dec.actions.len()
-                                                );
-                                            }
-                                            Err(err) => self.status_note = format!("Error .f2d: {err}"),
-                                        }
-                                    }
-                                    if ui.add_sized([114.0, btn_h], egui::Button::new("Copiar .rs UI")).clicked() {
-                                        ui.ctx().copy_text(doc2d.to_rust_code());
-                                        self.status_note = String::from("Código de acciones .rs de pantalla copiado");
-                                    }
-                                });
-                            });
-                        ui.add_space(6.0);
-
-                        // .f3t Texture
-                        egui::Frame::new()
-                            .fill(card_fill)
-                            .inner_margin(8.0)
-                            .corner_radius(6.0)
-                            .show(ui, |ui| {
-                                ui.label(egui::RichText::new(".f3t · Textura Binaria Propia (F3T1)").strong());
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{}x{} px · paleta sin dependencias externas · {} B",
-                                        tex_asset.width,
-                                        tex_asset.height,
-                                        f3t_bytes.len()
-                                    ))
-                                    .size(11.5)
-                                    .color(egui::Color32::from_gray(180)),
-                                );
-                                ui.horizontal_wrapped(|ui| {
-                                    if ui.add_sized([114.0, btn_h], egui::Button::new("Descargar .f3t")).clicked() {
-                                        let file = format!("{base_name}.f3t");
-                                        match trigger_download(&file, &f3t_bytes, "application/octet-stream") {
-                                            Ok(Some(saved)) => self.status_note = format!("Guardado: {saved}"),
-                                            Ok(None) => self.status_note = format!("Exportado {file} ({} B)", f3t_bytes.len()),
-                                            Err(err) => self.status_note = err,
-                                        }
-                                    }
-                                    if ui.add_sized([102.0, btn_h], egui::Button::new("Importar .f3t")).clicked() {
-                                        self.request_import(ui.ctx(), ".f3t");
-                                    }
-                                    if ui.add_sized([110.0, btn_h], egui::Button::new("Probar .f3t")).clicked() {
-                                        match Texture::from_bytes(&f3t_bytes) {
-                                            Ok(dec) => {
-                                                self.status_note = format!(
-                                                    "Roundtrip .f3t OK ({}x{}, {} B)",
-                                                    dec.width,
-                                                    dec.height,
-                                                    dec.data.len()
-                                                );
-                                            }
-                                            Err(err) => self.status_note = format!("Error .f3t: {err}"),
-                                        }
-                                    }
-                                });
-                            });
-                    });
-            }
-            ExportTab::RustSource => {
-                ui.horizontal_wrapped(|ui| {
-                    for target in RustExportTarget::ALL {
-                        if ui.selectable_label(self.rust_target == target, target.label()).clicked() {
-                            self.rust_target = target;
-                            self.cached_rust_src =
-                                self.baked_model.to_rust_source(&self.scene.model_name, self.rust_target);
-                        }
-                    }
-                });
-                ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui.add_sized([124.0, btn_h], egui::Button::new("Descargar .rs")).clicked() {
-                        let file = format!("{}.rs", self.scene.model_name.to_lowercase());
-                        match trigger_download(&file, self.cached_rust_src.as_bytes(), "text/plain") {
-                            Ok(Some(saved)) => self.status_note = format!("Guardado: {saved}"),
-                            Ok(None) => self.status_note = format!("Exportado {file}"),
-                            Err(err) => self.status_note = err,
-                        }
-                    }
-                    if ui.add_sized([124.0, btn_h], egui::Button::new("Copiar .rs")).clicked() {
-                        ui.ctx().copy_text(self.cached_rust_src.clone());
-                        self.status_note = String::from("Código .rs copiado");
-                    }
-                });
-
-                ui.add_space(6.0);
-                egui::ScrollArea::vertical().id_salt("rs_preview_scroll").show(ui, |ui| {
-                    let preview = if self.cached_rust_src.len() > 6000 {
-                        format!(
-                            "{}\n\n// ... ({} bytes totales — descarga el .rs completo)",
-                            &self.cached_rust_src[..6000],
-                            self.cached_rust_src.len()
+                        if icon_text_btn(
+                            ui,
+                            SvgIcon::Folder,
+                            15.0,
+                            "Abrir .f3d / .f2d / .f3*",
+                            [184.0, btn_h],
+                            false,
                         )
-                    } else {
-                        self.cached_rust_src.clone()
-                    };
-                    ui.add(
-                        egui::TextEdit::multiline(&mut preview.as_str())
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(f32::INFINITY),
-                    );
-                });
-            }
-            ExportTab::WavefrontObj => {
-                ui.label(format!(
-                    "Wavefront .obj · {} vértices · {} triángulos · {:.1} KB",
-                    self.baked_model.vertex_count(),
-                    self.baked_model.triangle_count(),
-                    self.cached_obj_src.len() as f32 / 1024.0
-                ));
-                ui.label(
-                    egui::RichText::new("Compatible con Blender, Godot, Unity y Unreal Engine")
-                        .size(11.0)
-                        .color(egui::Color32::from_gray(165)),
-                );
-                ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui.add_sized([124.0, btn_h], egui::Button::new("Descargar .obj")).clicked() {
-                        let file = format!("{}.obj", self.scene.model_name.to_lowercase());
-                        match trigger_download(&file, self.cached_obj_src.as_bytes(), "text/plain") {
-                            Ok(Some(saved)) => self.status_note = format!("Guardado: {saved}"),
-                            Ok(None) => self.status_note = format!("Exportado {file}"),
-                            Err(err) => self.status_note = err,
+                        .clicked()
+                        {
+                            self.request_import(ui.ctx(), ".f3d,.f3a,.f3p,.f2d,.f3t,.glb,.gltf");
+                        }
+                    });
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label(egui::RichText::new("Exportar proyecto").strong());
+                    let tab_w = if compact { 92.0 } else { 112.0 };
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add_sized([tab_w, btn_h], egui::Button::selectable(self.export_tab == ExportTab::F3dBinary, "Modelo .f3d")).clicked() {
+                            self.export_tab = ExportTab::F3dBinary;
+                        }
+                        if ui.add_sized([tab_w, btn_h], egui::Button::selectable(self.export_tab == ExportTab::AssetFormats, "Assets .f3* / .f2d")).clicked() {
+                            self.export_tab = ExportTab::AssetFormats;
+                        }
+                        if ui.add_sized([tab_w, btn_h], egui::Button::selectable(self.export_tab == ExportTab::RustSource, "Código .rs")).clicked() {
+                            self.export_tab = ExportTab::RustSource;
+                        }
+                        if ui.add_sized([tab_w, btn_h], egui::Button::selectable(self.export_tab == ExportTab::WavefrontObj, "Malla .obj")).clicked() {
+                            self.export_tab = ExportTab::WavefrontObj;
+                        }
+                    });
+                    ui.add_space(6.0);
+
+                    match self.export_tab {
+                        ExportTab::F3dBinary => {
+                            ui.checkbox(&mut self.f3d_compact, "Compresión compacta (17 B/vértice + u16 idx)");
+                            let std_len = self.cached_f3d_bytes.len();
+                            let cmp_len = self.cached_f3d_compact_bytes.len();
+                            let active_bytes = if self.f3d_compact {
+                                self.cached_f3d_compact_bytes.clone()
+                            } else {
+                                self.cached_f3d_bytes.clone()
+                            };
+                            ui.label(format!(
+                                "Partes: {} · Vértices: {} · Triángulos: {} · {} B (Estándar {} B / Compacto {} B)",
+                                self.baked_model.parts.len(),
+                                self.baked_model.vertex_count(),
+                                self.baked_model.triangle_count(),
+                                active_bytes.len(),
+                                std_len,
+                                cmp_len,
+                            ));
+                            ui.horizontal_wrapped(|ui| {
+                                if icon_text_btn(ui, SvgIcon::Download, 14.0, "Descargar .f3d", [136.0, btn_h], false)
+                                    .clicked()
+                                {
+                                    let file = format!("{}.f3d", self.scene.model_name.to_lowercase());
+                                    match trigger_download(&file, &active_bytes, "application/octet-stream") {
+                                        Ok(Some(saved)) => self.status_note = format!("Guardado: {saved}"),
+                                        Ok(None) => self.status_note = format!("Exportado {file} ({} B)", active_bytes.len()),
+                                        Err(err) => self.status_note = err,
+                                    }
+                                }
+                                if ui.add_sized([148.0, btn_h], egui::Button::new("Probar from_bytes")).clicked() {
+                                    match Model::from_bytes(&active_bytes) {
+                                        Ok(decoded) => {
+                                            let h = fnv1a_32(&active_bytes[16..]);
+                                            self.status_note = format!(
+                                                "Roundtrip OK: '{}' ({} tri, 0x{:08X})",
+                                                decoded.name,
+                                                decoded.triangle_count(),
+                                                h
+                                            );
+                                        }
+                                        Err(err) => self.status_note = format!("Error loader: {err}"),
+                                    }
+                                }
+                            });
+                            let hex_preview: String = active_bytes
+                                .iter()
+                                .take(80)
+                                .enumerate()
+                                .map(|(i, b)| if i % 16 == 15 { format!("{b:02X}\n") } else { format!("{b:02X} ") })
+                                .collect();
+                            egui::Frame::new()
+                                .fill(egui::Color32::from_rgb(10, 12, 16))
+                                .inner_margin(8.0)
+                                .corner_radius(4.0)
+                                .show(ui, |ui| {
+                                    ui.add(egui::Label::new(egui::RichText::new(hex_preview).monospace().size(11.0)));
+                                });
+                        }
+                        ExportTab::AssetFormats => {
+                            let base_name = self.scene.model_name.to_lowercase();
+                            let pack_bytes = self.build_pack_asset().to_bytes();
+                            let anim_bytes = self.build_animation_asset().to_bytes();
+                            let f2d_bytes = self.doc2d.to_bytes();
+                            let f2d_rs = self.doc2d.to_rust_code();
+                            let f3t_bytes = self.build_texture_asset().to_bytes();
+                            let card_fill = egui::Color32::from_rgb(22, 26, 35);
+
+                            for (title, desc, ext, bytes) in [
+                                (".f3p · Paquete Todo-en-Uno (F3P1)", "Malla + texturas + animaciones", "f3p", pack_bytes),
+                                (".f3a · Animación (F3A1)", "Clips y keyframes de escena", "f3a", anim_bytes),
+                                (".f2d · Pantalla 2D / UI (F2D1)", "Controles del Visor 2D + acciones .rs", "f2d", f2d_bytes),
+                                (".f3t · Textura Propia (F3T1)", "Paleta RGBA sin dependencias", "f3t", f3t_bytes),
+                            ] {
+                                egui::Frame::new()
+                                    .fill(card_fill)
+                                    .inner_margin(8.0)
+                                    .corner_radius(6.0)
+                                    .show(ui, |ui| {
+                                        ui.label(egui::RichText::new(title).strong());
+                                        ui.label(
+                                            egui::RichText::new(format!("{desc} · {} B", bytes.len()))
+                                                .size(11.5)
+                                                .color(egui::Color32::from_gray(180)),
+                                        );
+                                        ui.horizontal_wrapped(|ui| {
+                                            if icon_text_btn(
+                                                ui,
+                                                SvgIcon::Download,
+                                                14.0,
+                                                &format!("Descargar .{ext}"),
+                                                [128.0, btn_h],
+                                                false,
+                                            )
+                                            .clicked()
+                                            {
+                                                let file = format!("{base_name}.{ext}");
+                                                match trigger_download(&file, &bytes, "application/octet-stream") {
+                                                    Ok(Some(saved)) => self.status_note = format!("Guardado: {saved}"),
+                                                    Ok(None) => self.status_note = format!("Exportado {file} ({} B)", bytes.len()),
+                                                    Err(err) => self.status_note = err,
+                                                }
+                                            }
+                                            if ext == "f2d"
+                                                && icon_text_btn(ui, SvgIcon::Copy, 14.0, "Copiar .rs UI", [118.0, btn_h], false).clicked()
+                                            {
+                                                ui.ctx().copy_text(f2d_rs.clone());
+                                                self.status_note = String::from("Código .rs de Pantalla 2D copiado");
+                                            }
+                                        });
+                                    });
+                                ui.add_space(6.0);
+                            }
+                        }
+                        ExportTab::RustSource => {
+                            ui.horizontal_wrapped(|ui| {
+                                for target in RustExportTarget::ALL {
+                                    if ui.selectable_label(self.rust_target == target, target.label()).clicked() {
+                                        self.rust_target = target;
+                                        self.cached_rust_src =
+                                            self.baked_model.to_rust_source(&self.scene.model_name, self.rust_target);
+                                    }
+                                }
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                if icon_text_btn(ui, SvgIcon::Download, 14.0, "Descargar .rs", [128.0, btn_h], false).clicked() {
+                                    let file = format!("{}.rs", self.scene.model_name.to_lowercase());
+                                    match trigger_download(&file, self.cached_rust_src.as_bytes(), "text/plain") {
+                                        Ok(Some(saved)) => self.status_note = format!("Guardado: {saved}"),
+                                        Ok(None) => self.status_note = format!("Exportado {file}"),
+                                        Err(err) => self.status_note = err,
+                                    }
+                                }
+                                if icon_text_btn(ui, SvgIcon::Copy, 14.0, "Copiar .rs", [116.0, btn_h], false).clicked() {
+                                    ui.ctx().copy_text(self.cached_rust_src.clone());
+                                    self.status_note = String::from("Código .rs copiado");
+                                }
+                            });
+                            let preview = if self.cached_rust_src.len() > 6000 {
+                                format!("{}\n// ... ({} B)", &self.cached_rust_src[..6000], self.cached_rust_src.len())
+                            } else {
+                                self.cached_rust_src.clone()
+                            };
+                            ui.add(
+                                egui::TextEdit::multiline(&mut preview.as_str())
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_rows(14)
+                                    .desired_width(f32::INFINITY),
+                            );
+                        }
+                        ExportTab::WavefrontObj => {
+                            ui.horizontal_wrapped(|ui| {
+                                if icon_text_btn(ui, SvgIcon::Download, 14.0, "Descargar .obj", [128.0, btn_h], false).clicked() {
+                                    let file = format!("{}.obj", self.scene.model_name.to_lowercase());
+                                    match trigger_download(&file, self.cached_obj_src.as_bytes(), "text/plain") {
+                                        Ok(Some(saved)) => self.status_note = format!("Guardado: {saved}"),
+                                        Ok(None) => self.status_note = format!("Exportado {file}"),
+                                        Err(err) => self.status_note = err,
+                                    }
+                                }
+                                if icon_text_btn(ui, SvgIcon::Copy, 14.0, "Copiar .obj", [116.0, btn_h], false).clicked() {
+                                    ui.ctx().copy_text(self.cached_obj_src.clone());
+                                    self.status_note = String::from("Malla .obj copiada");
+                                }
+                            });
+                            let preview = if self.cached_obj_src.len() > 6000 {
+                                format!("{}\n# ... ({} B)", &self.cached_obj_src[..6000], self.cached_obj_src.len())
+                            } else {
+                                self.cached_obj_src.clone()
+                            };
+                            ui.add(
+                                egui::TextEdit::multiline(&mut preview.as_str())
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_rows(14)
+                                    .desired_width(f32::INFINITY),
+                            );
                         }
                     }
-                    if ui.add_sized([124.0, btn_h], egui::Button::new("Copiar .obj")).clicked() {
-                        ui.ctx().copy_text(self.cached_obj_src.clone());
-                        self.status_note = String::from("Malla .obj copiada");
-                    }
                 });
+            });
 
-                ui.add_space(6.0);
-                egui::ScrollArea::vertical().id_salt("obj_preview_scroll").show(ui, |ui| {
-                    let preview = if self.cached_obj_src.len() > 6000 {
-                        format!(
-                            "{}\n\n# ... ({} bytes totales — descarga el .obj completo)",
-                            &self.cached_obj_src[..6000],
-                            self.cached_obj_src.len()
-                        )
-                    } else {
-                        self.cached_obj_src.clone()
-                    };
-                    ui.add(
-                        egui::TextEdit::multiline(&mut preview.as_str())
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(f32::INFINITY),
-                    );
-                });
-            }
-        }
+        self.show_file_modal = open;
     }
 
     fn gizmo_handles(
@@ -2887,6 +2685,7 @@ impl StudioApp {
                     }
                     part.scale[axis_idx] = v;
                 }
+                GizmoMode::Vertices => {}
             }
         }
         self.rebuild_outputs();
@@ -2895,8 +2694,55 @@ impl StudioApp {
     fn render_viewport_3d(&mut self, ui: &mut egui::Ui, compact: bool) {
         let rect = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+        let rmin = [rect.left(), rect.top()];
+        let rsize = [rect.width(), rect.height().max(1.0)];
 
-        let gizmo_data = self.gizmo_handles(rect);
+        // Collect unique editable vertex handles if in GizmoMode::Vertices
+        let vertex_handles: Vec<(usize, [f32; 3], egui::Pos2)> = if self.sim_world.is_none()
+            && self.gizmo_mode == GizmoMode::Vertices
+        {
+            if let Some(Selection::Part(p_idx)) = self.selection {
+                if let Some(part) = self.scene.parts.get(p_idx) {
+                    if let Some(mesh) = &part.custom_mesh {
+                        let mat = Mat4::from_trs(part.position, part.rotation_deg, part.scale);
+                        let mut seen: Vec<[i32; 3]> = Vec::new();
+                        let mut out = Vec::new();
+                        for (v_idx, v) in mesh.vertices.iter().enumerate() {
+                            let key = [
+                                (v.position[0] * 1000.0).round() as i32,
+                                (v.position[1] * 1000.0).round() as i32,
+                                (v.position[2] * 1000.0).round() as i32,
+                            ];
+                            if !seen.contains(&key) {
+                                seen.push(key);
+                                let world = mat.transform_point(v.position);
+                                if let Some(px) = self.camera.project_to_screen(world, rmin, rsize) {
+                                    out.push((v_idx, v.position, egui::pos2(px[0], px[1])));
+                                }
+                                if out.len() >= 300 {
+                                    break;
+                                }
+                            }
+                        }
+                        out
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        let gizmo_data = if self.gizmo_mode != GizmoMode::Vertices {
+            self.gizmo_handles(rect)
+        } else {
+            None
+        };
         let hit_radius = if compact { 26.0 } else { 18.0 };
         let pointer_pos = ui.ctx().pointer_interact_pos();
         let hovered_axis = if self.active_gizmo_drag.is_none() {
@@ -2910,9 +2756,40 @@ impl StudioApp {
             self.active_gizmo_drag.as_ref().map(|d| d.axis)
         };
 
-        // Start gizmo drag when pressing primary button on an axis
+        let mut hit_vertex: Option<(usize, [f32; 3])> = None;
+        if self.gizmo_mode == GizmoMode::Vertices && self.active_vertex_drag.is_none() {
+            if let Some(p) = pointer_pos {
+                if rect.contains(p) {
+                    let mut best_d = if compact { 22.0 } else { 14.0 };
+                    for &(v_idx, local_pos, px) in &vertex_handles {
+                        let d = p.distance(px);
+                        if d < best_d {
+                            best_d = d;
+                            hit_vertex = Some((v_idx, local_pos));
+                        }
+                    }
+                }
+            }
+        }
+
         if response.drag_started_by(egui::PointerButton::Primary) {
-            if let Some(axis) = hovered_axis {
+            if let (Some((v_idx, local_anchor)), Some(Selection::Part(part_idx)), Some(pos)) =
+                (hit_vertex, &self.selection, pointer_pos)
+            {
+                if let Some(part) = self.scene.parts.get(*part_idx) {
+                    if let Some(mesh) = &part.custom_mesh {
+                        let mat = Mat4::from_trs(part.position, part.rotation_deg, part.scale);
+                        self.selected_vertex_idx = Some(v_idx);
+                        self.active_vertex_drag = Some(ActiveVertexDrag {
+                            part_idx: *part_idx,
+                            local_anchor,
+                            world_anchor: mat.transform_point(local_anchor),
+                            start_vertices: mesh.vertices.clone(),
+                            start_pointer_px: pos,
+                        });
+                    }
+                }
+            } else if let Some(axis) = hovered_axis {
                 self.active_gizmo_drag = Some(ActiveGizmoDrag {
                     axis,
                     mode: self.gizmo_mode,
@@ -2920,10 +2797,62 @@ impl StudioApp {
                     accum_pixels: 0.0,
                 });
             }
+        } else if response.clicked() {
+            if let Some((v_idx, _)) = hit_vertex {
+                self.selected_vertex_idx = Some(v_idx);
+            }
         }
 
-        // Update active gizmo drag OR fall back to camera orbit / multi-touch
-        if let (Some(drag), Some((_, world_len, handles))) = (self.active_gizmo_drag.as_mut(), &gizmo_data) {
+        if let Some(vdrag) = self.active_vertex_drag.as_ref() {
+            if response.dragged_by(egui::PointerButton::Primary) {
+                if let Some(pos) = pointer_pos {
+                    let dx_px = pos.x - vdrag.start_pointer_px.x;
+                    let dy_px = pos.y - vdrag.start_pointer_px.y;
+                    let eye = self.camera.eye();
+                    let forward = normalize_v([
+                        self.camera.target[0] - eye[0],
+                        self.camera.target[1] - eye[1],
+                        self.camera.target[2] - eye[2],
+                    ]);
+                    let right = normalize_v(cross_v(forward, [0.0, 1.0, 0.0]));
+                    let up = cross_v(right, forward);
+                    let dist = ((vdrag.world_anchor[0] - eye[0]).powi(2)
+                        + (vdrag.world_anchor[1] - eye[1]).powi(2)
+                        + (vdrag.world_anchor[2] - eye[2]).powi(2))
+                    .sqrt()
+                    .max(0.2);
+                    let world_per_px = (2.0 * dist * (45.0_f32.to_radians() * 0.5).tan())
+                        / rect.height().max(1.0);
+                    let world_delta = [
+                        (right[0] * dx_px - up[0] * dy_px) * world_per_px,
+                        (right[1] * dx_px - up[1] * dy_px) * world_per_px,
+                        (right[2] * dx_px - up[2] * dy_px) * world_per_px,
+                    ];
+
+                    if let Some(part) = self.scene.parts.get_mut(vdrag.part_idx) {
+                        let mat = Mat4::from_trs(part.position, part.rotation_deg, part.scale);
+                        let local_delta = mat3_inv_mul(&mat, world_delta);
+                        if let Some(mesh) = part.custom_mesh.as_mut() {
+                            for (i, v) in mesh.vertices.iter_mut().enumerate() {
+                                let sv = vdrag.start_vertices[i];
+                                if (sv.position[0] - vdrag.local_anchor[0]).abs() < 1e-4
+                                    && (sv.position[1] - vdrag.local_anchor[1]).abs() < 1e-4
+                                    && (sv.position[2] - vdrag.local_anchor[2]).abs() < 1e-4
+                                {
+                                    v.position = [
+                                        sv.position[0] + local_delta[0],
+                                        sv.position[1] + local_delta[1],
+                                        sv.position[2] + local_delta[2],
+                                    ];
+                                }
+                            }
+                            recompute_mesh_normals(mesh);
+                        }
+                    }
+                    self.rebuild_outputs();
+                }
+            }
+        } else if let (Some(drag), Some((_, world_len, handles))) = (self.active_gizmo_drag.as_mut(), &gizmo_data) {
             if response.dragged_by(egui::PointerButton::Primary) {
                 let delta = response.drag_delta();
                 let (origin, _, _) = gizmo_data.unwrap();
@@ -2957,7 +2886,6 @@ impl StudioApp {
             self.camera.pan(delta.x, delta.y);
         }
 
-        // Commit gizmo drag to Undo stack on pointer release
         if response.drag_stopped() {
             if let Some(drag) = self.active_gizmo_drag.take() {
                 if drag.start_parts != self.scene.parts {
@@ -2967,12 +2895,22 @@ impl StudioApp {
                         scene: prev_scene,
                         selection: self.selection.clone(),
                     });
-                    self.status_note = format!(
-                        "{} aplicado{}",
-                        drag.mode.label(),
-                        if self.snap_enabled { " (Snap)" } else { "" }
-                    );
+                    self.status_note = format!("{} aplicado", drag.mode.label());
                 }
+            }
+            if let Some(vdrag) = self.active_vertex_drag.take() {
+                let mut prev_scene = self.scene.clone();
+                if let Some(p) = prev_scene.parts.get_mut(vdrag.part_idx) {
+                    if let Some(m) = p.custom_mesh.as_mut() {
+                        m.vertices = vdrag.start_vertices;
+                        recompute_mesh_normals(m);
+                    }
+                }
+                self.push_undo_entry(HistoryEntry {
+                    scene: prev_scene,
+                    selection: self.selection.clone(),
+                });
+                self.status_note = String::from("Vértice editado");
             }
         }
 
@@ -2983,8 +2921,7 @@ impl StudioApp {
             }
         }
 
-        // Click / Tap to select 3D part via Ray-AABB (skip if clicking gizmo handle or simulating)
-        if self.sim_world.is_none() && response.clicked() && hovered_axis.is_none() {
+        if self.sim_world.is_none() && response.clicked() && hovered_axis.is_none() && hit_vertex.is_none() {
             if let Some(pos) = response.interact_pointer_pos() {
                 let norm_x = ((pos.x - rect.left()) / rect.width()) * 2.0 - 1.0;
                 let norm_y = 1.0 - ((pos.y - rect.top()) / rect.height()) * 2.0;
@@ -3002,6 +2939,7 @@ impl StudioApp {
                     }
                 }
                 self.selection = best_part.map(Selection::Part);
+                self.selected_vertex_idx = None;
             }
         }
 
@@ -3013,7 +2951,7 @@ impl StudioApp {
         let show_grid = self.show_grid;
         let show_colliders = self.show_colliders || self.sim_world.is_some();
         let wireframe = self.wireframe;
-        let model_offset = self.sim_offset;
+        let part_transforms = self.sim_part_transforms.clone();
         let aspect = rect.width() / rect.height().max(1.0);
 
         let callback = egui::PaintCallback {
@@ -3032,7 +2970,7 @@ impl StudioApp {
                                 &selected_mask,
                                 show_grid,
                                 wireframe,
-                                model_offset,
+                                &part_transforms,
                             );
                         }
                     }
@@ -3041,60 +2979,85 @@ impl StudioApp {
         };
         ui.painter().add(callback);
 
-        // Crisp 3D Gizmo Overlay drawn from projected 3D coordinates (hidden during live physics playback)
-        if self.sim_world.is_none() {
-            if let Some((origin, _, handles)) = self.gizmo_handles(rect) {
+        // Draw vertex handles in Vertex Edit mode
+        if self.sim_world.is_none() && self.gizmo_mode == GizmoMode::Vertices {
             let painter = ui.painter_at(rect);
-            let axis_names = ["X", "Y", "Z"];
-            for (i, &(axis, tip, base_col)) in handles.iter().enumerate() {
-                let is_active = hovered_axis == Some(axis)
-                    || self.active_gizmo_drag.as_ref().map(|d| d.axis) == Some(axis);
-                let col = if is_active {
+            let vr = if compact { 6.5 } else { 4.8 };
+            for &(v_idx, _, px) in &vertex_handles {
+                let is_sel_v = self.selected_vertex_idx == Some(v_idx);
+                let fill = if is_sel_v {
                     egui::Color32::from_rgb(251, 191, 36)
                 } else {
-                    base_col
+                    egui::Color32::from_rgb(56, 189, 248)
                 };
-                let width = if is_active { 4.2 } else { 2.8 };
-                painter.line_segment([origin, tip], egui::Stroke::new(width, col));
-
-                let handle_r = if compact { 8.5 } else { 6.0 };
-                match self.gizmo_mode {
-                    GizmoMode::Translate => {
-                        painter.circle_filled(tip, handle_r, col);
-                    }
-                    GizmoMode::Scale => {
-                        painter.rect_filled(
-                            egui::Rect::from_center_size(tip, egui::vec2(handle_r * 1.9, handle_r * 1.9)),
-                            2.0,
-                            col,
-                        );
-                    }
-                    GizmoMode::Rotate => {
-                        painter.circle_stroke(tip, handle_r + 1.5, egui::Stroke::new(2.2, col));
-                    }
-                }
-                painter.text(
-                    tip + egui::vec2(10.0, -10.0),
-                    egui::Align2::CENTER_CENTER,
-                    axis_names[i],
-                    egui::FontId::proportional(11.5),
-                    col,
-                );
+                painter.circle_filled(px, vr, fill);
+                painter.circle_stroke(px, vr + 1.0, egui::Stroke::new(1.2, egui::Color32::BLACK));
             }
-            painter.circle_filled(origin, 4.5, egui::Color32::WHITE);
+            if let Some(Selection::Part(p_idx)) = self.selection {
+                if self.scene.parts.get(p_idx).map_or(false, |p| p.kind != PrimitiveKind::CustomMesh) {
+                    let btn_rect = egui::Rect::from_min_size(
+                        rect.center_top() + egui::vec2(-105.0, 50.0),
+                        egui::vec2(210.0, 32.0),
+                    );
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(btn_rect), |ui| {
+                        if icon_text_btn(ui, SvgIcon::Vertices, 14.0, "Convertir a Malla Editable", [210.0, 32.0], false)
+                            .clicked()
+                        {
+                            self.convert_selected_to_mesh();
+                        }
+                    });
+                }
             }
         }
 
-        // Top-left floating Gizmo Mode + Undo/Redo + Snap bar inside 3D Viewport
-        let top_bar_w = if compact { (rect.width() - 16.0).min(430.0) } else { 520.0 };
-        let top_bar_h = if compact { 38.0 } else { 30.0 };
+        // Draw 3D gizmo axes
+        if self.sim_world.is_none() && self.gizmo_mode != GizmoMode::Vertices {
+            if let Some((origin, _, handles)) = self.gizmo_handles(rect) {
+                let painter = ui.painter_at(rect);
+                let axis_names = ["X", "Y", "Z"];
+                for (i, &(axis, tip, base_col)) in handles.iter().enumerate() {
+                    let is_active = hovered_axis == Some(axis)
+                        || self.active_gizmo_drag.as_ref().map(|d| d.axis) == Some(axis);
+                    let col = if is_active {
+                        egui::Color32::from_rgb(251, 191, 36)
+                    } else {
+                        base_col
+                    };
+                    let width = if is_active { 4.2 } else { 2.8 };
+                    painter.line_segment([origin, tip], egui::Stroke::new(width, col));
+
+                    let handle_r = if compact { 8.5 } else { 6.0 };
+                    match self.gizmo_mode {
+                        GizmoMode::Translate | GizmoMode::Vertices => painter.circle_filled(tip, handle_r, col),
+                        GizmoMode::Scale => painter.rect_filled(
+                            egui::Rect::from_center_size(tip, egui::vec2(handle_r * 1.9, handle_r * 1.9)),
+                            2.0,
+                            col,
+                        ),
+                        GizmoMode::Rotate => painter.circle_stroke(tip, handle_r + 1.5, egui::Stroke::new(2.2, col)),
+                    }
+                    painter.text(
+                        tip + egui::vec2(10.0, -10.0),
+                        egui::Align2::CENTER_CENTER,
+                        axis_names[i],
+                        egui::FontId::proportional(11.5),
+                        col,
+                    );
+                }
+                painter.circle_filled(origin, 4.5, egui::Color32::WHITE);
+            }
+        }
+
+        // Floating tool strip inside 3D Viewport
+        let top_bar_w = if compact { (rect.width() - 16.0).max(200.0) } else { 420.0 };
+        let top_bar_h = if compact { 38.0 } else { 32.0 };
         let top_rect = egui::Rect::from_min_size(
             rect.left_top() + egui::vec2(8.0, 8.0),
             egui::vec2(top_bar_w, top_bar_h),
         );
         ui.scope_builder(egui::UiBuilder::new().max_rect(top_rect), |ui| {
             egui::Frame::new()
-                .fill(egui::Color32::from_rgba_unmultiplied(15, 18, 24, 220))
+                .fill(egui::Color32::from_rgba_unmultiplied(15, 18, 24, 222))
                 .inner_margin(egui::Margin::symmetric(8, 4))
                 .corner_radius(6.0)
                 .show(ui, |ui| {
@@ -3104,101 +3067,44 @@ impl StudioApp {
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 let bh = if compact { 28.0 } else { 22.0 };
-                                let mode_w = if compact && rect.width() < 390.0 { 48.0 } else { 54.0 };
-                                for mode in [GizmoMode::Translate, GizmoMode::Rotate, GizmoMode::Scale] {
-                                    if ui
-                                        .add_sized([mode_w, bh], egui::Button::selectable(self.gizmo_mode == mode, mode.label()))
-                                        .clicked()
+                                for mode in [
+                                    GizmoMode::Translate,
+                                    GizmoMode::Rotate,
+                                    GizmoMode::Scale,
+                                    GizmoMode::Vertices,
+                                ] {
+                                    let w = if compact { 76.0 } else { 78.0 };
+                                    if icon_text_btn(
+                                        ui,
+                                        mode.icon(),
+                                        14.0,
+                                        mode.label(),
+                                        [w, bh],
+                                        self.gizmo_mode == mode,
+                                    )
+                                    .clicked()
                                     {
                                         self.gizmo_mode = mode;
                                     }
                                 }
-                                ui.toggle_value(&mut self.snap_enabled, "Snap");
-                                ui.separator();
-                                let can_undo = !self.undo_stack.is_empty();
-                                let can_redo = !self.redo_stack.is_empty();
-                                if ui
-                                    .add_enabled(can_undo, egui::Button::new("↶").min_size(egui::vec2(28.0, bh)))
-                                    .on_hover_text("Deshacer (Ctrl+Z)")
-                                    .clicked()
-                                {
-                                    self.undo();
-                                }
-                                if ui
-                                    .add_enabled(can_redo, egui::Button::new("↷").min_size(egui::vec2(28.0, bh)))
-                                    .on_hover_text("Rehacer (Ctrl+Y)")
-                                    .clicked()
-                                {
-                                    self.redo();
+                                if icon_text_btn(ui, SvgIcon::Snap, 14.0, "Snap", [64.0, bh], self.snap_enabled).clicked() {
+                                    self.snap_enabled = !self.snap_enabled;
                                 }
                             });
                         });
                 });
         });
 
-        // Floating Physics Playback Bar (forja3d-physics)
-        let is_simulating = self.sim_world.is_some();
-        let sim_w = if is_simulating { 280.0 } else { 132.0 };
-        let sim_pos = if compact {
-            rect.left_top() + egui::vec2(8.0, top_bar_h + 14.0)
-        } else {
-            rect.right_top() + egui::vec2(-(sim_w + 8.0), 8.0)
-        };
-        let sim_rect = egui::Rect::from_min_size(sim_pos, egui::vec2(sim_w, top_bar_h));
-        ui.scope_builder(egui::UiBuilder::new().max_rect(sim_rect), |ui| {
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgba_unmultiplied(15, 22, 28, 225))
-                .inner_margin(egui::Margin::symmetric(8, 4))
-                .corner_radius(6.0)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let bh = if compact { 28.0 } else { 22.0 };
-                        let sim_lbl = if is_simulating { "⏹ Parar" } else { "▶ Física" };
-                        if ui
-                            .add_sized([84.0, bh], egui::Button::selectable(is_simulating, sim_lbl))
-                            .on_hover_text("Probar físicas del .f3d con forja3d-physics")
-                            .clicked()
-                        {
-                            if is_simulating {
-                                self.stop_physics_sim();
-                                self.status_note = String::from("Simulación detenida");
-                            } else {
-                                self.start_physics_sim(2.2);
-                            }
-                        }
-                        if is_simulating {
-                            if ui.add_sized([82.0, bh], egui::Button::new("↑ Impulso")).clicked() {
-                                if let (Some(world), Some(handle)) = (self.sim_world.as_mut(), self.sim_body) {
-                                    let mass = world.body(handle).map_or(1.0, |b| b.mass.max(0.5));
-                                    world.apply_impulse(handle, [0.0, 6.5 * mass, 0.0]);
-                                }
-                            }
-                            if let (Some(world), Some(handle)) = (&self.sim_world, self.sim_body) {
-                                if let Some(body) = world.body(handle) {
-                                    let ground_txt = if body.on_ground { "Suelo" } else { "Aire" };
-                                    ui.label(
-                                        egui::RichText::new(format!("Y:{:.2}m · {ground_txt}", body.position[1]))
-                                            .size(11.0)
-                                            .monospace()
-                                            .color(egui::Color32::from_rgb(52, 211, 153)),
-                                    );
-                                }
-                            }
-                        }
-                    });
-                });
-        });
-
-        // Bottom-left floating viewport controls (Wire / Grid / Col. / Zoom / Reset)
-        let bar_w = if compact { (rect.width() - 16.0).max(200.0) } else { 540.0 };
-        let bar_h = if compact { 38.0 } else { 28.0 };
+        // Bottom-left floating viewport display controls
+        let bar_w = if compact { (rect.width() - 16.0).max(200.0) } else { 460.0 };
+        let bar_h = if compact { 38.0 } else { 32.0 };
         let overlay_rect = egui::Rect::from_min_size(
             rect.left_bottom() + egui::vec2(8.0, -(bar_h + 8.0)),
             egui::vec2(bar_w, bar_h),
         );
         ui.scope_builder(egui::UiBuilder::new().max_rect(overlay_rect), |ui| {
             egui::Frame::new()
-                .fill(egui::Color32::from_rgba_unmultiplied(15, 18, 24, 215))
+                .fill(egui::Color32::from_rgba_unmultiplied(15, 18, 24, 220))
                 .inner_margin(egui::Margin::symmetric(8, 4))
                 .corner_radius(6.0)
                 .show(ui, |ui| {
@@ -3207,32 +3113,157 @@ impl StudioApp {
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                let btn_h = if compact { 28.0 } else { 20.0 };
-                                ui.toggle_value(&mut self.wireframe, "Wire");
-                                ui.toggle_value(&mut self.show_grid, "Grid");
-                                ui.toggle_value(&mut self.show_colliders, "Col.");
-                                if ui.add_sized([28.0, btn_h], egui::Button::new("+")).on_hover_text("Acercar").clicked() {
+                                let bh = if compact { 28.0 } else { 22.0 };
+                                if icon_text_btn(ui, SvgIcon::Wire, 14.0, "Malla", [66.0, bh], self.wireframe).clicked() {
+                                    self.wireframe = !self.wireframe;
+                                }
+                                if icon_text_btn(ui, SvgIcon::Grid, 14.0, "Grilla", [68.0, bh], self.show_grid).clicked() {
+                                    self.show_grid = !self.show_grid;
+                                }
+                                if icon_text_btn(ui, SvgIcon::Collider, 14.0, "Col.", [60.0, bh], self.show_colliders).clicked() {
+                                    self.show_colliders = !self.show_colliders;
+                                }
+                                if icon_btn(ui, SvgIcon::Plus, 14.0, [28.0, bh], false)
+                                    .on_hover_text("Acercar")
+                                    .clicked()
+                                {
                                     self.camera.distance = (self.camera.distance * 0.82).clamp(0.15, 5000.0);
                                 }
-                                if ui.add_sized([28.0, btn_h], egui::Button::new("-")).on_hover_text("Alejar").clicked() {
+                                if icon_btn(ui, SvgIcon::Minus, 14.0, [28.0, bh], false)
+                                    .on_hover_text("Alejar")
+                                    .clicked()
+                                {
                                     self.camera.distance = (self.camera.distance * 1.22).clamp(0.15, 5000.0);
                                 }
-                                if ui.add_sized([64.0, btn_h], egui::Button::new("Centrar")).clicked() {
+                                if icon_text_btn(ui, SvgIcon::Center, 14.0, "Centrar", [82.0, bh], false).clicked() {
                                     self.camera = OrbitCamera::default();
                                     self.camera.frame_bounds(self.baked_model.bounds());
-                                }
-                                if !compact {
-                                    ui.separator();
-                                    ui.label(
-                                        egui::RichText::new(&self.status_note)
-                                            .size(11.5)
-                                            .color(egui::Color32::from_gray(185)),
-                                    );
                                 }
                             });
                         });
                 });
         });
+    }
+
+    fn render_top_header(&mut self, ui: &mut egui::Ui, compact: bool) {
+        let bh = if compact { 32.0 } else { 24.0 };
+        egui::ScrollArea::horizontal()
+            .id_salt("studio_header_scroll")
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .show(ui, |ui| {
+                ui.horizontal_centered(|ui| {
+                    if icon_text_btn(
+                        ui,
+                        SvgIcon::Folder,
+                        15.0,
+                        "Archivo",
+                        [86.0, bh],
+                        self.show_file_modal,
+                    )
+                    .on_hover_text("Importar / Exportar (.f3d, .f2d, .f3*, .glb, .rs, .obj)")
+                    .clicked()
+                    {
+                        self.show_file_modal = !self.show_file_modal;
+                    }
+
+                    ui.separator();
+
+                    if icon_text_btn(
+                        ui,
+                        SvgIcon::View3d,
+                        15.0,
+                        "Vista 3D",
+                        [84.0, bh],
+                        self.view_mode == ViewMode::Mode3D,
+                    )
+                    .clicked()
+                    {
+                        self.view_mode = ViewMode::Mode3D;
+                    }
+                    if icon_text_btn(
+                        ui,
+                        SvgIcon::View2d,
+                        15.0,
+                        "Visor 2D",
+                        [84.0, bh],
+                        self.view_mode == ViewMode::Mode2D,
+                    )
+                    .clicked()
+                    {
+                        self.view_mode = ViewMode::Mode2D;
+                    }
+
+                    ui.separator();
+
+                    let can_undo = !self.undo_stack.is_empty();
+                    let can_redo = !self.redo_stack.is_empty();
+                    if icon_btn_enabled(ui, can_undo, SvgIcon::Undo, 15.0, [30.0, bh])
+                        .on_hover_text("Deshacer (Ctrl+Z)")
+                        .clicked()
+                    {
+                        self.undo();
+                    }
+                    if icon_btn_enabled(ui, can_redo, SvgIcon::Redo, 15.0, [30.0, bh])
+                        .on_hover_text("Rehacer (Ctrl+Y)")
+                        .clicked()
+                    {
+                        self.redo();
+                    }
+
+                    if self.view_mode == ViewMode::Mode3D {
+                        ui.separator();
+                        let is_simulating = self.sim_world.is_some();
+                        let (sim_icon, sim_lbl) = if is_simulating {
+                            (SvgIcon::Stop, "Parar")
+                        } else {
+                            (SvgIcon::Play, "Física")
+                        };
+                        if icon_text_btn(ui, sim_icon, 14.0, sim_lbl, [76.0, bh], is_simulating)
+                            .on_hover_text("Simular físicas por pieza con forja3d-physics")
+                            .clicked()
+                        {
+                            if is_simulating {
+                                self.stop_physics_sim();
+                                self.status_note = String::from("Simulación detenida");
+                            } else {
+                                self.start_physics_sim();
+                            }
+                        }
+                        if is_simulating {
+                            if icon_text_btn(ui, SvgIcon::Impulse, 14.0, "Impulso", [82.0, bh], false).clicked() {
+                                let target_mesh = match self.selection {
+                                    Some(Selection::Part(p_idx)) => self
+                                        .part_map
+                                        .iter()
+                                        .position(|&src| src == p_idx),
+                                    _ => None,
+                                };
+                                if let Some(world) = self.sim_world.as_mut() {
+                                    for &(m_idx, handle, _) in &self.sim_part_bodies {
+                                        if target_mesh.map_or(true, |t| t == m_idx) {
+                                            if let Some(b) = world.body(handle) {
+                                                if b.body_kind == RigidBodyKind::Dynamic {
+                                                    let mass = b.mass.max(0.5);
+                                                    world.apply_impulse(handle, [0.4 * mass, 6.2 * mass, 0.0]);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !compact && !self.status_note.is_empty() {
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new(&self.status_note)
+                                .size(11.5)
+                                .color(egui::Color32::from_gray(190)),
+                        );
+                    }
+                });
+            });
     }
 }
 
@@ -3252,7 +3283,6 @@ impl eframe::App for StudioApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.step_physics_sim(ui.ctx());
 
-        // Handle pending async file-picker (.glb/.gltf/.f3d) import
         let picked = self.pending_import.lock().ok().and_then(|mut g| g.take());
         if let Some((name, bytes, base_dir)) = picked {
             self.import_model_bytes(Some(&name), &bytes, base_dir.as_deref());
@@ -3262,7 +3292,6 @@ impl eframe::App for StudioApp {
             self.status_note = note;
         }
 
-        // Handle drag & drop (.glb/.gltf/.f3d) files (Desktop + WebAssembly)
         let dropped = ui.ctx().input(|i| i.raw.dropped_files.clone());
         if let Some(file) = dropped.into_iter().next() {
             let name = file
@@ -3292,7 +3321,6 @@ impl eframe::App for StudioApp {
             }
         }
 
-        // Keyboard Undo / Redo shortcuts (Ctrl/Cmd + Z, Ctrl/Cmd + Y / Shift+Z)
         let (want_undo, want_redo) = ui.ctx().input(|i| {
             let cmd = i.modifiers.command;
             let undo = cmd && !i.modifiers.shift && i.key_pressed(egui::Key::Z);
@@ -3319,21 +3347,17 @@ impl eframe::App for StudioApp {
             if !self.immersive_applied || (!self.was_focused && focused) {
                 android_enable_immersive();
                 self.immersive_applied = true;
-                self.last_inset_poll = -1.0;
             }
-            if self.last_inset_poll < 0.0 || (now - self.last_inset_poll) > 0.25 {
-                let raw = android_safe_insets_dp(ui.ctx(), viewport_rect);
-                let already = [
-                    (content_rect.left() - viewport_rect.left()).max(0.0),
-                    (content_rect.top() - viewport_rect.top()).max(0.0),
-                    (viewport_rect.right() - content_rect.right()).max(0.0),
-                    (viewport_rect.bottom() - content_rect.bottom()).max(0.0),
-                ];
+            let size_changed = (viewport_rect.size() - content_rect.size()).length_sq() > 1.0;
+            if self.last_inset_poll < 0.0 || (!self.was_focused && focused) || size_changed || (now - self.last_inset_poll) > 0.75 {
+                let measured = android_safe_insets_dp(ui.ctx(), viewport_rect);
+                let fallback_t = if measured[1] < 1.0 && cfg!(target_os = "android") { 24.0 } else { 0.0 };
+                let fallback_b = if measured[3] < 1.0 && cfg!(target_os = "android") { 14.0 } else { 0.0 };
                 self.safe_insets_dp = [
-                    (raw[0] - already[0]).max(0.0),
-                    (raw[1] - already[1]).max(0.0),
-                    (raw[2] - already[2]).max(0.0),
-                    (raw[3] - already[3]).max(0.0),
+                    measured[0].max(0.0),
+                    measured[1].max(fallback_t),
+                    measured[2].max(0.0),
+                    measured[3].max(fallback_b),
                 ];
                 self.last_inset_poll = now;
             }
@@ -3379,27 +3403,53 @@ impl eframe::App for StudioApp {
         let style = ui.style_mut();
         if is_compact {
             style.spacing.interact_size.y = 32.0;
-            style.spacing.button_padding = egui::vec2(10.0, 6.0);
+            style.spacing.button_padding = egui::vec2(8.0, 5.0);
         } else {
             style.spacing.interact_size.y = 22.0;
             style.spacing.button_padding = egui::vec2(8.0, 4.0);
         }
+
+        egui::Panel::top("studio_top_bar")
+            .exact_size(if is_compact { 44.0 } else { 36.0 })
+            .show(ui, |ui| {
+                self.render_top_header(ui, is_compact);
+            });
+
+        if is_compact && !self.status_note.is_empty() {
+            egui::Panel::top("mobile_status_strip")
+                .exact_size(22.0)
+                .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(20, 25, 34)).inner_margin(egui::Margin::symmetric(8, 2)))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(&self.status_note)
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(251, 191, 36)),
+                    );
+                });
+        }
+
+        self.render_file_modal(ui.ctx(), is_compact);
+
+        let mut pending_f2d_dl: Option<(String, Vec<u8>)> = None;
+        let mut pending_rs_dl: Option<(String, String)> = None;
 
         if is_compact {
             egui::Panel::bottom("mobile_studio_tabs")
                 .exact_size(46.0)
                 .show(ui, |ui| {
                     ui.horizontal_centered(|ui| {
-                        let tab_w = ((root_rect.width() - 36.0) / 4.0).max(60.0);
+                        let tab_w = ((root_rect.width() - 28.0) / 3.0).max(74.0);
+                        let (v_icon, v_lbl, s_lbl) = match self.view_mode {
+                            ViewMode::Mode3D => (SvgIcon::View3d, "Vista 3D", "Piezas"),
+                            ViewMode::Mode2D => (SvgIcon::View2d, "Visor 2D", "Controles"),
+                        };
                         let tabs = [
-                            (MobileTab::Viewport, "Vista 3D"),
-                            (MobileTab::Scene, "Piezas"),
-                            (MobileTab::Inspect, "Editar"),
-                            (MobileTab::Export, "Exportar"),
+                            (MobileTab::Viewport, v_icon, v_lbl),
+                            (MobileTab::Scene, SvgIcon::Cubes, s_lbl),
+                            (MobileTab::Inspect, SvgIcon::Sliders, "Editar"),
                         ];
-                        for (tab, label) in tabs {
-                            if ui
-                                .add_sized([tab_w, 34.0], egui::Button::selectable(self.mobile_tab == tab, label))
+                        for (tab, icon, label) in tabs {
+                            if icon_text_btn(ui, icon, 14.0, label, [tab_w, 34.0], self.mobile_tab == tab)
                                 .clicked()
                             {
                                 self.mobile_tab = tab;
@@ -3409,17 +3459,45 @@ impl eframe::App for StudioApp {
                 });
 
             if self.mobile_tab != MobileTab::Viewport {
-                let drawer_h = (root_rect.height() * 0.46).clamp(180.0, 360.0);
+                let drawer_h = (root_rect.height() * 0.56).clamp(240.0, 480.0);
                 egui::Panel::bottom("mobile_drawer")
-                    .exact_size(drawer_h)
+                    .resizable(true)
+                    .default_size(drawer_h)
+                    .min_size(180.0)
+                    .max_size((root_rect.height() * 0.72).max(260.0))
                     .show(ui, |ui| {
                         egui::ScrollArea::vertical().id_salt("mobile_drawer_scroll").show(ui, |ui| {
                             ui.add_space(4.0);
-                            match self.mobile_tab {
-                                MobileTab::Scene => self.render_scene_panel(ui, &mut dirty, true),
-                                MobileTab::Inspect => self.render_inspector(ui, &mut dirty, true),
-                                MobileTab::Export => self.render_exporter(ui, true),
-                                MobileTab::Viewport => {}
+                            match (self.mobile_tab, self.view_mode) {
+                                (MobileTab::Scene, ViewMode::Mode3D) => self.render_scene_panel(ui, &mut dirty, true),
+                                (MobileTab::Inspect, ViewMode::Mode3D) => self.render_inspector(ui, &mut dirty, true),
+                                (MobileTab::Scene, ViewMode::Mode2D) => {
+                                    let sel3d = match self.selection {
+                                        Some(Selection::Part(i)) => Some(i),
+                                        _ => None,
+                                    };
+                                    render_scene_panel_2d(
+                                        ui,
+                                        &mut self.doc2d,
+                                        &mut self.selected_widget_2d,
+                                        &self.scene,
+                                        sel3d,
+                                        &mut self.status_note,
+                                        true,
+                                    );
+                                }
+                                (MobileTab::Inspect, ViewMode::Mode2D) => {
+                                    render_inspector_2d(
+                                        ui,
+                                        &mut self.doc2d,
+                                        &mut self.selected_widget_2d,
+                                        &mut self.status_note,
+                                        true,
+                                        &mut pending_f2d_dl,
+                                        &mut pending_rs_dl,
+                                    );
+                                }
+                                (MobileTab::Viewport, _) => {}
                             }
                         });
                     });
@@ -3431,27 +3509,68 @@ impl eframe::App for StudioApp {
 
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(13, 16, 22)))
-                .show(ui, |ui| {
-                    self.render_viewport_3d(ui, true);
+                .show(ui, |ui| match self.view_mode {
+                    ViewMode::Mode3D => self.render_viewport_3d(ui, true),
+                    ViewMode::Mode2D => render_viewport_2d(
+                        ui,
+                        &mut self.doc2d,
+                        &mut self.selected_widget_2d,
+                        &mut self.dragging_widget_2d,
+                        &mut self.snap_enabled,
+                        &mut self.status_note,
+                        true,
+                    ),
                 });
         } else {
             egui::Panel::left("left_scene_panel")
-                .resizable(false)
-                .default_size(244.0)
+                .resizable(true)
+                .default_size(276.0)
+                .min_size(220.0)
+                .max_size(460.0)
                 .show(ui, |ui| {
-                    self.render_scene_panel(ui, &mut dirty, false);
+                    egui::ScrollArea::vertical().id_salt("desktop_left_scroll").show(ui, |ui| {
+                        ui.add_space(6.0);
+                        match self.view_mode {
+                            ViewMode::Mode3D => self.render_scene_panel(ui, &mut dirty, false),
+                            ViewMode::Mode2D => {
+                                let sel3d = match self.selection {
+                                    Some(Selection::Part(i)) => Some(i),
+                                    _ => None,
+                                };
+                                render_scene_panel_2d(
+                                    ui,
+                                    &mut self.doc2d,
+                                    &mut self.selected_widget_2d,
+                                    &self.scene,
+                                    sel3d,
+                                    &mut self.status_note,
+                                    false,
+                                );
+                            }
+                        }
+                    });
                 });
 
             egui::Panel::right("right_inspector_panel")
                 .resizable(true)
-                .default_size(356.0)
+                .default_size(340.0)
+                .min_size(250.0)
+                .max_size(520.0)
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical().id_salt("desktop_right_scroll").show(ui, |ui| {
                         ui.add_space(6.0);
-                        self.render_inspector(ui, &mut dirty, false);
-                        ui.add_space(8.0);
-                        ui.separator();
-                        self.render_exporter(ui, false);
+                        match self.view_mode {
+                            ViewMode::Mode3D => self.render_inspector(ui, &mut dirty, false),
+                            ViewMode::Mode2D => render_inspector_2d(
+                                ui,
+                                &mut self.doc2d,
+                                &mut self.selected_widget_2d,
+                                &mut self.status_note,
+                                false,
+                                &mut pending_f2d_dl,
+                                &mut pending_rs_dl,
+                            ),
+                        }
                     });
                 });
 
@@ -3461,11 +3580,107 @@ impl eframe::App for StudioApp {
 
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(13, 16, 22)))
-                .show(ui, |ui| {
-                    self.render_viewport_3d(ui, false);
+                .show(ui, |ui| match self.view_mode {
+                    ViewMode::Mode3D => self.render_viewport_3d(ui, false),
+                    ViewMode::Mode2D => render_viewport_2d(
+                        ui,
+                        &mut self.doc2d,
+                        &mut self.selected_widget_2d,
+                        &mut self.dragging_widget_2d,
+                        &mut self.snap_enabled,
+                        &mut self.status_note,
+                        false,
+                    ),
                 });
         }
+
+        if let Some((file, bytes)) = pending_f2d_dl {
+            match trigger_download(&file, &bytes, "application/octet-stream") {
+                Ok(Some(saved)) => self.status_note = format!("Guardado: {saved}"),
+                Ok(None) => self.status_note = format!("Exportado {file} ({} B)", bytes.len()),
+                Err(err) => self.status_note = err,
+            }
+        }
+        if let Some((file, code)) = pending_rs_dl {
+            match trigger_download(&file, code.as_bytes(), "text/plain") {
+                Ok(Some(saved)) => self.status_note = format!("Guardado: {saved}"),
+                Ok(None) => self.status_note = format!("Exportado {file}"),
+                Err(err) => self.status_note = err,
+            }
+        }
     }
+}
+
+fn recompute_mesh_normals(mesh: &mut MeshPart) {
+    let mut acc = vec![Vec3::ZERO; mesh.vertices.len()];
+    let mut bounds = forja3d::Aabb::EMPTY;
+    for v in &mesh.vertices {
+        bounds.include_point(v.position);
+    }
+    mesh.bounds = bounds;
+
+    for tri in mesh.indices.chunks_exact(3) {
+        let (Some(va), Some(vb), Some(vc)) = (
+            mesh.vertices.get(tri[0] as usize),
+            mesh.vertices.get(tri[1] as usize),
+            mesh.vertices.get(tri[2] as usize),
+        ) else {
+            continue;
+        };
+        let pa = Vec3::new(va.position[0], va.position[1], va.position[2]);
+        let pb = Vec3::new(vb.position[0], vb.position[1], vb.position[2]);
+        let pc = Vec3::new(vc.position[0], vc.position[1], vc.position[2]);
+        let w = (pb - pa).cross(pc - pa);
+        acc[tri[0] as usize] = acc[tri[0] as usize] + w;
+        acc[tri[1] as usize] = acc[tri[1] as usize] + w;
+        acc[tri[2] as usize] = acc[tri[2] as usize] + w;
+    }
+    for (i, v) in mesh.vertices.iter_mut().enumerate() {
+        let n = acc[i];
+        if n.dot(n) > 1e-8 {
+            v.normal = n.normalized().to_array();
+        }
+    }
+}
+
+fn cross_v(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn dot_v(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn normalize_v(v: [f32; 3]) -> [f32; 3] {
+    let l = dot_v(v, v).sqrt();
+    if l > 1e-6 {
+        [v[0] / l, v[1] / l, v[2] / l]
+    } else {
+        [0.0, 1.0, 0.0]
+    }
+}
+
+fn mat3_inv_mul(m: &Mat4, v: [f32; 3]) -> [f32; 3] {
+    let a = [m.cols[0][0], m.cols[0][1], m.cols[0][2]];
+    let b = [m.cols[1][0], m.cols[1][1], m.cols[1][2]];
+    let c = [m.cols[2][0], m.cols[2][1], m.cols[2][2]];
+    let r0 = cross_v(b, c);
+    let r1 = cross_v(c, a);
+    let r2 = cross_v(a, b);
+    let det = dot_v(a, r0);
+    if det.abs() < 1e-7 {
+        return v;
+    }
+    let inv = 1.0 / det;
+    [
+        dot_v(r0, v) * inv,
+        dot_v(r1, v) * inv,
+        dot_v(r2, v) * inv,
+    ]
 }
 
 fn dist_point_to_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
@@ -3491,7 +3706,44 @@ static SYSTEM_BARS_CLASS: std::sync::OnceLock<jni::objects::GlobalRef> =
     std::sync::OnceLock::new();
 
 #[cfg(target_os = "android")]
+static PICKER_JNI_REGISTERED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "android")]
 const SYSTEM_BARS_DEX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/classes.dex"));
+
+#[cfg(target_os = "android")]
+type AndroidPickCallback = Box<dyn FnOnce(Option<String>, Option<Vec<u8>>, Option<String>) + Send + 'static>;
+
+#[cfg(target_os = "android")]
+extern "system" fn android_on_file_picked_native<'local>(
+    mut env: jni::JNIEnv<'local>,
+    _cls: jni::objects::JClass<'local>,
+    callback_ptr: jni::sys::jlong,
+    name: jni::objects::JString<'local>,
+    data: jni::objects::JByteArray<'local>,
+    error: jni::objects::JString<'local>,
+) {
+    if callback_ptr == 0 {
+        return;
+    }
+    let cb: Box<AndroidPickCallback> = unsafe { Box::from_raw(callback_ptr as *mut AndroidPickCallback) };
+    let name_opt = if !name.is_null() {
+        env.get_string(&name).ok().map(|s| s.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+    let data_opt = if !data.is_null() {
+        env.convert_byte_array(&data).ok()
+    } else {
+        None
+    };
+    let err_opt = if !error.is_null() {
+        env.get_string(&error).ok().map(|s| s.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+    cb(name_opt, data_opt, err_opt);
+}
 
 #[cfg(target_os = "android")]
 fn android_system_bars_class<'a>(
@@ -3523,7 +3775,18 @@ fn android_system_bars_class<'a>(
         )?
         .l()?;
     let global = env.new_global_ref(cls_obj)?;
-    Ok(SYSTEM_BARS_CLASS.get_or_init(|| global))
+    let cls_ref = SYSTEM_BARS_CLASS.get_or_init(|| global);
+    if PICKER_JNI_REGISTERED.get().is_none() {
+        let method = jni::NativeMethod {
+            name: "onFilePicked".into(),
+            sig: "(JLjava/lang/String;[BLjava/lang/String;)V".into(),
+            fn_ptr: android_on_file_picked_native as *mut core::ffi::c_void,
+        };
+        if env.register_native_methods(cls_ref, &[method]).is_ok() {
+            let _ = PICKER_JNI_REGISTERED.set(());
+        }
+    }
+    Ok(cls_ref)
 }
 
 #[cfg(target_os = "android")]
@@ -3651,54 +3914,53 @@ impl StudioApp {
             let pending_status = Arc::clone(&self.pending_status);
             let ctx_clone = ctx.clone();
 
-            let res = robius_file_picker::FileDialog::new()
-                .set_title("Importar Forja3D (.f3d / .f3a / .f3p / .f2d / .f3t / .glb)")
-                .set_mime_type("*/*")
-                .pick_file(move |result| {
-                    match result {
-                        Ok(Some(picked)) => {
-                            let name = picked
-                                .file_name()
-                                .filter(|s| !s.is_empty())
-                                .unwrap_or("modelo.glb")
-                                .to_string();
-                            match picked.read_bytes() {
-                                Ok(bytes) => {
-                                    if let Ok(mut guard) = pending.lock() {
-                                        *guard = Some((name, bytes, None));
-                                    }
-                                }
-                                Err(err) => {
-                                    if let Ok(mut guard) = pending_status.lock() {
-                                        *guard = Some(format!("No se pudo leer el archivo: {err}"));
-                                    }
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            if let Ok(mut guard) = pending_status.lock() {
-                                *guard = Some(String::from("Importación cancelada"));
-                            }
-                        }
-                        Err(err) => {
-                            if let Ok(mut guard) = pending_status.lock() {
-                                *guard = Some(format!(
-                                    "No se pudo abrir el gestor de archivos: {err:?}"
-                                ));
-                            }
-                        }
+            let cb: AndroidPickCallback = Box::new(move |name_opt, bytes_opt, err_opt| {
+                if let Some(err) = err_opt {
+                    if let Ok(mut guard) = pending_status.lock() {
+                        *guard = Some(err);
                     }
-                    ctx_clone.request_repaint();
-                });
+                } else if let Some(bytes) = bytes_opt {
+                    let name = name_opt
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| String::from("modelo.glb"));
+                    if let Ok(mut guard) = pending.lock() {
+                        *guard = Some((name, bytes, None));
+                    }
+                } else if let Ok(mut guard) = pending_status.lock() {
+                    *guard = Some(String::from("Importación cancelada"));
+                }
+                ctx_clone.request_repaint();
+            });
 
-            match res {
-                Ok(()) => {
-                    self.status_note = String::from("Abriendo gestor de archivos...");
+            let ptr = Box::into_raw(Box::new(cb)) as jni::sys::jlong;
+            let launched = robius_android_env::with_activity(|env, activity| -> bool {
+                let Ok(cls) = android_system_bars_class(env) else {
+                    return false;
+                };
+                if PICKER_JNI_REGISTERED.get().is_none() {
+                    return false;
                 }
-                Err(err) => {
-                    self.status_note =
-                        format!("No se pudo abrir el gestor de archivos: {err:?}");
+                env.call_static_method(
+                    cls,
+                    "openFilePicker",
+                    "(Landroid/app/Activity;J)Z",
+                    &[
+                        jni::objects::JValueGen::Object(activity),
+                        jni::objects::JValueGen::Long(ptr),
+                    ],
+                )
+                .and_then(|v| v.z())
+                .unwrap_or(false)
+            })
+            .unwrap_or(false);
+
+            if launched {
+                self.status_note = String::from("Abriendo gestor de archivos...");
+            } else {
+                unsafe {
+                    drop(Box::from_raw(ptr as *mut AndroidPickCallback));
                 }
+                self.status_note = String::from("No se pudo abrir el gestor de archivos de Android");
             }
         }
     }
@@ -3786,12 +4048,18 @@ fn trigger_import_model(
     let Ok(input) = el.dyn_into::<eframe::web_sys::HtmlInputElement>() else { return };
     input.set_type("file");
     input.set_accept(accept);
+    let _ = input.set_attribute("style", "display:none");
+    if let Some(body) = document.body() {
+        let _ = body.append_child(&input);
+    }
 
     let pending_clone = Arc::clone(pending);
     let ctx_clone = ctx.clone();
     let input_ref = input.clone();
     let onchange = Closure::wrap(Box::new(move |_event: eframe::web_sys::Event| {
-        let Some(files) = input_ref.files() else { return };
+        let files_opt = input_ref.files();
+        input_ref.remove();
+        let Some(files) = files_opt else { return };
         let Some(file) = files.get(0) else { return };
         let name = file.name();
         let promise = file.array_buffer();

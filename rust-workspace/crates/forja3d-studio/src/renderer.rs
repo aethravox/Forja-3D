@@ -160,7 +160,7 @@ pub struct GlViewportRenderer {
     grid_vertex_count: i32,
     debug_vao: glow::VertexArray,
     debug_vbo: glow::Buffer,
-    debug_vertex_count: i32,
+    debug_ranges: Vec<(Option<usize>, i32, i32)>,
     parts: Vec<GpuPart>,
     uploaded_generation: u64,
     uploaded_debug_key: u64,
@@ -181,15 +181,22 @@ impl GlViewportRenderer {
             layout(location = 2) in vec4 a_color;
 
             uniform mat4 u_mvp;
+            uniform vec3 u_pivot;
+            uniform vec4 u_quat;
             uniform vec3 u_offset;
             out vec3 v_world_pos;
             out vec3 v_normal;
             out vec4 v_color;
 
+            vec3 rotate_quat(vec4 q, vec3 v) {{
+                vec3 t = 2.0 * cross(q.xyz, v);
+                return v + q.w * t + cross(q.xyz, t);
+            }}
+
             void main() {{
-                vec3 pos = a_pos + u_offset;
+                vec3 pos = rotate_quat(u_quat, a_pos - u_pivot) + u_pivot + u_offset;
                 v_world_pos = pos;
-                v_normal = a_normal;
+                v_normal = rotate_quat(u_quat, a_normal);
                 v_color = a_color;
                 gl_Position = u_mvp * vec4(pos, 1.0);
             }}"
@@ -237,14 +244,22 @@ impl GlViewportRenderer {
             layout(location = 1) in vec3 a_color;
 
             uniform mat4 u_mvp;
+            uniform vec3 u_pivot;
+            uniform vec4 u_quat;
             uniform vec3 u_offset;
             uniform float u_use_override;
             uniform vec3 u_override_color;
             out vec3 v_col;
 
+            vec3 rotate_quat(vec4 q, vec3 v) {{
+                vec3 t = 2.0 * cross(q.xyz, v);
+                return v + q.w * t + cross(q.xyz, t);
+            }}
+
             void main() {{
                 v_col = mix(a_color, u_override_color, u_use_override);
-                gl_Position = u_mvp * vec4(a_pos + u_offset, 1.0);
+                vec3 pos = rotate_quat(u_quat, a_pos - u_pivot) + u_pivot + u_offset;
+                gl_Position = u_mvp * vec4(pos, 1.0);
             }}"
         );
 
@@ -290,7 +305,7 @@ impl GlViewportRenderer {
             grid_vertex_count: (grid_data.len() / 6) as i32,
             debug_vao,
             debug_vbo,
-            debug_vertex_count: 0,
+            debug_ranges: Vec::new(),
             parts: Vec::new(),
             uploaded_generation: 0,
             uploaded_debug_key: 0,
@@ -309,13 +324,14 @@ impl GlViewportRenderer {
             return;
         }
         self.uploaded_debug_key = key;
+        self.debug_ranges.clear();
 
-        let line_data = if show_colliders {
+        let (line_data, ranges) = if show_colliders {
             build_collider_debug_vertices(model)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
-        self.debug_vertex_count = (line_data.len() / 6) as i32;
+        self.debug_ranges = ranges;
         if !line_data.is_empty() {
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.debug_vbo));
             gl.buffer_data_u8_slice(
@@ -403,12 +419,14 @@ impl GlViewportRenderer {
         selected_mask: &[bool],
         show_grid: bool,
         wireframe: bool,
-        model_offset: [f32; 3],
+        part_transforms: &[([f32; 3], [f32; 4], [f32; 3])],
     ) {
         let view = camera.view_matrix();
         let proj = camera.proj_matrix(aspect);
         let mvp = mat4_mul(proj, view);
         let eye = camera.eye();
+        let id_quat = [0.0_f32, 0.0, 0.0, 1.0];
+        let zero_vec = [0.0_f32; 3];
 
         gl.enable(glow::DEPTH_TEST);
         gl.depth_mask(true);
@@ -421,8 +439,14 @@ impl GlViewportRenderer {
             if let Some(loc) = gl.get_uniform_location(self.line_program, "u_mvp") {
                 gl.uniform_matrix_4_f32_slice(Some(&loc), false, &mvp);
             }
+            if let Some(loc) = gl.get_uniform_location(self.line_program, "u_pivot") {
+                gl.uniform_3_f32_slice(Some(&loc), &zero_vec);
+            }
+            if let Some(loc) = gl.get_uniform_location(self.line_program, "u_quat") {
+                gl.uniform_4_f32_slice(Some(&loc), &id_quat);
+            }
             if let Some(loc) = gl.get_uniform_location(self.line_program, "u_offset") {
-                gl.uniform_3_f32_slice(Some(&loc), &[0.0, 0.0, 0.0]);
+                gl.uniform_3_f32_slice(Some(&loc), &zero_vec);
             }
             if let Some(loc) = gl.get_uniform_location(self.line_program, "u_use_override") {
                 gl.uniform_1_f32(Some(&loc), 0.0);
@@ -436,15 +460,26 @@ impl GlViewportRenderer {
         if let Some(loc) = gl.get_uniform_location(self.program, "u_mvp") {
             gl.uniform_matrix_4_f32_slice(Some(&loc), false, &mvp);
         }
-        if let Some(loc) = gl.get_uniform_location(self.program, "u_offset") {
-            gl.uniform_3_f32_slice(Some(&loc), &model_offset);
-        }
         if let Some(loc) = gl.get_uniform_location(self.program, "u_eye") {
             gl.uniform_3_f32_slice(Some(&loc), &eye);
         }
 
         for (idx, part) in self.parts.iter().enumerate() {
             let is_sel = selected_mask.get(idx).copied().unwrap_or(false);
+            let (pivot, quat, offset) = part_transforms
+                .get(idx)
+                .copied()
+                .unwrap_or((zero_vec, id_quat, zero_vec));
+
+            if let Some(loc) = gl.get_uniform_location(self.program, "u_pivot") {
+                gl.uniform_3_f32_slice(Some(&loc), &pivot);
+            }
+            if let Some(loc) = gl.get_uniform_location(self.program, "u_quat") {
+                gl.uniform_4_f32_slice(Some(&loc), &quat);
+            }
+            if let Some(loc) = gl.get_uniform_location(self.program, "u_offset") {
+                gl.uniform_3_f32_slice(Some(&loc), &offset);
+            }
             if let Some(loc) = gl.get_uniform_location(self.program, "u_metallic") {
                 gl.uniform_1_f32(Some(&loc), part.metallic);
             }
@@ -465,8 +500,14 @@ impl GlViewportRenderer {
                 if let Some(loc) = gl.get_uniform_location(self.line_program, "u_mvp") {
                     gl.uniform_matrix_4_f32_slice(Some(&loc), false, &mvp);
                 }
+                if let Some(loc) = gl.get_uniform_location(self.line_program, "u_pivot") {
+                    gl.uniform_3_f32_slice(Some(&loc), &pivot);
+                }
+                if let Some(loc) = gl.get_uniform_location(self.line_program, "u_quat") {
+                    gl.uniform_4_f32_slice(Some(&loc), &quat);
+                }
                 if let Some(loc) = gl.get_uniform_location(self.line_program, "u_offset") {
-                    gl.uniform_3_f32_slice(Some(&loc), &model_offset);
+                    gl.uniform_3_f32_slice(Some(&loc), &offset);
                 }
                 if let Some(loc) = gl.get_uniform_location(self.line_program, "u_use_override") {
                     gl.uniform_1_f32(Some(&loc), 1.0);
@@ -481,19 +522,30 @@ impl GlViewportRenderer {
             }
         }
 
-        if self.debug_vertex_count > 0 {
+        if !self.debug_ranges.is_empty() {
             gl.use_program(Some(self.line_program));
             if let Some(loc) = gl.get_uniform_location(self.line_program, "u_mvp") {
                 gl.uniform_matrix_4_f32_slice(Some(&loc), false, &mvp);
-            }
-            if let Some(loc) = gl.get_uniform_location(self.line_program, "u_offset") {
-                gl.uniform_3_f32_slice(Some(&loc), &model_offset);
             }
             if let Some(loc) = gl.get_uniform_location(self.line_program, "u_use_override") {
                 gl.uniform_1_f32(Some(&loc), 0.0);
             }
             gl.bind_vertex_array(Some(self.debug_vao));
-            gl.draw_arrays(glow::LINES, 0, self.debug_vertex_count);
+            for &(part_idx_opt, start, count) in &self.debug_ranges {
+                let (pivot, quat, offset) = part_idx_opt
+                    .and_then(|idx| part_transforms.get(idx).copied())
+                    .unwrap_or((zero_vec, id_quat, zero_vec));
+                if let Some(loc) = gl.get_uniform_location(self.line_program, "u_pivot") {
+                    gl.uniform_3_f32_slice(Some(&loc), &pivot);
+                }
+                if let Some(loc) = gl.get_uniform_location(self.line_program, "u_quat") {
+                    gl.uniform_4_f32_slice(Some(&loc), &quat);
+                }
+                if let Some(loc) = gl.get_uniform_location(self.line_program, "u_offset") {
+                    gl.uniform_3_f32_slice(Some(&loc), &offset);
+                }
+                gl.draw_arrays(glow::LINES, start, count);
+            }
         }
 
         gl.bind_vertex_array(None);
@@ -671,14 +723,20 @@ fn push_circle_wire(out: &mut Vec<f32>, c: [f32; 3], r: f32, plane: u8, col: [f3
     }
 }
 
-fn build_collider_debug_vertices(model: &Model) -> Vec<f32> {
+fn build_collider_debug_vertices(model: &Model) -> (Vec<f32>, Vec<(Option<usize>, i32, i32)>) {
     let mut out = Vec::new();
+    let mut ranges = Vec::new();
     let active_col = [0.20, 0.90, 0.58];
     let fallback_col = [0.95, 0.72, 0.22];
 
     if let Some(phys) = &model.physics {
         if !phys.colliders.is_empty() {
             for spec in &phys.colliders {
+                let start = (out.len() / 6) as i32;
+                let part_idx = model
+                    .parts
+                    .iter()
+                    .position(|p| forja3d::fnv1a_32(p.name.as_bytes()) == spec.part_hash);
                 match spec.shape {
                     ColliderShape::None => {}
                     ColliderShape::Box { half_extents } => {
@@ -706,18 +764,27 @@ fn build_collider_debug_vertices(model: &Model) -> Vec<f32> {
                         }
                     }
                 }
+                let end = (out.len() / 6) as i32;
+                if end > start {
+                    ranges.push((part_idx, start, end - start));
+                }
             }
-            return out;
+            return (out, ranges);
         }
     }
 
     let bounds = model.bounds();
     if bounds.is_valid() {
+        let start = (out.len() / 6) as i32;
         let (center, shape) = ColliderShape::fit_box(bounds);
         if let ColliderShape::Box { half_extents } = shape {
             push_box_wire(&mut out, center, half_extents, fallback_col);
         }
+        let end = (out.len() / 6) as i32;
+        if end > start {
+            ranges.push((None, start, end - start));
+        }
     }
-    out
+    (out, ranges)
 }
 

@@ -139,3 +139,70 @@ fn spawn_from_f3p_pack_bytes_simulates() {
     assert!(b.position[1] >= 0.45 && b.position[1] < 2.5);
 }
 
+
+#[test]
+fn dynamic_sphere_bounces_and_rolls_down_static_pyramid_slope() {
+    use forja3d_physics::{RigidBody, WorldCollider};
+
+    let mut pyramid = PartSpec::new("piramide", PrimitiveKind::Pyramid);
+    pyramid.position = [0.0, 0.5, 0.0];
+    pyramid.scale = [2.0, 1.4, 2.0];
+    let pyr_baked = pyramid.bake();
+    let mut tris = Vec::new();
+    for tri in pyr_baked.indices.chunks_exact(3) {
+        let a = pyr_baked.vertices[tri[0] as usize].position;
+        let b = pyr_baked.vertices[tri[1] as usize].position;
+        let c = pyr_baked.vertices[tri[2] as usize].position;
+        tris.push([a, b, c]);
+    }
+
+    let mut sphere = PartSpec::new("esfera", PrimitiveKind::Sphere);
+    sphere.position = [0.12, 2.1, 0.0];
+    sphere.scale = [0.5, 0.5, 0.5];
+
+    let mut world = PhysicsWorld::new();
+    let mut pyr_body = RigidBody::from_model(&Model::new("Piramide"), [0.0, 0.0, 0.0]).with_mesh_triangles(tris);
+    pyr_body.body_kind = RigidBodyKind::Static;
+    pyr_body.inv_mass = 0.0;
+    world.add_body(pyr_body);
+
+    let sph_body = RigidBody {
+        name: String::from("Esfera"),
+        body_kind: RigidBodyKind::Dynamic,
+        position: [0.12, 2.1, 0.0],
+        orientation: [0.0, 0.0, 0.0, 1.0],
+        velocity: [0.0; 3],
+        angular_velocity: [0.0; 3],
+        force_accum: [0.0; 3],
+        mass: 1.0,
+        inv_mass: 1.0,
+        friction: 0.35,
+        restitution: 0.45,
+        linear_damping: 0.02,
+        gravity_scale: 1.0,
+        colliders: vec![WorldCollider {
+            offset: [0.0; 3],
+            shape: ColliderShape::Sphere { radius: 0.25 },
+        }],
+        mesh_triangles: Vec::new(),
+        mesh_local_aabb: forja3d::Aabb::EMPTY,
+        on_ground: false,
+        sleeping: false,
+    };
+    let sph_handle = world.add_body(sph_body);
+
+    for _ in 0..180 {
+        world.step(1.0 / 60.0);
+    }
+    let final_sph = world.body(sph_handle).unwrap();
+    assert!(
+        final_sph.position[0] > 0.6,
+        "sphere should bounce/roll laterally down the pyramid slope, got x={}",
+        final_sph.position[0]
+    );
+    assert!(
+        final_sph.position[1] < 0.8,
+        "sphere should descend onto ground/lower slope, got y={}",
+        final_sph.position[1]
+    );
+}
