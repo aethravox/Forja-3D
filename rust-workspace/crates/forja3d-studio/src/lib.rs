@@ -166,6 +166,7 @@ pub struct StudioApp {
     textures_shared: Arc<Vec<Texture>>,
     texture_generation: u64,
     textures_enabled: bool,
+    import_tex_for_selection_only: bool,
     new_group_draft: String,
     export_tab: ExportTab,
     mobile_tab: MobileTab,
@@ -251,6 +252,7 @@ impl StudioApp {
             textures_shared: Arc::new(Vec::new()),
             texture_generation: 1,
             textures_enabled: false,
+            import_tex_for_selection_only: false,
             new_group_draft: String::from("Grupo"),
             export_tab: ExportTab::F3dBinary,
             mobile_tab: MobileTab::Viewport,
@@ -384,13 +386,17 @@ impl StudioApp {
                     mesh_part.bounds.max[2] - pivot[2],
                 ],
             };
-            let ext_x = (local_bounds.max[0] - local_bounds.min[0]).max(0.05);
-            let ext_y = (local_bounds.max[1] - local_bounds.min[1]).max(0.05);
-            let ext_z = (local_bounds.max[2] - local_bounds.min[2]).max(0.05);
             let is_rotated = part_spec.rotation_deg.iter().any(|r| r.abs() > 0.01);
             let is_mirrored = part_spec.mirror.iter().any(|&m| m);
+            let sx = part_spec.scale[0].abs().max(0.05);
+            let sy = part_spec.scale[1].abs().max(0.05);
+            let sz = part_spec.scale[2].abs().max(0.05);
+            let s_max = sx.max(sy).max(sz);
             let is_nonuniform_sphere = part_spec.kind == PrimitiveKind::Sphere
-                && ((ext_x - ext_y).abs() > 0.04 || (ext_y - ext_z).abs() > 0.04 || is_mirrored);
+                && ((sx - sy).abs() > s_max * 0.03
+                    || (sy - sz).abs() > s_max * 0.03
+                    || (sx - sz).abs() > s_max * 0.03
+                    || is_mirrored);
 
             let use_exact_mesh = (matches!(
                 part_spec.kind,
@@ -405,7 +411,7 @@ impl StudioApp {
                     | PrimitiveKind::CustomMesh
             ) || (part_spec.kind == PrimitiveKind::Cube && (is_rotated || is_mirrored))
                 || is_nonuniform_sphere)
-                && (mesh_part.indices.len() / 3) <= 4096;
+                && (mesh_part.indices.len() / 3) <= 12288;
 
             let mut body = if use_exact_mesh {
                 let mut tris = Vec::with_capacity(mesh_part.indices.len() / 3);
@@ -443,7 +449,7 @@ impl StudioApp {
                     let dz = (local_bounds.max[2] - local_bounds.min[2]).max(0.05);
                     let shape = match part_spec.kind {
                         PrimitiveKind::Sphere => ColliderShape::Sphere {
-                            radius: (dx.max(dy).max(dz) * 0.5).max(0.04),
+                            radius: (dx.max(dy).max(dz).max(s_max) * 0.5).max(0.04),
                         },
                         _ => ColliderShape::Box {
                             half_extents: [dx * 0.5, dy * 0.5, dz * 0.5],
@@ -535,13 +541,17 @@ impl StudioApp {
         self.textures_shared = Arc::new(self.imported_textures.clone());
     }
 
+    fn assign_texture_index_to_all(&mut self, tex_idx: usize) {
+        for p in &mut self.scene.parts {
+            p.texture_index = Some(tex_idx);
+            p.texture_enabled = true;
+        }
+    }
+
     fn assign_texture_index_to_selection_or_all(&mut self, tex_idx: usize) {
         let selected_indices = self.selected_part_indices();
         if selected_indices.is_empty() {
-            for p in &mut self.scene.parts {
-                p.texture_index = Some(tex_idx);
-                p.texture_enabled = true;
-            }
+            self.assign_texture_index_to_all(tex_idx);
         } else {
             for idx in selected_indices {
                 if let Some(p) = self.scene.parts.get_mut(idx) {
@@ -552,12 +562,31 @@ impl StudioApp {
         }
     }
 
+    fn export_texture_asset(&self) -> Texture {
+        if let Some(Selection::Part(idx)) = self.selection {
+            if let Some(tex) = self
+                .scene
+                .parts
+                .get(idx)
+                .and_then(|p| p.texture_index)
+                .and_then(|ti| self.imported_textures.get(ti))
+            {
+                return tex.clone();
+            }
+        }
+        if let Some(tex) = self.imported_textures.first() {
+            return tex.clone();
+        }
+        self.build_texture_asset()
+    }
+
     fn import_model_bytes(
         &mut self,
         filename: Option<&str>,
         bytes: &[u8],
         base_dir: Option<&std::path::Path>,
     ) {
+        let selection_only = std::mem::take(&mut self.import_tex_for_selection_only);
         let lower = filename.unwrap_or("").to_ascii_lowercase();
         let is_f3d_magic = bytes.len() >= 4 && bytes[0..4] == forja3d::MAGIC;
         let is_f3p_magic = bytes.len() >= 4 && bytes[0..4] == F3P_MAGIC;
@@ -619,6 +648,9 @@ impl StudioApp {
                     if let Some(model) = pack.model {
                         let tri = model.triangle_count();
                         self.scene = SceneDocument::from_model(model);
+                        if !self.imported_textures.is_empty() {
+                            self.assign_texture_index_to_all(0);
+                        }
                         self.selection = if self.scene.parts.is_empty() {
                             None
                         } else {
@@ -628,6 +660,9 @@ impl StudioApp {
                         self.rebuild_outputs();
                         self.camera.frame_bounds(self.baked_model.bounds());
                         summary.push(format!("malla {} tri", tri));
+                    } else if !self.imported_textures.is_empty() {
+                        self.assign_texture_index_to_all(0);
+                        self.view_mode = ViewMode::Mode3D;
                     }
                     if !pack.textures.is_empty() {
                         summary.push(format!("{} texturas", pack.textures.len()));
@@ -681,8 +716,13 @@ impl StudioApp {
             }
         } else if is_f3t_magic || lower.ends_with(".f3t") {
             match Texture::from_bytes(bytes) {
-                Ok(tex) => {
+                Ok(mut tex) => {
                     self.push_undo();
+                    if tex.name.trim().is_empty() {
+                        if let Some(fname) = filename {
+                            tex.name = fname.to_string();
+                        }
+                    }
                     let src = filename.unwrap_or(&tex.name).to_string();
                     let w = tex.width;
                     let h = tex.height;
@@ -690,7 +730,12 @@ impl StudioApp {
                     self.imported_textures.push(tex);
                     self.sync_textures_cache();
                     self.textures_enabled = true;
-                    self.assign_texture_index_to_selection_or_all(tex_idx);
+                    if selection_only {
+                        self.assign_texture_index_to_selection_or_all(tex_idx);
+                    } else {
+                        self.assign_texture_index_to_all(tex_idx);
+                    }
+                    self.view_mode = ViewMode::Mode3D;
                     self.status_note = format!("Textura .f3t '{src}' aplicada ({w}x{h} px)");
                 }
                 Err(err) => {
@@ -717,7 +762,12 @@ impl StudioApp {
                     self.imported_textures.push(tex);
                     self.sync_textures_cache();
                     self.textures_enabled = true;
-                    self.assign_texture_index_to_selection_or_all(tex_idx);
+                    if selection_only {
+                        self.assign_texture_index_to_selection_or_all(tex_idx);
+                    } else {
+                        self.assign_texture_index_to_all(tex_idx);
+                    }
+                    self.view_mode = ViewMode::Mode3D;
                     self.status_note = format!("Imagen '{tex_name}' cargada ({w}x{h} px)");
                 }
                 Err(err) => {
@@ -851,9 +901,13 @@ impl StudioApp {
                 let idx = ((x / 4) + (y / 4) * 4) % palette.len();
                 let mut c = palette[idx];
                 if (x + y) % 2 == 0 {
-                    c[0] = c[0].saturating_add(10);
-                    c[1] = c[1].saturating_add(10);
-                    c[2] = c[2].saturating_add(10);
+                    c[0] = c[0].saturating_add(28);
+                    c[1] = c[1].saturating_add(28);
+                    c[2] = c[2].saturating_add(28);
+                } else {
+                    c[0] = c[0].saturating_sub(24);
+                    c[1] = c[1].saturating_sub(24);
+                    c[2] = c[2].saturating_sub(24);
                 }
                 rgba.extend_from_slice(&c);
             }
@@ -2828,6 +2882,7 @@ impl StudioApp {
                             self.status_note = String::from("Textura de paleta generada y aplicada");
                         }
                         "load_tex" => {
+                            self.import_tex_for_selection_only = true;
                             self.request_import(ui.ctx(), ".png,.jpg,.jpeg,.webp,.f3t");
                         }
                         "apply_tex_all" => {
@@ -2954,6 +3009,7 @@ impl StudioApp {
                         if icon_text_btn(ui, SvgIcon::Upload, 15.0, "Importar GLB / GLTF", [164.0, btn_h], false)
                             .clicked()
                         {
+                            self.import_tex_for_selection_only = false;
                             self.request_import(ui.ctx(), ".glb,.gltf");
                         }
                         if icon_text_btn(
@@ -2966,6 +3022,7 @@ impl StudioApp {
                         )
                         .clicked()
                         {
+                            self.import_tex_for_selection_only = false;
                             self.request_import(ui.ctx(), ".f3d,.f3a,.f3p,.f2d,.f3t,.png,.jpg,.jpeg,.webp,.glb,.gltf");
                         }
                     });
@@ -3055,14 +3112,19 @@ impl StudioApp {
                             let anim_bytes = self.build_animation_asset().to_bytes();
                             let f2d_bytes = self.doc2d.to_bytes();
                             let f2d_rs = self.doc2d.to_rust_code();
-                            let f3t_bytes = self.build_texture_asset().to_bytes();
+                            let export_tex = self.export_texture_asset();
+                            let f3t_desc = format!(
+                                "Textura '{}' ({}x{} px)",
+                                export_tex.name, export_tex.width, export_tex.height
+                            );
+                            let f3t_bytes = export_tex.to_bytes();
                             let card_fill = egui::Color32::from_rgb(22, 26, 35);
 
                             for (title, desc, ext, bytes) in [
-                                (".f3p · Paquete Todo-en-Uno (F3P1)", "Malla + texturas + animaciones", "f3p", pack_bytes),
-                                (".f3a · Animación (F3A1)", "Clips y keyframes de escena", "f3a", anim_bytes),
-                                (".f2d · Pantalla 2D / UI (F2D1)", "Controles del Visor 2D + acciones .rs", "f2d", f2d_bytes),
-                                (".f3t · Textura Propia (F3T1)", "Paleta RGBA sin dependencias", "f3t", f3t_bytes),
+                                (".f3p · Paquete Todo-en-Uno (F3P1)", String::from("Malla + texturas + animaciones"), "f3p", pack_bytes),
+                                (".f3a · Animación (F3A1)", String::from("Clips y keyframes de escena"), "f3a", anim_bytes),
+                                (".f2d · Pantalla 2D / UI (F2D1)", String::from("Controles del Visor 2D + acciones .rs"), "f2d", f2d_bytes),
+                                (".f3t · Textura Propia (F3T1)", f3t_desc, "f3t", f3t_bytes),
                             ] {
                                 egui::Frame::new()
                                     .fill(card_fill)
@@ -4005,6 +4067,7 @@ impl eframe::App for StudioApp {
 
         let dropped = ui.ctx().input(|i| i.raw.dropped_files.clone());
         if let Some(file) = dropped.into_iter().next() {
+            self.import_tex_for_selection_only = false;
             let name = file
                 .path()
                 .file_name()
@@ -4766,6 +4829,7 @@ impl StudioApp {
             let picked = rfd::FileDialog::new()
                 .set_title("Importar Forja3D (.f3d / .f3a / .f3p / .f2d / .f3t / .glb)")
                 .add_filter("Assets Forja3D & 3D", &ext_refs)
+                .add_filter("Todos los archivos", &["*"])
                 .pick_file();
             if let Some(path) = picked {
                 match std::fs::read(&path) {
@@ -4883,7 +4947,12 @@ fn trigger_import_model(
     let Ok(el) = document.create_element("input") else { return };
     let Ok(input) = el.dyn_into::<eframe::web_sys::HtmlInputElement>() else { return };
     input.set_type("file");
-    input.set_accept(accept);
+    if accept.contains(".f3") || accept.contains(".f2") || accept.contains(".glb") || accept.contains(".gltf") {
+        // Keep picker open to all files so mobile/case-sensitive browsers never hide .F3T/.F3D/.GLB.
+        input.set_accept("*/*");
+    } else {
+        input.set_accept(accept);
+    }
     let _ = input.set_attribute("style", "display:none");
     if let Some(body) = document.body() {
         let _ = body.append_child(&input);

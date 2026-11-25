@@ -660,3 +660,324 @@ fn heavy_sphere_8kg_pushes_light_cube_4kg_much_farther_than_reverse() {
         sph_4_end
     );
 }
+
+fn bake_centered_tris(part: &PartSpec) -> ([f32; 3], Vec<[[f32; 3]; 3]>) {
+    let baked = part.bake();
+    let pivot = if baked.bounds.is_valid() {
+        [
+            (baked.bounds.min[0] + baked.bounds.max[0]) * 0.5,
+            (baked.bounds.min[1] + baked.bounds.max[1]) * 0.5,
+            (baked.bounds.min[2] + baked.bounds.max[2]) * 0.5,
+        ]
+    } else {
+        part.position
+    };
+    let mut tris = Vec::with_capacity(baked.indices.len() / 3);
+    for tri in baked.indices.chunks_exact(3) {
+        let a = baked.vertices[tri[0] as usize].position;
+        let b = baked.vertices[tri[1] as usize].position;
+        let c = baked.vertices[tri[2] as usize].position;
+        tris.push([
+            [a[0] - pivot[0], a[1] - pivot[1], a[2] - pivot[2]],
+            [b[0] - pivot[0], b[1] - pivot[1], b[2] - pivot[2]],
+            [c[0] - pivot[0], c[1] - pivot[1], c[2] - pivot[2]],
+        ]);
+    }
+    (pivot, tris)
+}
+
+#[test]
+fn large_analytical_sphere_and_three_small_spheres_never_penetrate_or_teleport() {
+    use forja3d_physics::{RigidBody, WorldCollider};
+
+    let mut world = PhysicsWorld::new();
+    let big_r = 5.0_f32;
+    let small_r = 0.25_f32;
+
+    let big = world.add_body(RigidBody {
+        name: String::from("EsferaGrande"),
+        body_kind: RigidBodyKind::Dynamic,
+        position: [0.0, big_r, 0.0],
+        orientation: [0.0, 0.0, 0.0, 1.0],
+        velocity: [0.0; 3],
+        angular_velocity: [0.0; 3],
+        force_accum: [0.0; 3],
+        mass: 1.0,
+        inv_mass: 1.0,
+        friction: 0.45,
+        restitution: 0.35,
+        linear_damping: 0.04,
+        gravity_scale: 1.0,
+        colliders: vec![WorldCollider {
+            offset: [0.0; 3],
+            shape: ColliderShape::Sphere { radius: big_r },
+        }],
+        mesh_triangles: Vec::new(),
+        mesh_local_aabb: forja3d::Aabb::EMPTY,
+        on_ground: false,
+        sleeping: false,
+    });
+
+    let small_starts = [
+        [0.4, big_r * 2.0 + 0.6, 0.0],
+        [-0.35, big_r * 2.0 + 1.2, 0.3],
+        [0.15, big_r * 2.0 + 1.8, -0.35],
+    ];
+    let mut smalls = Vec::new();
+    for (idx, &pos) in small_starts.iter().enumerate() {
+        let h = world.add_body(RigidBody {
+            name: format!("EsferaPequena_{idx}"),
+            body_kind: RigidBodyKind::Dynamic,
+            position: pos,
+            orientation: [0.0, 0.0, 0.0, 1.0],
+            velocity: [0.0; 3],
+            angular_velocity: [0.0; 3],
+            force_accum: [0.0; 3],
+            mass: 1.0,
+            inv_mass: 1.0,
+            friction: 0.45,
+            restitution: 0.35,
+            linear_damping: 0.04,
+            gravity_scale: 1.0,
+            colliders: vec![WorldCollider {
+                offset: [0.0; 3],
+                shape: ColliderShape::Sphere { radius: small_r },
+            }],
+            mesh_triangles: Vec::new(),
+            mesh_local_aabb: forja3d::Aabb::EMPTY,
+            on_ground: false,
+            sleeping: false,
+        });
+        smalls.push((h, pos));
+    }
+
+    for step in 0..240 {
+        world.step(1.0 / 60.0);
+        let bp = world.body(big).unwrap().position;
+        for (h, prev_pos) in &mut smalls {
+            let sp = world.body(*h).unwrap().position;
+            let dx = sp[0] - bp[0];
+            let dy = sp[1] - bp[1];
+            let dz = sp[2] - bp[2];
+            let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+            assert!(
+                dist >= big_r + small_r - 0.15,
+                "step {step}: small sphere entered large sphere (dist={dist}, pos={sp:?}, big={bp:?})"
+            );
+            let step_jump = ((sp[0] - prev_pos[0]).powi(2)
+                + (sp[1] - prev_pos[1]).powi(2)
+                + (sp[2] - prev_pos[2]).powi(2))
+            .sqrt();
+            assert!(
+                step_jump < 1.0,
+                "step {step}: small sphere teleported (jump={step_jump}, from={prev_pos:?}, to={sp:?})"
+            );
+            assert!(sp[1] >= 0.12, "step {step}: fell below ground y={}", sp[1]);
+            *prev_pos = sp;
+        }
+    }
+}
+
+#[test]
+fn large_mesh_sphere_and_three_small_spheres_never_sink_inside_or_teleport() {
+    use forja3d_physics::{RigidBody, WorldCollider};
+
+    let mut big_part = PartSpec::new("esfera_grande_malla", PrimitiveKind::Sphere);
+    big_part.position = [0.0, 5.0, 0.0];
+    big_part.scale = [10.0, 10.0, 10.0];
+    let (pivot, tris) = bake_centered_tris(&big_part);
+
+    let mut world = PhysicsWorld::new();
+    let mut big_body = RigidBody::from_model(&Model::new("EsferaGrandeMalla"), pivot);
+    big_body.colliders.clear();
+    big_body = big_body.with_mesh_triangles(tris);
+    big_body.body_kind = RigidBodyKind::Static;
+    big_body.inv_mass = 0.0;
+    let big = world.add_body(big_body);
+
+    // 2 small spheres drop on top of the large mesh, 1 sits in the outer AABB corner (must NOT hit phantom box!)
+    let small_r = 0.25_f32;
+    let small_starts = [
+        [0.45, 10.7, 0.0],
+        [-0.4, 11.4, 0.25],
+        [4.2, 8.8, 0.0],
+    ];
+    let mut smalls = Vec::new();
+    for (idx, &pos) in small_starts.iter().enumerate() {
+        let h = world.add_body(RigidBody {
+            name: format!("Pequena_{idx}"),
+            body_kind: RigidBodyKind::Dynamic,
+            position: pos,
+            orientation: [0.0, 0.0, 0.0, 1.0],
+            velocity: [0.0; 3],
+            angular_velocity: [0.0; 3],
+            force_accum: [0.0; 3],
+            mass: 1.0,
+            inv_mass: 1.0,
+            friction: 0.4,
+            restitution: 0.3,
+            linear_damping: 0.03,
+            gravity_scale: 1.0,
+            colliders: vec![WorldCollider {
+                offset: [0.0; 3],
+                shape: ColliderShape::Sphere { radius: small_r },
+            }],
+            mesh_triangles: Vec::new(),
+            mesh_local_aabb: forja3d::Aabb::EMPTY,
+            on_ground: false,
+            sleeping: false,
+        });
+        smalls.push((h, pos));
+    }
+
+    for step in 0..240 {
+        world.step(1.0 / 60.0);
+        let bp = world.body(big).unwrap().position;
+        for (idx, (h, prev_pos)) in smalls.iter_mut().enumerate() {
+            let sp = world.body(*h).unwrap().position;
+            let dx = sp[0] - bp[0];
+            let dy = sp[1] - bp[1];
+            let dz = sp[2] - bp[2];
+            let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+            assert!(
+                dist >= 4.75,
+                "step {step}: small sphere {idx} went inside large mesh sphere (dist={dist}, pos={sp:?})"
+            );
+            let jump = ((sp[0] - prev_pos[0]).powi(2)
+                + (sp[1] - prev_pos[1]).powi(2)
+                + (sp[2] - prev_pos[2]).powi(2))
+            .sqrt();
+            assert!(
+                jump < 1.0,
+                "step {step}: small sphere {idx} teleported (jump={jump}, pos={sp:?})"
+            );
+            *prev_pos = sp;
+        }
+    }
+}
+
+#[test]
+fn large_mesh_vs_small_mesh_spheres_no_obb_teleport_and_no_tunneling() {
+    use forja3d_physics::RigidBody;
+
+    let mut big_part = PartSpec::new("elipsoide_grande", PrimitiveKind::Sphere);
+    big_part.position = [0.0, 4.5, 0.0];
+    big_part.scale = [10.0, 9.0, 10.0];
+    let (big_pivot, big_tris) = bake_centered_tris(&big_part);
+
+    let mut world = PhysicsWorld::new();
+    let mut big_body = RigidBody::from_model(&Model::new("ElipsoideGrande"), big_pivot);
+    big_body.colliders.clear();
+    big_body = big_body.with_mesh_triangles(big_tris);
+    big_body.body_kind = RigidBodyKind::Static;
+    big_body.inv_mass = 0.0;
+    let big = world.add_body(big_body);
+
+    // Corner body sits inside big_body's AABB (5x4.5x5) at [4.2, 8.2, 0.0], yet outside ellipsoid surface!
+    let starts = [
+        [0.5, 9.6, 0.0],
+        [-0.4, 10.2, 0.3],
+        [4.2, 8.2, 0.0],
+    ];
+    let mut smalls = Vec::new();
+    for (idx, &pos) in starts.iter().enumerate() {
+        let mut p = PartSpec::new(format!("malla_peq_{idx}"), PrimitiveKind::Sphere);
+        p.position = pos;
+        p.scale = [0.5, 0.5, 0.5];
+        let (piv, tris) = bake_centered_tris(&p);
+        let mut rb = RigidBody::from_model(&Model::new(format!("MallaPeq_{idx}")), piv);
+        rb.colliders.clear();
+        rb = rb.with_mesh_triangles(tris);
+        rb.body_kind = RigidBodyKind::Dynamic;
+        rb.mass = 1.0;
+        rb.inv_mass = 1.0;
+        let h = world.add_body(rb);
+        smalls.push((h, piv));
+    }
+
+    for step in 0..180 {
+        world.step(1.0 / 60.0);
+        let bp = world.body(big).unwrap().position;
+        for (idx, (h, prev_pos)) in smalls.iter_mut().enumerate() {
+            let sp = world.body(*h).unwrap().position;
+            let nx = (sp[0] - bp[0]) / 5.0;
+            let ny = (sp[1] - bp[1]) / 4.5;
+            let nz = (sp[2] - bp[2]) / 5.0;
+            let ellip_norm = (nx * nx + ny * ny + nz * nz).sqrt();
+            assert!(
+                ellip_norm >= 0.92,
+                "step {step}: small mesh {idx} entered inside large ellipsoid (ellip_norm={ellip_norm}, pos={sp:?})"
+            );
+            let jump = ((sp[0] - prev_pos[0]).powi(2)
+                + (sp[1] - prev_pos[1]).powi(2)
+                + (sp[2] - prev_pos[2]).powi(2))
+            .sqrt();
+            assert!(
+                jump < 1.0,
+                "step {step}: small mesh {idx} teleported (jump={jump}, from={prev_pos:?}, to={sp:?})"
+            );
+            *prev_pos = sp;
+        }
+    }
+    // Verify the corner mesh fell downward with gravity instead of getting OBB-teleported horizontally away
+    let corner_pos = world.body(smalls[2].0).unwrap().position;
+    assert!(
+        corner_pos[1] < 8.0,
+        "corner small mesh outside ellipsoid should fall under gravity, got {:?}",
+        corner_pos
+    );
+}
+
+#[test]
+fn small_sphere_deep_inside_large_mesh_sphere_escapes_outward() {
+    use forja3d_physics::{RigidBody, WorldCollider};
+
+    let mut big_part = PartSpec::new("esfera_grande", PrimitiveKind::Sphere);
+    big_part.position = [0.0, 5.0, 0.0];
+    big_part.scale = [10.0, 10.0, 10.0];
+    let (pivot, tris) = bake_centered_tris(&big_part);
+
+    let mut world = PhysicsWorld::new();
+    let mut big_body = RigidBody::from_model(&Model::new("EsferaGrande"), pivot);
+    big_body.colliders.clear();
+    big_body = big_body.with_mesh_triangles(tris);
+    big_body.body_kind = RigidBodyKind::Static;
+    big_body.inv_mass = 0.0;
+    world.add_body(big_body);
+
+    // Start 0.6m inside top surface (well beyond the old 0.55*radius backface cutoff)
+    let small = world.add_body(RigidBody {
+        name: String::from("EsferaAtrapada"),
+        body_kind: RigidBodyKind::Dynamic,
+        position: [0.1, 9.4, 0.0],
+        orientation: [0.0, 0.0, 0.0, 1.0],
+        velocity: [0.0; 3],
+        angular_velocity: [0.0; 3],
+        force_accum: [0.0; 3],
+        mass: 1.0,
+        inv_mass: 1.0,
+        friction: 0.3,
+        restitution: 0.2,
+        linear_damping: 0.04,
+        gravity_scale: 1.0,
+        colliders: vec![WorldCollider {
+            offset: [0.0; 3],
+            shape: ColliderShape::Sphere { radius: 0.25 },
+        }],
+        mesh_triangles: Vec::new(),
+        mesh_local_aabb: forja3d::Aabb::EMPTY,
+        on_ground: false,
+        sleeping: false,
+    });
+
+    for _ in 0..60 {
+        world.step(1.0 / 60.0);
+    }
+    let sp = world.body(small).unwrap().position;
+    let dist = (sp[0] * sp[0] + (sp[1] - 5.0).powi(2) + sp[2] * sp[2]).sqrt();
+    assert!(
+        dist >= 5.1,
+        "sphere trapped inside large mesh should be pushed outside cleanly, got dist={dist}, pos={sp:?}"
+    );
+}
+

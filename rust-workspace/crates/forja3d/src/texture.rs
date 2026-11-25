@@ -83,8 +83,9 @@ impl Texture {
     /// Encode texture into binary .f3t format.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut payload = Vec::new();
-        let name_bytes = self.name.as_bytes();
-        payload.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        let name_len = self.name.len().min(u16::MAX as usize);
+        let name_bytes = &self.name.as_bytes()[..name_len];
+        payload.extend_from_slice(&(name_len as u16).to_le_bytes());
         payload.extend_from_slice(name_bytes);
         payload.extend_from_slice(&self.width.to_le_bytes());
         payload.extend_from_slice(&self.height.to_le_bytes());
@@ -183,5 +184,24 @@ mod tests {
         assert_eq!(decoded.width, 2);
         assert_eq!(decoded.height, 2);
         assert_eq!(decoded.data.len(), 16);
+    }
+
+    #[test]
+    fn roundtrip_other_pixel_formats() {
+        for (format, data) in [
+            (TexturePixelFormat::Rgb8, alloc::vec![255, 128, 64, 10, 20, 30]),
+            (TexturePixelFormat::R8, alloc::vec![0, 255]),
+            (TexturePixelFormat::RleRgba8, alloc::vec![2, 200, 100, 50, 255]),
+        ] {
+            let tex = Texture {
+                name: String::from("fmt_test"),
+                width: 2,
+                height: 1,
+                format,
+                data,
+            };
+            let decoded = Texture::from_bytes(&tex.to_bytes()).expect("decodifica formato f3t");
+            assert_eq!(decoded, tex);
+        }
     }
 }

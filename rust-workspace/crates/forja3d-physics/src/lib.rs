@@ -418,8 +418,61 @@ impl PhysicsWorld {
             return Vec::new();
         }
         let max_substep = 1.0 / 90.0;
-        let substeps = ((dt / max_substep) + 0.9999) as usize;
-        let substeps = substeps.clamp(1, 8);
+        let mut substeps = ((dt / max_substep) + 0.9999) as usize;
+
+        // Adapt substep count so fast small dynamic bodies cannot tunnel past thin walls or curved meshes
+        let mut min_feature = 0.25_f32;
+        let mut max_speed = 0.0_f32;
+        let grav_mag = sqrtf(
+            self.gravity[0] * self.gravity[0]
+                + self.gravity[1] * self.gravity[1]
+                + self.gravity[2] * self.gravity[2],
+        );
+        for body in &self.bodies {
+            if body.body_kind != RigidBodyKind::Dynamic {
+                continue;
+            }
+            for c in &body.colliders {
+                match c.shape {
+                    ColliderShape::Sphere { radius } => {
+                        min_feature = min_feature.min(radius.max(0.04));
+                    }
+                    ColliderShape::Box { half_extents } => {
+                        let m = half_extents[0]
+                            .min(half_extents[1])
+                            .min(half_extents[2])
+                            .max(0.04);
+                        min_feature = min_feature.min(m);
+                    }
+                    ColliderShape::Capsule { radius, .. } => {
+                        min_feature = min_feature.min(radius.max(0.04));
+                    }
+                    ColliderShape::None => {}
+                }
+            }
+            if body.colliders.is_empty() && body.mesh_local_aabb.is_valid() {
+                let hx = (body.mesh_local_aabb.max[0] - body.mesh_local_aabb.min[0]) * 0.5;
+                let hy = (body.mesh_local_aabb.max[1] - body.mesh_local_aabb.min[1]) * 0.5;
+                let hz = (body.mesh_local_aabb.max[2] - body.mesh_local_aabb.min[2]) * 0.5;
+                min_feature = min_feature.min(hx.min(hy).min(hz).max(0.04));
+            }
+            let v_sq = body.velocity[0] * body.velocity[0]
+                + body.velocity[1] * body.velocity[1]
+                + body.velocity[2] * body.velocity[2];
+            let spd = sqrtf(v_sq) + grav_mag * body.gravity_scale.abs() * dt;
+            if spd > max_speed {
+                max_speed = spd;
+            }
+        }
+        let max_disp = (min_feature * 0.45).max(0.02);
+        if max_speed * dt > max_disp {
+            let needed = ((max_speed * dt / max_disp) + 0.9999) as usize;
+            if needed > substeps {
+                substeps = needed;
+            }
+        }
+
+        let substeps = substeps.clamp(1, 24);
         let sub_dt = dt / substeps as f32;
         let mut events = Vec::new();
         for s in 0..substeps {
@@ -547,7 +600,7 @@ impl PhysicsWorld {
             init_vn[ci] = (vb - va).dot(c.normal);
         }
 
-        const VEL_ITERS: usize = 6;
+        const VEL_ITERS: usize = 10;
         for _iter in 0..VEL_ITERS {
             for (ci, c) in contacts.iter().enumerate() {
                 let b_idx = c.body_b;
@@ -683,10 +736,11 @@ impl PhysicsWorld {
             }
         }
 
-        // 4. Positional penetration projection
-        const POS_ITERS: usize = 2;
+        // 4. Tracked sequential positional penetration projection (prevents multi-contact stacking & teleports)
+        const POS_ITERS: usize = 4;
         let slop = 0.0015_f32;
-        let percent = 0.55_f32;
+        let percent = 0.45_f32;
+        let mut pos_delta = vec![Vec3::ZERO; n];
         for _ in 0..POS_ITERS {
             for c in &contacts {
                 let inv_mb = self.bodies[c.body_b].inv_mass;
@@ -695,15 +749,29 @@ impl PhysicsWorld {
                 if total_inv <= 1e-8 {
                     continue;
                 }
-                let corr = ((c.penetration - slop).max(0.0) / total_inv) * percent / (POS_ITERS as f32);
+                let delta_b = pos_delta[c.body_b];
+                let delta_a = c.body_a.map_or(Vec3::ZERO, |ai| pos_delta[ai]);
+                let resolved = (delta_b - delta_a).dot(c.normal);
+                let remaining_pen = c.penetration - resolved;
+                if remaining_pen <= slop {
+                    continue;
+                }
+                let step_dist = ((remaining_pen - slop) * percent).min(0.25);
+                let corr = step_dist / total_inv;
                 let move_vec = c.normal * corr;
                 if let Some(ai) = c.body_a {
+                    let da = move_vec * inv_ma;
+                    pos_delta[ai] = pos_delta[ai] - da;
+                    let arr = da.to_array();
                     for axis in 0..3 {
-                        self.bodies[ai].position[axis] -= move_vec.to_array()[axis] * inv_ma;
+                        self.bodies[ai].position[axis] -= arr[axis];
                     }
                 }
+                let db = move_vec * inv_mb;
+                pos_delta[c.body_b] = pos_delta[c.body_b] + db;
+                let arr = db.to_array();
                 for axis in 0..3 {
-                    self.bodies[c.body_b].position[axis] += move_vec.to_array()[axis] * inv_mb;
+                    self.bodies[c.body_b].position[axis] += arr[axis];
                 }
             }
         }
@@ -956,9 +1024,12 @@ fn collect_ground_contacts(body_idx: usize, body: &RigidBody, gy: f32, out: &mut
     let up_n = Vec3::new(0.0, 1.0, 0.0);
 
     if !body.mesh_triangles.is_empty() && body.colliders.is_empty() {
+        let waabb = body.world_aabb();
+        if !waabb.is_valid() || waabb.min[1] > gy {
+            return;
+        }
         let mut pts: Vec<(Vec3, f32)> = Vec::new();
-        let stride = (body.mesh_triangles.len() / 256).max(1);
-        for tri in body.mesh_triangles.iter().step_by(stride) {
+        for tri in &body.mesh_triangles {
             for v in tri {
                 let w = pos + quat_rotate(body.orientation, Vec3::new(v[0], v[1], v[2]));
                 let pen = gy - w.y;
@@ -1067,56 +1138,369 @@ fn collect_body_pair_contacts(a: &RigidBody, b: &RigidBody, out: &mut Vec<Contac
     }
 }
 
-fn collect_mesh_vs_mesh_contacts(a: &RigidBody, b: &RigidBody, out: &mut Vec<Contact>) {
-    let pa = Vec3::new(a.position[0], a.position[1], a.position[2]);
-    let pb = Vec3::new(b.position[0], b.position[1], b.position[2]);
-    let mut tmp: Vec<Contact> = Vec::new();
-    let catch_r = 0.075_f32;
+fn world_aabb_to_local(world_aabb: Aabb, body_pos: Vec3, body_q: [f32; 4], margin: f32) -> Aabb {
+    if !world_aabb.is_valid() {
+        return Aabb::EMPTY;
+    }
+    let wc = Vec3::new(
+        (world_aabb.min[0] + world_aabb.max[0]) * 0.5,
+        (world_aabb.min[1] + world_aabb.max[1]) * 0.5,
+        (world_aabb.min[2] + world_aabb.max[2]) * 0.5,
+    );
+    let h = [
+        (world_aabb.max[0] - world_aabb.min[0]) * 0.5 + margin,
+        (world_aabb.max[1] - world_aabb.min[1]) * 0.5 + margin,
+        (world_aabb.max[2] - world_aabb.min[2]) * 0.5 + margin,
+    ];
+    let inv_q = [-body_q[0], -body_q[1], -body_q[2], body_q[3]];
+    let axes = quat_axes(inv_q);
+    let lc = quat_inv_rotate(body_q, wc - body_pos);
+    obb_world_aabb(lc, axes, h)
+}
 
-    let stride_b = (b.mesh_triangles.len() / 128).max(1);
-    for tri in b.mesh_triangles.iter().step_by(stride_b) {
-        for v in tri {
-            let pw = pb + quat_rotate(b.orientation, Vec3::new(v[0], v[1], v[2]));
-            let p_loc = quat_inv_rotate(a.orientation, pw - pa);
-            if let Some((pt_loc, n_loc, pen)) =
-                best_mesh_vs_sphere_contact(&a.mesh_triangles, p_loc, catch_r)
-            {
-                let actual_pen = pen - catch_r;
-                if actual_pen > 0.0 {
-                    let pw_hit = pa + quat_rotate(a.orientation, pt_loc);
-                    let nw = quat_rotate(a.orientation, n_loc).normalized();
-                    tmp.push(Contact {
-                        body_a: None,
-                        body_b: 0,
-                        point: pw_hit,
-                        normal: nw,
-                        penetration: actual_pen,
-                    });
+fn filter_tris_in_aabb(tris: &[[[f32; 3]; 3]], bounds: Aabb) -> Vec<[[f32; 3]; 3]> {
+    if !bounds.is_valid() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for &tri in tris {
+        let min_x = tri[0][0].min(tri[1][0]).min(tri[2][0]);
+        let max_x = tri[0][0].max(tri[1][0]).max(tri[2][0]);
+        if max_x < bounds.min[0] || min_x > bounds.max[0] {
+            continue;
+        }
+        let min_y = tri[0][1].min(tri[1][1]).min(tri[2][1]);
+        let max_y = tri[0][1].max(tri[1][1]).max(tri[2][1]);
+        if max_y < bounds.min[1] || min_y > bounds.max[1] {
+            continue;
+        }
+        let min_z = tri[0][2].min(tri[1][2]).min(tri[2][2]);
+        let max_z = tri[0][2].max(tri[1][2]).max(tri[2][2]);
+        if max_z < bounds.min[2] || min_z > bounds.max[2] {
+            continue;
+        }
+        out.push(tri);
+    }
+    out
+}
+
+fn aabb_contains_point(aabb: Aabb, p: Vec3, tol: f32) -> bool {
+    aabb.is_valid()
+        && p.x >= aabb.min[0] - tol
+        && p.x <= aabb.max[0] + tol
+        && p.y >= aabb.min[1] - tol
+        && p.y <= aabb.max[1] + tol
+        && p.z >= aabb.min[2] - tol
+        && p.z <= aabb.max[2] + tol
+}
+
+fn is_point_inside_closed_mesh(tris: &[[[f32; 3]; 3]], aabb: Aabb, p: Vec3) -> bool {
+    if tris.len() < 4 || !aabb_contains_point(aabb, p, 1e-4) {
+        return false;
+    }
+    // Single-pass 6 cardinal raycast (+/-X, +/-Y, +/-Z): track nearest hit in each direction.
+    // Inside a watertight/closed mesh, >= 5 cardinal rays hit an outward-facing triangle on exit.
+    let mut best_t = [f32::INFINITY; 6];
+    let mut best_outward = [false; 6];
+    let dirs = [
+        [1.0_f32, 0.0, 0.0],
+        [-1.0_f32, 0.0, 0.0],
+        [0.0_f32, 1.0, 0.0],
+        [0.0_f32, -1.0, 0.0],
+        [0.0_f32, 0.0, 1.0],
+        [0.0_f32, 0.0, -1.0],
+    ];
+    let po = p.to_array();
+    for tri in tris {
+        let min_x = tri[0][0].min(tri[1][0]).min(tri[2][0]);
+        let max_x = tri[0][0].max(tri[1][0]).max(tri[2][0]);
+        let min_y = tri[0][1].min(tri[1][1]).min(tri[2][1]);
+        let max_y = tri[0][1].max(tri[1][1]).max(tri[2][1]);
+        let min_z = tri[0][2].min(tri[1][2]).min(tri[2][2]);
+        let max_z = tri[0][2].max(tri[1][2]).max(tri[2][2]);
+
+        let in_yz = po[1] >= min_y - 1e-5 && po[1] <= max_y + 1e-5 && po[2] >= min_z - 1e-5 && po[2] <= max_z + 1e-5;
+        let in_xz = po[0] >= min_x - 1e-5 && po[0] <= max_x + 1e-5 && po[2] >= min_z - 1e-5 && po[2] <= max_z + 1e-5;
+        let in_xy = po[0] >= min_x - 1e-5 && po[0] <= max_x + 1e-5 && po[1] >= min_y - 1e-5 && po[1] <= max_y + 1e-5;
+
+        if !in_yz && !in_xz && !in_xy {
+            continue;
+        }
+        let check_dir = |axis_mask: bool, dir_idx: usize, best_t: &mut [f32; 6], best_outward: &mut [bool; 6]| {
+            if !axis_mask {
+                return;
+            }
+            let d = dirs[dir_idx];
+            if let Some((t, n)) = ray_triangle(po, d, tri[0], tri[1], tri[2], 1e6) {
+                if t > 1e-5 && t < best_t[dir_idx] {
+                    best_t[dir_idx] = t;
+                    let dot = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
+                    best_outward[dir_idx] = dot > 0.0;
                 }
+            }
+        };
+        check_dir(in_yz && max_x >= po[0], 0, &mut best_t, &mut best_outward);
+        check_dir(in_yz && min_x <= po[0], 1, &mut best_t, &mut best_outward);
+        check_dir(in_xz && max_y >= po[1], 2, &mut best_t, &mut best_outward);
+        check_dir(in_xz && min_y <= po[1], 3, &mut best_t, &mut best_outward);
+        check_dir(in_xy && max_z >= po[2], 4, &mut best_t, &mut best_outward);
+        check_dir(in_xy && min_z <= po[2], 5, &mut best_t, &mut best_outward);
+    }
+    let hit_count = best_t.iter().filter(|&&t| t.is_finite()).count();
+    let outward_count = best_outward.iter().filter(|&&b| b).count();
+    hit_count >= 5 && outward_count >= 4
+}
+
+fn closest_interior_escape(tris: &[[[f32; 3]; 3]], p: Vec3) -> Option<(Vec3, Vec3, f32)> {
+    let mut best_neg: Option<(Vec3, Vec3, f32)> = None;
+    let mut best_any: Option<(Vec3, Vec3, f32)> = None;
+    for tri in tris {
+        let a = Vec3::new(tri[0][0], tri[0][1], tri[0][2]);
+        let b = Vec3::new(tri[1][0], tri[1][1], tri[1][2]);
+        let c = Vec3::new(tri[2][0], tri[2][1], tri[2][2]);
+        let tri_n = (b - a).cross(c - a);
+        if tri_n.dot(tri_n) <= 1e-10 {
+            continue;
+        }
+        let tri_n = tri_n.normalized();
+        let closest = closest_point_on_triangle(p, a, b, c);
+        let diff = p - closest;
+        let dist = sqrtf(diff.dot(diff));
+        let signed_d = diff.dot(tri_n);
+        if signed_d <= 1e-4 {
+            if best_neg.map_or(true, |(_, _, prev_d)| dist < prev_d) {
+                best_neg = Some((closest, tri_n, dist));
+            }
+        }
+        if best_any.map_or(true, |(_, _, prev_d)| dist < prev_d) {
+            best_any = Some((closest, tri_n, dist));
+        }
+    }
+    best_neg.or(best_any)
+}
+
+fn mesh_point_penetration(
+    local_tris: &[[[f32; 3]; 3]],
+    all_tris: &[[[f32; 3]; 3]],
+    all_aabb: Aabb,
+    p_loc: Vec3,
+    max_depth: f32,
+) -> Option<(Vec3, Vec3, f32)> {
+    if !aabb_contains_point(all_aabb, p_loc, 1e-4) {
+        return None;
+    }
+    let mut best_pos_dist = f32::INFINITY;
+    let mut best_neg: Option<(Vec3, Vec3, f32)> = None;
+
+    for tri in local_tris {
+        let min_x = tri[0][0].min(tri[1][0]).min(tri[2][0]);
+        let max_x = tri[0][0].max(tri[1][0]).max(tri[2][0]);
+        if p_loc.x + max_depth < min_x || p_loc.x - max_depth > max_x {
+            continue;
+        }
+        let min_y = tri[0][1].min(tri[1][1]).min(tri[2][1]);
+        let max_y = tri[0][1].max(tri[1][1]).max(tri[2][1]);
+        if p_loc.y + max_depth < min_y || p_loc.y - max_depth > max_y {
+            continue;
+        }
+        let min_z = tri[0][2].min(tri[1][2]).min(tri[2][2]);
+        let max_z = tri[0][2].max(tri[1][2]).max(tri[2][2]);
+        if p_loc.z + max_depth < min_z || p_loc.z - max_depth > max_z {
+            continue;
+        }
+
+        let a = Vec3::new(tri[0][0], tri[0][1], tri[0][2]);
+        let b = Vec3::new(tri[1][0], tri[1][1], tri[1][2]);
+        let c = Vec3::new(tri[2][0], tri[2][1], tri[2][2]);
+        let tri_n = (b - a).cross(c - a);
+        if tri_n.dot(tri_n) <= 1e-10 {
+            continue;
+        }
+        let tri_n = tri_n.normalized();
+        let closest = closest_point_on_triangle(p_loc, a, b, c);
+        let diff = p_loc - closest;
+        let dist_sq = diff.dot(diff);
+        if dist_sq > max_depth * max_depth {
+            continue;
+        }
+        let dist = sqrtf(dist_sq);
+        let signed_d = diff.dot(tri_n);
+        if signed_d >= -1e-4 {
+            if dist < best_pos_dist {
+                best_pos_dist = dist;
+            }
+        } else if dist <= (-signed_d) + 1e-4 {
+            if best_neg.map_or(true, |(_, _, prev_d)| dist < prev_d) {
+                best_neg = Some((closest, tri_n, dist));
             }
         }
     }
 
-    let stride_a = (a.mesh_triangles.len() / 128).max(1);
-    for tri in a.mesh_triangles.iter().step_by(stride_a) {
-        for v in tri {
-            let pw = pa + quat_rotate(a.orientation, Vec3::new(v[0], v[1], v[2]));
+    if let Some((pt, n, pen)) = best_neg {
+        if pen <= best_pos_dist + 1e-4 {
+            return Some((pt, n, pen.max(0.001)));
+        }
+    }
+
+    if is_point_inside_closed_mesh(all_tris, all_aabb, p_loc) {
+        if let Some((pt, n, dist)) = closest_interior_escape(all_tris, p_loc) {
+            return Some((pt, n, dist.max(0.001)));
+        }
+    }
+    None
+}
+
+fn push_contact_dedup(tmp: &mut Vec<Contact>, pt: Vec3, nw: Vec3, pen: f32) {
+    if let Some(existing) = tmp.iter_mut().find(|c| {
+        let d = c.point - pt;
+        d.dot(d) < 1e-4 && c.normal.dot(nw) > 0.9
+    }) {
+        if pen > existing.penetration {
+            *existing = Contact {
+                body_a: None,
+                body_b: 0,
+                point: pt,
+                normal: nw,
+                penetration: pen,
+            };
+        }
+    } else {
+        tmp.push(Contact {
+            body_a: None,
+            body_b: 0,
+            point: pt,
+            normal: nw,
+            penetration: pen,
+        });
+    }
+}
+
+fn collect_mesh_vs_mesh_contacts(a: &RigidBody, b: &RigidBody, out: &mut Vec<Contact>) {
+    let pa = Vec3::new(a.position[0], a.position[1], a.position[2]);
+    let pb = Vec3::new(b.position[0], b.position[1], b.position[2]);
+    let waabb_a = a.world_aabb();
+    let waabb_b = b.world_aabb();
+    if !aabb_overlaps(waabb_a, waabb_b) {
+        return;
+    }
+
+    let b_in_a = world_aabb_to_local(waabb_b, pa, a.orientation, 0.12);
+    let a_in_b = world_aabb_to_local(waabb_a, pb, b.orientation, 0.12);
+    let tris_a_near = filter_tris_in_aabb(&a.mesh_triangles, b_in_a);
+    let tris_b_near = filter_tris_in_aabb(&b.mesh_triangles, a_in_b);
+    if tris_a_near.is_empty() || tris_b_near.is_empty() {
+        return;
+    }
+
+    let a_ext = [
+        (a.mesh_local_aabb.max[0] - a.mesh_local_aabb.min[0]).max(0.05),
+        (a.mesh_local_aabb.max[1] - a.mesh_local_aabb.min[1]).max(0.05),
+        (a.mesh_local_aabb.max[2] - a.mesh_local_aabb.min[2]).max(0.05),
+    ];
+    let b_ext = [
+        (b.mesh_local_aabb.max[0] - b.mesh_local_aabb.min[0]).max(0.05),
+        (b.mesh_local_aabb.max[1] - b.mesh_local_aabb.min[1]).max(0.05),
+        (b.mesh_local_aabb.max[2] - b.mesh_local_aabb.min[2]).max(0.05),
+    ];
+    let max_depth_a = (a_ext[0].min(a_ext[1]).min(a_ext[2]) * 0.45).clamp(0.12, 1.5);
+    let max_depth_b = (b_ext[0].min(b_ext[1]).min(b_ext[2]) * 0.45).clamp(0.12, 1.5);
+
+    let mut tmp: Vec<Contact> = Vec::new();
+
+    // Sample B vertices + edge midpoints/centers in the overlap region against A's nearby triangles
+    let dense_b = tris_b_near.len() <= 64;
+    let stride_b = (tris_b_near.len() / 160).max(1);
+    for tri in tris_b_near.iter().step_by(stride_b) {
+        let v0 = Vec3::new(tri[0][0], tri[0][1], tri[0][2]);
+        let v1 = Vec3::new(tri[1][0], tri[1][1], tri[1][2]);
+        let v2 = Vec3::new(tri[2][0], tri[2][1], tri[2][2]);
+        let samples_small = [v0, v1, v2];
+        let samples_dense = [
+            v0,
+            v1,
+            v2,
+            (v0 + v1) * 0.5,
+            (v1 + v2) * 0.5,
+            (v2 + v0) * 0.5,
+            (v0 + v1 + v2) * (1.0 / 3.0),
+        ];
+        let iter_slice: &[Vec3] = if dense_b { &samples_dense } else { &samples_small };
+        for &v_loc in iter_slice {
+            let pw = pb + quat_rotate(b.orientation, v_loc);
+            let p_loc = quat_inv_rotate(a.orientation, pw - pa);
+            if let Some((pt_loc, n_loc, pen)) =
+                mesh_point_penetration(&tris_a_near, &a.mesh_triangles, a.mesh_local_aabb, p_loc, max_depth_a)
+            {
+                let pw_hit = pa + quat_rotate(a.orientation, pt_loc);
+                let nw = quat_rotate(a.orientation, n_loc).normalized();
+                push_contact_dedup(&mut tmp, pw_hit, nw, pen);
+            }
+        }
+    }
+
+    // Sample A vertices + edge midpoints/centers in the overlap region against B's nearby triangles
+    let dense_a = tris_a_near.len() <= 64;
+    let stride_a = (tris_a_near.len() / 160).max(1);
+    for tri in tris_a_near.iter().step_by(stride_a) {
+        let v0 = Vec3::new(tri[0][0], tri[0][1], tri[0][2]);
+        let v1 = Vec3::new(tri[1][0], tri[1][1], tri[1][2]);
+        let v2 = Vec3::new(tri[2][0], tri[2][1], tri[2][2]);
+        let samples_small = [v0, v1, v2];
+        let samples_dense = [
+            v0,
+            v1,
+            v2,
+            (v0 + v1) * 0.5,
+            (v1 + v2) * 0.5,
+            (v2 + v0) * 0.5,
+            (v0 + v1 + v2) * (1.0 / 3.0),
+        ];
+        let iter_slice: &[Vec3] = if dense_a { &samples_dense } else { &samples_small };
+        for &v_loc in iter_slice {
+            let pw = pa + quat_rotate(a.orientation, v_loc);
             let p_loc = quat_inv_rotate(b.orientation, pw - pb);
             if let Some((pt_loc, n_loc, pen)) =
-                best_mesh_vs_sphere_contact(&b.mesh_triangles, p_loc, catch_r)
+                mesh_point_penetration(&tris_b_near, &b.mesh_triangles, b.mesh_local_aabb, p_loc, max_depth_b)
             {
-                let actual_pen = pen - catch_r;
-                if actual_pen > 0.0 {
-                    let pw_hit = pb + quat_rotate(b.orientation, pt_loc);
-                    let nw = quat_rotate(b.orientation, n_loc).normalized() * -1.0;
-                    tmp.push(Contact {
-                        body_a: None,
-                        body_b: 0,
-                        point: pw_hit,
-                        normal: nw,
-                        penetration: actual_pen,
-                    });
-                }
+                let pw_hit = pb + quat_rotate(b.orientation, pt_loc);
+                let nw = quat_rotate(b.orientation, n_loc).normalized() * -1.0;
+                push_contact_dedup(&mut tmp, pw_hit, nw, pen);
+            }
+        }
+    }
+
+    // Also test B's center against A (and A's center against B) in case a small mesh sits completely inside a large mesh
+    if tmp.is_empty() && b.mesh_local_aabb.is_valid() {
+        let bc_loc = Vec3::new(
+            (b.mesh_local_aabb.min[0] + b.mesh_local_aabb.max[0]) * 0.5,
+            (b.mesh_local_aabb.min[1] + b.mesh_local_aabb.max[1]) * 0.5,
+            (b.mesh_local_aabb.min[2] + b.mesh_local_aabb.max[2]) * 0.5,
+        );
+        let bc_w = pb + quat_rotate(b.orientation, bc_loc);
+        let p_in_a = quat_inv_rotate(a.orientation, bc_w - pa);
+        if is_point_inside_closed_mesh(&a.mesh_triangles, a.mesh_local_aabb, p_in_a) {
+            if let Some((pt_loc, n_loc, dist)) = closest_interior_escape(&a.mesh_triangles, p_in_a) {
+                let b_r = b_ext[0].min(b_ext[1]).min(b_ext[2]) * 0.5;
+                let pw_hit = pa + quat_rotate(a.orientation, pt_loc);
+                let nw = quat_rotate(a.orientation, n_loc).normalized();
+                push_contact_dedup(&mut tmp, pw_hit, nw, dist + b_r);
+            }
+        }
+    }
+    if tmp.is_empty() && a.mesh_local_aabb.is_valid() {
+        let ac_loc = Vec3::new(
+            (a.mesh_local_aabb.min[0] + a.mesh_local_aabb.max[0]) * 0.5,
+            (a.mesh_local_aabb.min[1] + a.mesh_local_aabb.max[1]) * 0.5,
+            (a.mesh_local_aabb.min[2] + a.mesh_local_aabb.max[2]) * 0.5,
+        );
+        let ac_w = pa + quat_rotate(a.orientation, ac_loc);
+        let p_in_b = quat_inv_rotate(b.orientation, ac_w - pb);
+        if is_point_inside_closed_mesh(&b.mesh_triangles, b.mesh_local_aabb, p_in_b) {
+            if let Some((pt_loc, n_loc, dist)) = closest_interior_escape(&b.mesh_triangles, p_in_b) {
+                let a_r = a_ext[0].min(a_ext[1]).min(a_ext[2]) * 0.5;
+                let pw_hit = pb + quat_rotate(b.orientation, pt_loc);
+                let nw = quat_rotate(b.orientation, n_loc).normalized() * -1.0;
+                push_contact_dedup(&mut tmp, pw_hit, nw, dist + a_r);
             }
         }
     }
@@ -1124,16 +1508,6 @@ fn collect_mesh_vs_mesh_contacts(a: &RigidBody, b: &RigidBody, out: &mut Vec<Con
     if !tmp.is_empty() {
         tmp.sort_by(|x, y| y.penetration.total_cmp(&x.penetration));
         out.extend(tmp.into_iter().take(6));
-        return;
-    }
-
-    // Coarse OBB fallback only if vertex probes missed
-    if a.mesh_local_aabb.is_valid() && b.mesh_local_aabb.is_valid() {
-        let (ca, sa) = ColliderShape::fit_box(a.mesh_local_aabb);
-        let (cb, sb) = ColliderShape::fit_box(b.mesh_local_aabb);
-        let oa = pa + quat_rotate(a.orientation, Vec3::new(ca[0], ca[1], ca[2]));
-        let ob = pb + quat_rotate(b.orientation, Vec3::new(cb[0], cb[1], cb[2]));
-        collect_shape_pair_contacts(oa, a.orientation, sa, ob, b.orientation, sb, out);
     }
 }
 
@@ -1156,7 +1530,13 @@ fn collect_mesh_vs_body_contacts(
             ColliderShape::Sphere { radius } => {
                 let p_loc = quat_inv_rotate(mq, cw - mp);
                 let mut local_hits = Vec::new();
-                collect_mesh_vs_sphere_contacts(&mesh_body.mesh_triangles, p_loc, radius, &mut local_hits);
+                collect_mesh_vs_sphere_contacts_with_aabb(
+                    &mesh_body.mesh_triangles,
+                    mesh_body.mesh_local_aabb,
+                    p_loc,
+                    radius,
+                    &mut local_hits,
+                );
                 for (pt_loc, n_loc, pen) in local_hits {
                     out.push(Contact {
                         body_a: None,
@@ -1172,8 +1552,9 @@ fn collect_mesh_vs_body_contacts(
                 for end in [cw - up, cw, cw + up] {
                     let p_loc = quat_inv_rotate(mq, end - mp);
                     let mut local_hits = Vec::new();
-                    collect_mesh_vs_sphere_contacts(
+                    collect_mesh_vs_sphere_contacts_with_aabb(
                         &mesh_body.mesh_triangles,
+                        mesh_body.mesh_local_aabb,
                         p_loc,
                         radius,
                         &mut local_hits,
@@ -1231,11 +1612,24 @@ fn collect_mesh_vs_body_contacts(
                     probes.push((cw + quat_rotate(sq, local), pr));
                 }
 
+                let box_waabb = obb_world_aabb(cw, quat_axes(sq), half_extents);
+                let box_in_mesh = world_aabb_to_local(box_waabb, mp, mq, pr + 0.05);
+                let near_tris = filter_tris_in_aabb(&mesh_body.mesh_triangles, box_in_mesh);
+
                 let mut box_hits: Vec<Contact> = Vec::new();
                 for (pw, rad) in probes {
                     let p_loc = quat_inv_rotate(mq, pw - mp);
-                    if let Some((pt_loc, n_loc, pen)) =
-                        best_mesh_vs_sphere_contact(&mesh_body.mesh_triangles, p_loc, rad)
+                    let mut probe_hits = Vec::new();
+                    collect_mesh_vs_sphere_contacts_with_aabb(
+                        &near_tris,
+                        Aabb::EMPTY,
+                        p_loc,
+                        rad,
+                        &mut probe_hits,
+                    );
+                    if let Some((pt_loc, n_loc, pen)) = probe_hits
+                        .into_iter()
+                        .max_by(|a, b| a.2.total_cmp(&b.2))
                     {
                         box_hits.push(Contact {
                             body_a: None,
@@ -1244,12 +1638,25 @@ fn collect_mesh_vs_body_contacts(
                             normal: quat_rotate(mq, n_loc).normalized() * sign,
                             penetration: pen,
                         });
+                    } else if let Some((pt_loc, n_loc, depth)) = mesh_point_penetration(
+                        &near_tris,
+                        &mesh_body.mesh_triangles,
+                        mesh_body.mesh_local_aabb,
+                        p_loc,
+                        min_h.max(0.25),
+                    ) {
+                        box_hits.push(Contact {
+                            body_a: None,
+                            body_b: 0,
+                            point: mp + quat_rotate(mq, pt_loc),
+                            normal: quat_rotate(mq, n_loc).normalized() * sign,
+                            penetration: depth + rad,
+                        });
                     }
                 }
 
-                // Also test mesh vertices penetrating inside the OBB (e.g. pyramid apex hitting a box face)
-                let stride = (mesh_body.mesh_triangles.len() / 256).max(1);
-                for tri in mesh_body.mesh_triangles.iter().step_by(stride) {
+                // Also test mesh vertices inside the OBB (using AABB-filtered triangles instead of blind stride)
+                for tri in &near_tris {
                     let a = Vec3::new(tri[0][0], tri[0][1], tri[0][2]);
                     let b = Vec3::new(tri[1][0], tri[1][1], tri[1][2]);
                     let c = Vec3::new(tri[2][0], tri[2][1], tri[2][2]);
@@ -1300,19 +1707,9 @@ fn collect_mesh_vs_body_contacts(
     }
 }
 
-fn best_mesh_vs_sphere_contact(
+fn collect_mesh_vs_sphere_contacts_with_aabb(
     tris: &[[[f32; 3]; 3]],
-    sphere_local: Vec3,
-    radius: f32,
-) -> Option<(Vec3, Vec3, f32)> {
-    let mut hits = Vec::new();
-    collect_mesh_vs_sphere_contacts(tris, sphere_local, radius, &mut hits);
-    hits.into_iter()
-        .max_by(|a, b| a.2.total_cmp(&b.2))
-}
-
-fn collect_mesh_vs_sphere_contacts(
-    tris: &[[[f32; 3]; 3]],
+    mesh_aabb: Aabb,
     sp: Vec3,
     radius: f32,
     out: &mut Vec<(Vec3, Vec3, f32)>,
@@ -1400,6 +1797,13 @@ fn collect_mesh_vs_sphere_contacts(
             if pen > min_pen {
                 out[min_idx] = (closest, normal, pen);
             }
+        }
+    }
+
+    // Tier 2: If no shallow surface contact was found, prevent spheres from staying trapped inside closed solid meshes
+    if out.is_empty() && is_point_inside_closed_mesh(tris, mesh_aabb, sp) {
+        if let Some((closest, tri_n, dist)) = closest_interior_escape(tris, sp) {
+            out.push((closest, tri_n, radius + dist));
         }
     }
 }

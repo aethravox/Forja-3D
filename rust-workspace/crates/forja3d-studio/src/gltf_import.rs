@@ -252,7 +252,29 @@ fn convert_primitive(
         .and_then(|opt| opt.as_ref());
     let mapped_tex_idx = tex_source_idx
         .and_then(|idx| image_to_tex_idx.get(idx).copied().flatten());
-    let uses_gpu_tex = mapped_tex_idx.is_some() && uvs.is_some();
+    let has_uvs = uvs.is_some();
+    let uses_gpu_tex = mapped_tex_idx.is_some() && has_uvs;
+
+    let mut pos_min = [f32::INFINITY; 3];
+    let mut pos_max = [f32::NEG_INFINITY; 3];
+    if !has_uvs {
+        for &p in &positions {
+            for k in 0..3 {
+                let v = if p[k].is_finite() { p[k] } else { 0.0 };
+                if v < pos_min[k] {
+                    pos_min[k] = v;
+                }
+                if v > pos_max[k] {
+                    pos_max[k] = v;
+                }
+            }
+        }
+    }
+    let pos_span = [
+        (pos_max[0] - pos_min[0]).max(1e-4),
+        (pos_max[1] - pos_min[1]).max(1e-4),
+        (pos_max[2] - pos_min[2]).max(1e-4),
+    ];
 
     let metallic = pbr.metallic_factor().clamp(0.0, 1.0);
     let roughness = pbr.roughness_factor().clamp(0.05, 1.0);
@@ -272,15 +294,27 @@ fn convert_primitive(
             Some(ns) => transform_normal(norm_mat, ns.get(i).copied().unwrap_or([0.0, 1.0, 0.0])),
             None => [0.0, 1.0, 0.0],
         };
-        let uv = uvs
-            .as_ref()
-            .and_then(|u| u.get(i).copied())
-            .unwrap_or([0.0, 0.0]);
+        let uv = match uvs.as_ref().and_then(|u| u.get(i).copied()) {
+            Some(u) => u,
+            None => {
+                let nx = (pos[0] - pos_min[0]) / pos_span[0];
+                let ny = (pos[1] - pos_min[1]) / pos_span[1];
+                let nz = (pos[2] - pos_min[2]) / pos_span[2];
+                let an = [world_norm[0].abs(), world_norm[1].abs(), world_norm[2].abs()];
+                if an[0] >= an[1] && an[0] >= an[2] {
+                    [nz, ny]
+                } else if an[1] >= an[0] && an[1] >= an[2] {
+                    [nx, nz]
+                } else {
+                    [nx, ny]
+                }
+            }
+        };
 
         let mut color = base_factor;
         if let Some(img) = tex_img {
             if !uses_gpu_tex {
-                let tc = if uvs.is_some() {
+                let tc = if has_uvs {
                     img.sample(uv)
                 } else {
                     img.average
