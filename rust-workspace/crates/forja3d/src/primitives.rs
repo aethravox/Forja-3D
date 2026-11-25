@@ -88,6 +88,11 @@ pub struct PartSpec {
     pub collider_auto_fit: bool,
     pub collider_offset: [f32; 3],
     pub body_kind: RigidBodyKind,
+    pub mass: f32,
+    pub friction: f32,
+    pub restitution: f32,
+    pub linear_damping: f32,
+    pub gravity_scale: f32,
 }
 
 impl PartSpec {
@@ -124,6 +129,17 @@ impl PartSpec {
             } else {
                 RigidBodyKind::Dynamic
             },
+            mass: if is_terrain { 50.0 } else { 1.0 },
+            friction: if is_terrain { 0.75 } else { 0.45 },
+            restitution: if is_terrain {
+                0.1
+            } else if kind == PrimitiveKind::Sphere {
+                0.45
+            } else {
+                0.25
+            },
+            linear_damping: 0.04,
+            gravity_scale: 1.0,
         }
     }
 
@@ -286,6 +302,11 @@ impl PartSpec {
             collider_auto_fit: true,
             collider_offset: [0.0; 3],
             body_kind: RigidBodyKind::Dynamic,
+            mass: 1.0,
+            friction: 0.45,
+            restitution: 0.3,
+            linear_damping: 0.04,
+            gravity_scale: 1.0,
         }
     }
 
@@ -457,6 +478,11 @@ impl SceneDocument {
         let (physics_enabled, physics) = if let Some(phys) = phys_opt {
             for part in &mut parts {
                 part.body_kind = phys.body_kind;
+                part.mass = phys.mass;
+                part.friction = phys.friction;
+                part.restitution = phys.restitution;
+                part.linear_damping = phys.linear_damping;
+                part.gravity_scale = phys.gravity_scale;
                 let h = fnv1a_32(part.name.as_bytes());
                 if let Some(c) = phys.colliders.iter().find(|c| c.part_hash == h) {
                     part.collider = c.shape;

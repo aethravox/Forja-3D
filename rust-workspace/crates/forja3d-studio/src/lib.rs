@@ -351,9 +351,15 @@ impl StudioApp {
                 part_spec.position
             };
 
-            let mut part_phys = self.scene.physics.clone();
-            part_phys.body_kind = part_spec.body_kind;
-            part_phys.colliders.clear();
+            let mut part_phys = PhysicsSpec {
+                body_kind: part_spec.body_kind,
+                mass: part_spec.mass.max(0.05),
+                friction: part_spec.friction,
+                restitution: part_spec.restitution,
+                linear_damping: part_spec.linear_damping,
+                gravity_scale: part_spec.gravity_scale,
+                colliders: Vec::new(),
+            };
 
             let local_bounds = forja3d::Aabb {
                 min: [
@@ -1322,7 +1328,18 @@ impl StudioApp {
                     vis_toggled = true;
                 }
                 let mirror_tag = if part.mirror.iter().any(|&m| m) { " [M]" } else { "" };
-                let phys_tag = if part.body_kind == RigidBodyKind::Static { " [Fijo]" } else { "" };
+                let phys_tag = match part.body_kind {
+                    RigidBodyKind::Static => String::from(" [Fijo]"),
+                    RigidBodyKind::Kinematic => String::from(" [Cinem.]"),
+                    RigidBodyKind::Sensor => String::from(" [Sensor]"),
+                    RigidBodyKind::Dynamic => {
+                        if (part.mass - 1.0).abs() > 0.05 {
+                            format!(" [{:.1}kg]", part.mass)
+                        } else {
+                            String::new()
+                        }
+                    }
+                };
                 let label = format!("{}{}{}", part.name, mirror_tag, phys_tag);
                 if ui.selectable_label(is_sel, label).clicked() {
                     self.selection = Some(Selection::Part(idx));
@@ -2128,6 +2145,29 @@ impl StudioApp {
                             discrete_autofit_toggle = Some(auto_fit);
                         }
                     }
+
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Propiedades físicas de esta pieza").strong());
+                    if ui.add(egui::Slider::new(&mut part.mass, 0.05..=200.0).logarithmic(true).text("Masa (kg)")).changed() {
+                        changed_continuous = true;
+                        *dirty = true;
+                    }
+                    if ui.add(egui::Slider::new(&mut part.friction, 0.0..=1.5).text("Fricción")).changed() {
+                        changed_continuous = true;
+                        *dirty = true;
+                    }
+                    if ui.add(egui::Slider::new(&mut part.restitution, 0.0..=1.0).text("Rebote")).changed() {
+                        changed_continuous = true;
+                        *dirty = true;
+                    }
+                    if ui.add(egui::Slider::new(&mut part.gravity_scale, -2.0..=3.0).text("Escala gravedad")).changed() {
+                        changed_continuous = true;
+                        *dirty = true;
+                    }
+                    if ui.add(egui::Slider::new(&mut part.linear_damping, 0.0..=2.0).text("Amortiguación")).changed() {
+                        changed_continuous = true;
+                        *dirty = true;
+                    }
                 }
 
                 self.selected_profile_pt = selected_pt;
@@ -2318,16 +2358,26 @@ impl StudioApp {
 
     fn render_model_physics_section(&mut self, ui: &mut egui::Ui, dirty: &mut bool, compact: bool) {
         let btn_h = if compact { 32.0 } else { 22.0 };
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Físicas globales (.f3d)").strong());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add_sized([116.0, btn_h], egui::Button::new("Auto-colisión")).clicked() {
-                    self.push_undo();
-                    self.scene.auto_generate_colliders();
-                    self.show_colliders = true;
-                    *dirty = true;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Físicas de exportación (.f3d)").strong());
+            if ui.add_sized([108.0, btn_h], egui::Button::new("Auto-colisión")).clicked() {
+                self.push_undo();
+                self.scene.auto_generate_colliders();
+                self.show_colliders = true;
+                *dirty = true;
+            }
+            if ui.add_sized([118.0, btn_h], egui::Button::new("Copiar a todas")).clicked() {
+                self.push_undo();
+                for p in &mut self.scene.parts {
+                    p.mass = self.scene.physics.mass;
+                    p.friction = self.scene.physics.friction;
+                    p.restitution = self.scene.physics.restitution;
+                    p.gravity_scale = self.scene.physics.gravity_scale;
+                    p.linear_damping = self.scene.physics.linear_damping;
                 }
-            });
+                self.status_note = String::from("Físicas aplicadas a todas las piezas");
+                *dirty = true;
+            }
         });
         let mut enabled = self.scene.physics_enabled;
         if ui.checkbox(&mut enabled, "Incluir colisionadores y propiedades en .f3d").changed() {

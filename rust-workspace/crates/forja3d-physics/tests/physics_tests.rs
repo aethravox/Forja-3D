@@ -510,3 +510,153 @@ fn sphere_and_cube_descend_rotated_ramp_mesh() {
         fb.position
     );
 }
+
+#[test]
+fn sphere_rolls_off_dynamic_pyramid_without_dragging_pyramid_along() {
+    use forja3d_physics::{RigidBody, WorldCollider};
+
+    let mut pyramid = PartSpec::new("piramide", PrimitiveKind::Pyramid);
+    pyramid.position = [0.0, 0.5, 0.0];
+    pyramid.scale = [1.4, 1.2, 1.4];
+    let pyr_baked = pyramid.bake();
+    let pivot = [0.0_f32, 0.5, 0.0];
+    let mut tris = Vec::new();
+    for tri in pyr_baked.indices.chunks_exact(3) {
+        let a = pyr_baked.vertices[tri[0] as usize].position;
+        let b = pyr_baked.vertices[tri[1] as usize].position;
+        let c = pyr_baked.vertices[tri[2] as usize].position;
+        tris.push([
+            [a[0] - pivot[0], a[1] - pivot[1], a[2] - pivot[2]],
+            [b[0] - pivot[0], b[1] - pivot[1], b[2] - pivot[2]],
+            [c[0] - pivot[0], c[1] - pivot[1], c[2] - pivot[2]],
+        ]);
+    }
+
+    let mut world = PhysicsWorld::new();
+    let mut pyr_body = RigidBody::from_model(&Model::new("Piramide1kg"), pivot);
+    pyr_body.colliders.clear();
+    pyr_body = pyr_body.with_mesh_triangles(tris);
+    pyr_body.body_kind = RigidBodyKind::Dynamic;
+    pyr_body.mass = 1.0;
+    pyr_body.inv_mass = 1.0;
+    pyr_body.friction = 0.5;
+    let pyr_h = world.add_body(pyr_body);
+
+    let sph_body = RigidBody {
+        name: String::from("Esfera1kg"),
+        body_kind: RigidBodyKind::Dynamic,
+        position: [0.16, 1.55, 0.0],
+        orientation: [0.0, 0.0, 0.0, 1.0],
+        velocity: [0.0; 3],
+        angular_velocity: [0.0; 3],
+        force_accum: [0.0; 3],
+        mass: 1.0,
+        inv_mass: 1.0,
+        friction: 0.45,
+        restitution: 0.25,
+        linear_damping: 0.02,
+        gravity_scale: 1.0,
+        colliders: vec![WorldCollider {
+            offset: [0.0; 3],
+            shape: ColliderShape::Sphere { radius: 0.5 },
+        }],
+        mesh_triangles: Vec::new(),
+        mesh_local_aabb: forja3d::Aabb::EMPTY,
+        on_ground: false,
+        sleeping: false,
+    };
+    let sph_h = world.add_body(sph_body);
+
+    for _ in 0..200 {
+        world.step(1.0 / 60.0);
+        let p = world.body(pyr_h).unwrap();
+        // Newton's 3rd law: sphere rolling +X down +X slope can only push pyramid -X, NEVER drag it +X!
+        assert!(
+            p.position[0] <= 0.03,
+            "pyramid must never be hooked/dragged +X with the sphere, got pyr.x={}",
+            p.position[0]
+        );
+    }
+    let s = world.body(sph_h).unwrap();
+    assert!(
+        s.position[0] > 0.7 && s.position[1] < 0.7,
+        "sphere should cleanly roll down +X slope off pyramid, got {:?}",
+        s.position
+    );
+}
+
+#[test]
+fn heavy_sphere_8kg_pushes_light_cube_4kg_much_farther_than_reverse() {
+    use forja3d_physics::{RigidBody, WorldCollider};
+
+    fn run_collision(sph_mass: f32, box_mass: f32) -> (f32, f32) {
+        let mut world = PhysicsWorld::new();
+        let sph = world.add_body(RigidBody {
+            name: String::from("Esfera"),
+            body_kind: RigidBodyKind::Dynamic,
+            position: [-1.5, 0.5, 0.0],
+            orientation: [0.0, 0.0, 0.0, 1.0],
+            velocity: [6.0, 0.0, 0.0],
+            angular_velocity: [0.0; 3],
+            force_accum: [0.0; 3],
+            mass: sph_mass,
+            inv_mass: 1.0 / sph_mass,
+            friction: 0.2,
+            restitution: 0.5,
+            linear_damping: 0.02,
+            gravity_scale: 1.0,
+            colliders: vec![WorldCollider {
+                offset: [0.0; 3],
+                shape: ColliderShape::Sphere { radius: 0.5 },
+            }],
+            mesh_triangles: Vec::new(),
+            mesh_local_aabb: forja3d::Aabb::EMPTY,
+            on_ground: false,
+            sleeping: false,
+        });
+        let bx = world.add_body(RigidBody {
+            name: String::from("Cubo"),
+            body_kind: RigidBodyKind::Dynamic,
+            position: [0.0, 0.5, 0.0],
+            orientation: [0.0, 0.0, 0.0, 1.0],
+            velocity: [0.0; 3],
+            angular_velocity: [0.0; 3],
+            force_accum: [0.0; 3],
+            mass: box_mass,
+            inv_mass: 1.0 / box_mass,
+            friction: 0.2,
+            restitution: 0.5,
+            linear_damping: 0.02,
+            gravity_scale: 1.0,
+            colliders: vec![WorldCollider {
+                offset: [0.0; 3],
+                shape: ColliderShape::Box {
+                    half_extents: [0.5, 0.5, 0.5],
+                },
+            }],
+            mesh_triangles: Vec::new(),
+            mesh_local_aabb: forja3d::Aabb::EMPTY,
+            on_ground: false,
+            sleeping: false,
+        });
+        for _ in 0..90 {
+            world.step(1.0 / 60.0);
+        }
+        (world.body(sph).unwrap().position[0], world.body(bx).unwrap().position[0])
+    }
+
+    let (sph_8_end, box_4_end) = run_collision(8.0, 4.0);
+    let (sph_4_end, box_8_end) = run_collision(4.0, 8.0);
+    assert!(
+        box_4_end > box_8_end + 1.0,
+        "8kg sphere should push 4kg cube much farther than 4kg sphere pushes 8kg cube (4kg_end={}, 8kg_end={})",
+        box_4_end,
+        box_8_end
+    );
+    assert!(
+        sph_8_end > sph_4_end + 0.5,
+        "8kg sphere should retain forward momentum while 4kg sphere bounces back more (8kg={}, 4kg={})",
+        sph_8_end,
+        sph_4_end
+    );
+}

@@ -1350,7 +1350,11 @@ fn collect_mesh_vs_sphere_contacts(
 
         let dist = sqrtf(dist_sq);
         let (mut normal, pen) = if signed_d < 0.0 {
-            // Sphere center passed slightly behind the front face: always push outward along tri_n
+            // Only accept slight backface tunneling when closest lies strictly inside the face interior;
+            // if closest is on a ridge/apex of an adjacent backfacing slope, dist > -signed_d, so skip!
+            if dist > (-signed_d) + 1e-4 {
+                continue;
+            }
             (tri_n, radius + (-signed_d))
         } else {
             let n = if dist > 1e-5 {
