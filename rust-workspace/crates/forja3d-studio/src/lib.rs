@@ -355,17 +355,6 @@ impl StudioApp {
             part_phys.body_kind = part_spec.body_kind;
             part_phys.colliders.clear();
 
-            let use_exact_mesh = matches!(
-                part_spec.kind,
-                PrimitiveKind::Pyramid
-                    | PrimitiveKind::Cone
-                    | PrimitiveKind::Torus
-                    | PrimitiveKind::Terrain
-                    | PrimitiveKind::Extrude
-                    | PrimitiveKind::Lathe
-                    | PrimitiveKind::CustomMesh
-            ) && (mesh_part.indices.len() / 3) <= 4096;
-
             let local_bounds = forja3d::Aabb {
                 min: [
                     mesh_part.bounds.min[0] - pivot[0],
@@ -378,6 +367,28 @@ impl StudioApp {
                     mesh_part.bounds.max[2] - pivot[2],
                 ],
             };
+            let ext_x = (local_bounds.max[0] - local_bounds.min[0]).max(0.05);
+            let ext_y = (local_bounds.max[1] - local_bounds.min[1]).max(0.05);
+            let ext_z = (local_bounds.max[2] - local_bounds.min[2]).max(0.05);
+            let is_rotated = part_spec.rotation_deg.iter().any(|r| r.abs() > 0.01);
+            let is_mirrored = part_spec.mirror.iter().any(|&m| m);
+            let is_nonuniform_sphere = part_spec.kind == PrimitiveKind::Sphere
+                && ((ext_x - ext_y).abs() > 0.04 || (ext_y - ext_z).abs() > 0.04 || is_mirrored);
+
+            let use_exact_mesh = (matches!(
+                part_spec.kind,
+                PrimitiveKind::Pyramid
+                    | PrimitiveKind::Cone
+                    | PrimitiveKind::Cylinder
+                    | PrimitiveKind::Plane
+                    | PrimitiveKind::Torus
+                    | PrimitiveKind::Terrain
+                    | PrimitiveKind::Extrude
+                    | PrimitiveKind::Lathe
+                    | PrimitiveKind::CustomMesh
+            ) || (part_spec.kind == PrimitiveKind::Cube && (is_rotated || is_mirrored))
+                || is_nonuniform_sphere)
+                && (mesh_part.indices.len() / 3) <= 4096;
 
             let mut body = if use_exact_mesh {
                 let mut tris = Vec::with_capacity(mesh_part.indices.len() / 3);
@@ -400,10 +411,8 @@ impl StudioApp {
                     &part_phys,
                     local_bounds,
                 );
-                // Keep exact triangle mesh collision as primary without an oversized bounding box
-                if part_spec.collider == ColliderShape::None || !part_spec.collider_auto_fit {
-                    rb.colliders.clear();
-                }
+                // Keep exact triangle mesh collision as primary without an oversized fallback AABB
+                rb.colliders.clear();
                 rb.with_mesh_triangles(tris)
             } else {
                 let mut shape_spec = if part_spec.collider != ColliderShape::None {

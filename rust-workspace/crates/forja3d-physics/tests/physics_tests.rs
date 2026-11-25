@@ -206,3 +206,307 @@ fn dynamic_sphere_bounces_and_rolls_down_static_pyramid_slope() {
         final_sph.position[1]
     );
 }
+
+#[test]
+fn sphere_dropped_dead_center_on_pyramid_apex_tips_and_rolls_off() {
+    use forja3d_physics::{RigidBody, WorldCollider};
+
+    let mut pyramid = PartSpec::new("piramide", PrimitiveKind::Pyramid);
+    pyramid.position = [0.0, 0.5, 0.0];
+    pyramid.scale = [1.4, 1.2, 1.4];
+    let pyr_baked = pyramid.bake();
+    let mut tris = Vec::new();
+    for tri in pyr_baked.indices.chunks_exact(3) {
+        tris.push([
+            pyr_baked.vertices[tri[0] as usize].position,
+            pyr_baked.vertices[tri[1] as usize].position,
+            pyr_baked.vertices[tri[2] as usize].position,
+        ]);
+    }
+
+    let mut world = PhysicsWorld::new();
+    let mut pyr_body = RigidBody::from_model(&Model::new("Piramide"), [0.0, 0.0, 0.0]).with_mesh_triangles(tris);
+    pyr_body.body_kind = RigidBodyKind::Static;
+    pyr_body.inv_mass = 0.0;
+    pyr_body.colliders.clear();
+    world.add_body(pyr_body);
+
+    let sph_body = RigidBody {
+        name: String::from("EsferaCentro"),
+        body_kind: RigidBodyKind::Dynamic,
+        position: [0.0, 1.85, 0.0],
+        orientation: [0.0, 0.0, 0.0, 1.0],
+        velocity: [0.0; 3],
+        angular_velocity: [0.0; 3],
+        force_accum: [0.0; 3],
+        mass: 1.0,
+        inv_mass: 1.0,
+        friction: 0.55,
+        restitution: 0.3,
+        linear_damping: 0.02,
+        gravity_scale: 1.0,
+        colliders: vec![WorldCollider {
+            offset: [0.0; 3],
+            shape: ColliderShape::Sphere { radius: 0.35 },
+        }],
+        mesh_triangles: Vec::new(),
+        mesh_local_aabb: forja3d::Aabb::EMPTY,
+        on_ground: false,
+        sleeping: false,
+    };
+    let sph_handle = world.add_body(sph_body);
+
+    for _ in 0..240 {
+        world.step(1.0 / 60.0);
+    }
+    let final_sph = world.body(sph_handle).unwrap();
+    let lateral = (final_sph.position[0] * final_sph.position[0]
+        + final_sph.position[2] * final_sph.position[2])
+        .sqrt();
+    assert!(
+        lateral > 0.65,
+        "sphere dropped dead-center on pyramid apex should tip off and roll, lateral={}, pos={:?}",
+        lateral,
+        final_sph.position
+    );
+    assert!(
+        final_sph.position[1] < 0.7,
+        "sphere should descend onto ground/lower slope, got y={}",
+        final_sph.position[1]
+    );
+}
+
+#[test]
+fn dynamic_sphere_rolls_down_dynamic_pyramid_with_spin() {
+    use forja3d_physics::{RigidBody, WorldCollider};
+
+    let mut pyramid = PartSpec::new("piramide_din", PrimitiveKind::Pyramid);
+    pyramid.position = [0.0, 0.5, 0.0];
+    pyramid.scale = [1.6, 1.2, 1.6];
+    let pyr_baked = pyramid.bake();
+    let pivot = [0.0_f32, 0.5, 0.0];
+    let mut tris = Vec::new();
+    for tri in pyr_baked.indices.chunks_exact(3) {
+        let a = pyr_baked.vertices[tri[0] as usize].position;
+        let b = pyr_baked.vertices[tri[1] as usize].position;
+        let c = pyr_baked.vertices[tri[2] as usize].position;
+        tris.push([
+            [a[0] - pivot[0], a[1] - pivot[1], a[2] - pivot[2]],
+            [b[0] - pivot[0], b[1] - pivot[1], b[2] - pivot[2]],
+            [c[0] - pivot[0], c[1] - pivot[1], c[2] - pivot[2]],
+        ]);
+    }
+
+    let mut world = PhysicsWorld::new();
+    let mut pyr_body = RigidBody::from_model(&Model::new("PiramideDin"), pivot);
+    pyr_body.colliders.clear();
+    pyr_body = pyr_body.with_mesh_triangles(tris);
+    pyr_body.body_kind = RigidBodyKind::Dynamic;
+    pyr_body.mass = 4.0;
+    pyr_body.inv_mass = 0.25;
+    pyr_body.friction = 0.7;
+    world.add_body(pyr_body);
+
+    let sph_body = RigidBody {
+        name: String::from("Esfera"),
+        body_kind: RigidBodyKind::Dynamic,
+        position: [0.18, 1.7, 0.12],
+        orientation: [0.0, 0.0, 0.0, 1.0],
+        velocity: [0.0; 3],
+        angular_velocity: [0.0; 3],
+        force_accum: [0.0; 3],
+        mass: 1.0,
+        inv_mass: 1.0,
+        friction: 0.65,
+        restitution: 0.25,
+        linear_damping: 0.02,
+        gravity_scale: 1.0,
+        colliders: vec![WorldCollider {
+            offset: [0.0; 3],
+            shape: ColliderShape::Sphere { radius: 0.3 },
+        }],
+        mesh_triangles: Vec::new(),
+        mesh_local_aabb: forja3d::Aabb::EMPTY,
+        on_ground: false,
+        sleeping: false,
+    };
+    let sph_handle = world.add_body(sph_body);
+
+    let mut max_spin = 0.0_f32;
+    for _ in 0..240 {
+        world.step(1.0 / 60.0);
+        let b = world.body(sph_handle).unwrap();
+        let w = (b.angular_velocity[0] * b.angular_velocity[0]
+            + b.angular_velocity[1] * b.angular_velocity[1]
+            + b.angular_velocity[2] * b.angular_velocity[2])
+            .sqrt();
+        if w > max_spin {
+            max_spin = w;
+        }
+    }
+    let final_sph = world.body(sph_handle).unwrap();
+    let lateral = (final_sph.position[0] * final_sph.position[0]
+        + final_sph.position[2] * final_sph.position[2])
+        .sqrt();
+    assert!(
+        lateral > 0.75 && final_sph.position[1] < 0.65,
+        "dynamic sphere should roll off dynamic pyramid instead of sticking on edge/corner, pos={:?}",
+        final_sph.position
+    );
+    assert!(
+        max_spin > 1.0,
+        "sphere should acquire rolling angular velocity via contact torque, max_spin={}",
+        max_spin
+    );
+}
+
+#[test]
+fn tilted_dynamic_cube_topples_and_settles_on_ground() {
+    use forja3d_physics::{RigidBody, WorldCollider};
+
+    let angle = 38.0_f32.to_radians();
+    let half = angle * 0.5;
+    let mut cube = RigidBody {
+        name: String::from("CuboInclinado"),
+        body_kind: RigidBodyKind::Dynamic,
+        position: [0.0, 1.0, 0.0],
+        orientation: [0.0, 0.0, half.sin(), half.cos()],
+        velocity: [0.0; 3],
+        angular_velocity: [0.0; 3],
+        force_accum: [0.0; 3],
+        mass: 1.0,
+        inv_mass: 1.0,
+        friction: 0.6,
+        restitution: 0.1,
+        linear_damping: 0.04,
+        gravity_scale: 1.0,
+        colliders: vec![WorldCollider {
+            offset: [0.0; 3],
+            shape: ColliderShape::Box {
+                half_extents: [0.5, 0.5, 0.5],
+            },
+        }],
+        mesh_triangles: Vec::new(),
+        mesh_local_aabb: forja3d::Aabb::EMPTY,
+        on_ground: false,
+        sleeping: false,
+    };
+    cube.restitution = 0.05;
+
+    let mut world = PhysicsWorld::new();
+    let handle = world.add_body(cube);
+
+    for _ in 0..240 {
+        world.step(1.0 / 60.0);
+    }
+
+    let b = world.body(handle).unwrap();
+    assert!(
+        b.position[1] >= 0.45 && b.position[1] <= 0.58,
+        "tilted cube should topple flat onto ground near y=0.5, got y={}",
+        b.position[1]
+    );
+    assert!(
+        b.on_ground,
+        "cube should settle on ground"
+    );
+}
+
+#[test]
+fn sphere_and_cube_descend_rotated_ramp_mesh() {
+    use forja3d_physics::{RigidBody, WorldCollider};
+
+    let mut ramp = PartSpec::new("rampa", PrimitiveKind::Cube);
+    ramp.position = [0.0, 1.0, 0.0];
+    ramp.rotation_deg = [0.0, 0.0, -25.0];
+    ramp.scale = [4.0, 0.25, 2.0];
+    let ramp_baked = ramp.bake();
+    let pivot = [0.0_f32, 1.0, 0.0];
+    let mut tris = Vec::new();
+    for tri in ramp_baked.indices.chunks_exact(3) {
+        let a = ramp_baked.vertices[tri[0] as usize].position;
+        let b = ramp_baked.vertices[tri[1] as usize].position;
+        let c = ramp_baked.vertices[tri[2] as usize].position;
+        tris.push([
+            [a[0] - pivot[0], a[1] - pivot[1], a[2] - pivot[2]],
+            [b[0] - pivot[0], b[1] - pivot[1], b[2] - pivot[2]],
+            [c[0] - pivot[0], c[1] - pivot[1], c[2] - pivot[2]],
+        ]);
+    }
+
+    let mut world = PhysicsWorld::new();
+    let mut ramp_body = RigidBody::from_model(&Model::new("Rampa"), pivot);
+    ramp_body.colliders.clear();
+    ramp_body = ramp_body.with_mesh_triangles(tris);
+    ramp_body.body_kind = RigidBodyKind::Static;
+    ramp_body.inv_mass = 0.0;
+    ramp_body.friction = 0.25;
+    world.add_body(ramp_body);
+
+    let sph = world.add_body(RigidBody {
+        name: String::from("EsferaRampa"),
+        body_kind: RigidBodyKind::Dynamic,
+        position: [-1.0, 2.2, -0.4],
+        orientation: [0.0, 0.0, 0.0, 1.0],
+        velocity: [0.0; 3],
+        angular_velocity: [0.0; 3],
+        force_accum: [0.0; 3],
+        mass: 1.0,
+        inv_mass: 1.0,
+        friction: 0.45,
+        restitution: 0.2,
+        linear_damping: 0.01,
+        gravity_scale: 1.0,
+        colliders: vec![WorldCollider {
+            offset: [0.0; 3],
+            shape: ColliderShape::Sphere { radius: 0.28 },
+        }],
+        mesh_triangles: Vec::new(),
+        mesh_local_aabb: forja3d::Aabb::EMPTY,
+        on_ground: false,
+        sleeping: false,
+    });
+
+    let bx = world.add_body(RigidBody {
+        name: String::from("CuboRampa"),
+        body_kind: RigidBodyKind::Dynamic,
+        position: [-1.0, 2.2, 0.45],
+        orientation: [0.0, 0.0, 0.0, 1.0],
+        velocity: [0.0; 3],
+        angular_velocity: [0.0; 3],
+        force_accum: [0.0; 3],
+        mass: 1.0,
+        inv_mass: 1.0,
+        friction: 0.15,
+        restitution: 0.05,
+        linear_damping: 0.01,
+        gravity_scale: 1.0,
+        colliders: vec![WorldCollider {
+            offset: [0.0; 3],
+            shape: ColliderShape::Box {
+                half_extents: [0.25, 0.25, 0.25],
+            },
+        }],
+        mesh_triangles: Vec::new(),
+        mesh_local_aabb: forja3d::Aabb::EMPTY,
+        on_ground: false,
+        sleeping: false,
+    });
+
+    for _ in 0..180 {
+        world.step(1.0 / 60.0);
+    }
+
+    let fs = world.body(sph).unwrap();
+    let fb = world.body(bx).unwrap();
+    assert!(
+        fs.position[0] > 0.3 && fs.position[1] < 1.3,
+        "sphere should roll down +X along ramp, got {:?}",
+        fs.position
+    );
+    assert!(
+        fb.position[0] > 0.0 && fb.position[1] < 1.5,
+        "box should slide down +X along ramp, got {:?}",
+        fb.position
+    );
+}

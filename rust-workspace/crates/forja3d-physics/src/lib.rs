@@ -1,5 +1,4 @@
 #![cfg_attr(not(feature = "std"), no_std)]
-
 extern crate alloc;
 
 use alloc::{string::String, vec, vec::Vec};
@@ -102,6 +101,7 @@ impl RigidBody {
             .filter(|c| !matches!(c.shape, ColliderShape::None))
             .map(WorldCollider::from)
             .collect();
+
         if colliders.is_empty() {
             let (offset, shape) = if fallback_bounds.is_valid() {
                 ColliderShape::fit_box(fallback_bounds)
@@ -110,11 +110,13 @@ impl RigidBody {
             };
             colliders.push(WorldCollider { offset, shape });
         }
+
         let mass = phys.mass.max(0.01);
         let inv_mass = match phys.body_kind {
             RigidBodyKind::Dynamic => 1.0 / mass,
             RigidBodyKind::Static | RigidBodyKind::Kinematic | RigidBodyKind::Sensor => 0.0,
         };
+
         Self {
             name: name.into(),
             body_kind: phys.body_kind,
@@ -155,45 +157,109 @@ impl RigidBody {
 
     pub fn world_aabb(&self) -> Aabb {
         let mut out = Aabb::EMPTY;
+        let axes = quat_axes(self.orientation);
         for c in &self.colliders {
-            let center = [
-                self.position[0] + c.offset[0],
-                self.position[1] + c.offset[1],
-                self.position[2] + c.offset[2],
-            ];
-            let aabb = collider_world_aabb(center, c.shape);
+            let center = Vec3::new(self.position[0], self.position[1], self.position[2])
+                + quat_rotate(self.orientation, Vec3::new(c.offset[0], c.offset[1], c.offset[2]));
+            let aabb = match c.shape {
+                ColliderShape::None => Aabb::EMPTY,
+                ColliderShape::Sphere { radius } => Aabb {
+                    min: [center.x - radius, center.y - radius, center.z - radius],
+                    max: [center.x + radius, center.y + radius, center.z + radius],
+                },
+                ColliderShape::Box { half_extents } => obb_world_aabb(center, axes, half_extents),
+                ColliderShape::Capsule { radius, half_height } => {
+                    let up = axes[1] * half_height;
+                    let p0 = center - up;
+                    let p1 = center + up;
+                    Aabb {
+                        min: [
+                            p0.x.min(p1.x) - radius,
+                            p0.y.min(p1.y) - radius,
+                            p0.z.min(p1.z) - radius,
+                        ],
+                        max: [
+                            p0.x.max(p1.x) + radius,
+                            p0.y.max(p1.y) + radius,
+                            p0.z.max(p1.z) + radius,
+                        ],
+                    }
+                }
+            };
             out = out.merge(aabb);
         }
         if self.mesh_local_aabb.is_valid() {
-            let mesh_aabb = Aabb {
-                min: [
-                    self.mesh_local_aabb.min[0] + self.position[0],
-                    self.mesh_local_aabb.min[1] + self.position[1],
-                    self.mesh_local_aabb.min[2] + self.position[2],
-                ],
-                max: [
-                    self.mesh_local_aabb.max[0] + self.position[0],
-                    self.mesh_local_aabb.max[1] + self.position[1],
-                    self.mesh_local_aabb.max[2] + self.position[2],
-                ],
-            };
-            out = out.merge(mesh_aabb);
+            let lc = Vec3::new(
+                (self.mesh_local_aabb.min[0] + self.mesh_local_aabb.max[0]) * 0.5,
+                (self.mesh_local_aabb.min[1] + self.mesh_local_aabb.max[1]) * 0.5,
+                (self.mesh_local_aabb.min[2] + self.mesh_local_aabb.max[2]) * 0.5,
+            );
+            let lh = [
+                (self.mesh_local_aabb.max[0] - self.mesh_local_aabb.min[0]) * 0.5,
+                (self.mesh_local_aabb.max[1] - self.mesh_local_aabb.min[1]) * 0.5,
+                (self.mesh_local_aabb.max[2] - self.mesh_local_aabb.min[2]) * 0.5,
+            ];
+            let wc = Vec3::new(self.position[0], self.position[1], self.position[2])
+                + quat_rotate(self.orientation, lc);
+            out = out.merge(obb_world_aabb(wc, axes, lh));
         }
         out
     }
 
-    fn effective_radius(&self) -> f32 {
+    fn local_inv_inertia(&self) -> Vec3 {
+        if self.body_kind != RigidBodyKind::Dynamic || self.inv_mass <= 0.0 {
+            return Vec3::ZERO;
+        }
+        let m = self.mass.max(0.01);
         for c in &self.colliders {
             match c.shape {
-                ColliderShape::Sphere { radius } => return radius.max(0.05),
-                ColliderShape::Capsule { radius, .. } => return radius.max(0.05),
+                ColliderShape::Sphere { radius } => {
+                    let r = radius.max(0.05);
+                    let inv_i = 1.0 / (0.4 * m * r * r).max(1e-4);
+                    return Vec3::new(inv_i, inv_i, inv_i);
+                }
                 ColliderShape::Box { half_extents } => {
-                    return ((half_extents[0] + half_extents[1] + half_extents[2]) / 3.0).max(0.05);
+                    let hx = half_extents[0].max(0.05);
+                    let hy = half_extents[1].max(0.05);
+                    let hz = half_extents[2].max(0.05);
+                    let ix = (m * (hy * hy + hz * hz) / 3.0).max(1e-4);
+                    let iy = (m * (hx * hx + hz * hz) / 3.0).max(1e-4);
+                    let iz = (m * (hx * hx + hy * hy) / 3.0).max(1e-4);
+                    return Vec3::new(1.0 / ix, 1.0 / iy, 1.0 / iz);
+                }
+                ColliderShape::Capsule { radius, half_height } => {
+                    let r = radius.max(0.05);
+                    let hy = (half_height + r).max(0.05);
+                    let ix = (m * (hy * hy + r * r) / 3.0).max(1e-4);
+                    let iy = (0.5 * m * r * r).max(1e-4);
+                    return Vec3::new(1.0 / ix, 1.0 / iy, 1.0 / ix);
                 }
                 ColliderShape::None => {}
             }
         }
-        0.5
+        if self.mesh_local_aabb.is_valid() {
+            let hx = ((self.mesh_local_aabb.max[0] - self.mesh_local_aabb.min[0]) * 0.5).max(0.08);
+            let hy = ((self.mesh_local_aabb.max[1] - self.mesh_local_aabb.min[1]) * 0.5).max(0.08);
+            let hz = ((self.mesh_local_aabb.max[2] - self.mesh_local_aabb.min[2]) * 0.5).max(0.08);
+            let ix = (m * (hy * hy + hz * hz) / 3.0).max(1e-4);
+            let iy = (m * (hx * hx + hz * hz) / 3.0).max(1e-4);
+            let iz = (m * (hx * hx + hy * hy) / 3.0).max(1e-4);
+            return Vec3::new(1.0 / ix, 1.0 / iy, 1.0 / iz);
+        }
+        let default_inv = 1.0 / (0.4 * m * 0.25).max(1e-4);
+        Vec3::new(default_inv, default_inv, default_inv)
+    }
+
+    fn apply_world_inv_inertia(&self, torque: Vec3) -> Vec3 {
+        let inv_i = self.local_inv_inertia();
+        if inv_i.x == 0.0 && inv_i.y == 0.0 && inv_i.z == 0.0 {
+            return Vec3::ZERO;
+        }
+        let local = quat_inv_rotate(self.orientation, torque);
+        quat_rotate(
+            self.orientation,
+            Vec3::new(local.x * inv_i.x, local.y * inv_i.y, local.z * inv_i.z),
+        )
     }
 }
 
@@ -253,13 +319,22 @@ impl PhysicsWorld {
         Some(self.add_body(body))
     }
 
+    pub fn spawn_from_f3d_bytes(
+        &mut self,
+        bytes: &[u8],
+        position: [f32; 3],
+    ) -> Result<BodyHandle, DecodeError> {
+        let model = Model::from_bytes(bytes)?;
+        Ok(self.spawn_from_model(&model, position))
+    }
+
     pub fn spawn_from_f3p_bytes(
         &mut self,
         bytes: &[u8],
         position: [f32; 3],
     ) -> Result<Option<BodyHandle>, DecodeError> {
         let pack = ForjaPack::from_bytes(bytes)?;
-        Ok(self.spawn_from_pack(&pack, position))
+        Ok(pack.model.as_ref().map(|m| self.spawn_from_model(m, position)))
     }
 
     pub fn add_static_box(
@@ -342,9 +417,9 @@ impl PhysicsWorld {
         if dt <= 1e-6 {
             return Vec::new();
         }
-        let max_substep = 1.0 / 60.0;
+        let max_substep = 1.0 / 90.0;
         let substeps = ((dt / max_substep) + 0.9999) as usize;
-        let substeps = substeps.clamp(1, 6);
+        let substeps = substeps.clamp(1, 8);
         let sub_dt = dt / substeps as f32;
         let mut events = Vec::new();
         for s in 0..substeps {
@@ -358,13 +433,14 @@ impl PhysicsWorld {
 
     fn step_substep(&mut self, dt: f32) -> Vec<CollisionEvent> {
         let mut events = Vec::new();
-        // 1. Integrate forces, linear & angular velocities
+
+        // 1. Integrate forces, linear & angular velocities, and positions
         for body in &mut self.bodies {
             body.on_ground = false;
             match body.body_kind {
                 RigidBodyKind::Dynamic => {
                     let damp = (1.0 - body.linear_damping * dt).clamp(0.0, 1.0);
-                    let ang_damp = (1.0 - 0.6 * dt).clamp(0.0, 1.0);
+                    let ang_damp = (1.0 - 0.12 * dt).clamp(0.0, 1.0);
                     for axis in 0..3 {
                         let accel = self.gravity[axis] * body.gravity_scale
                             + body.force_accum[axis] * body.inv_mass;
@@ -387,182 +463,242 @@ impl PhysicsWorld {
             }
         }
 
-        // 2. Ground plane collision at y = ground_y
+        // 2. Collect contacts (ground + body-vs-body)
+        let mut contacts: Vec<Contact> = Vec::new();
         if let Some(gy) = self.ground_y {
-            for body in &mut self.bodies {
+            for (idx, body) in self.bodies.iter().enumerate() {
                 if body.body_kind != RigidBodyKind::Dynamic {
                     continue;
                 }
-                let mut deepest = 0.0_f32;
-                for c in &body.colliders {
-                    let cy = body.position[1] + c.offset[1];
-                    let bottom = collider_bottom_y(cy, c.shape);
-                    let pen = gy - bottom;
-                    if pen > deepest {
-                        deepest = pen;
-                    }
-                }
-                if body.colliders.is_empty() && body.mesh_local_aabb.is_valid() {
-                    let pen = gy - (body.position[1] + body.mesh_local_aabb.min[1]);
-                    if pen > deepest {
-                        deepest = pen;
-                    }
-                }
-                if deepest > 0.0 {
-                    body.position[1] += deepest;
-                    body.on_ground = true;
-                    let vn = body.velocity[1];
-                    if vn < 0.0 {
-                        let e = if vn.abs() < 0.45 {
-                            0.0
-                        } else {
-                            body.restitution.max(self.ground_restitution)
-                        };
-                        let j_n = -(1.0 + e) * vn;
-                        body.velocity[1] += j_n;
-                        // Rolling + Coulomb friction on ground
-                        let mu = sqrtf((body.friction * self.ground_friction).max(0.0));
-                        let vt_sq = body.velocity[0] * body.velocity[0]
-                            + body.velocity[2] * body.velocity[2];
-                        let vt = sqrtf(vt_sq);
-                        if vt > 1e-5 {
-                            let max_fric = j_n * mu;
-                            let scale = ((vt - max_fric * 0.25).max(0.0)) / vt;
-                            body.velocity[0] *= scale;
-                            body.velocity[2] *= scale;
-                        }
-                    }
-                    let r_eff = body.effective_radius();
-                    body.angular_velocity[0] = body.velocity[2] / r_eff;
-                    body.angular_velocity[2] = -body.velocity[0] / r_eff;
-                }
+                collect_ground_contacts(idx, body, gy, &mut contacts);
             }
         }
 
-        // 3. Pairwise body-vs-body collision detection & impulse response
         let n = self.bodies.len();
+        let mut pair_hits: Vec<Contact> = Vec::new();
         for i in 0..n {
             for j in (i + 1)..n {
                 let kind_a = self.bodies[i].body_kind;
                 let kind_b = self.bodies[j].body_kind;
                 let inv_a = self.bodies[i].inv_mass;
                 let inv_b = self.bodies[j].inv_mass;
-                if inv_a == 0.0 && inv_b == 0.0 && kind_a != RigidBodyKind::Sensor && kind_b != RigidBodyKind::Sensor {
+                if inv_a == 0.0
+                    && inv_b == 0.0
+                    && kind_a != RigidBodyKind::Sensor
+                    && kind_b != RigidBodyKind::Sensor
+                {
                     continue;
                 }
                 if !aabb_overlaps(self.bodies[i].world_aabb(), self.bodies[j].world_aabb()) {
                     continue;
                 }
-
-                let best_hit = collide_bodies(&self.bodies[i], &self.bodies[j]);
-                let Some((normal, pen)) = best_hit else {
+                pair_hits.clear();
+                collect_body_pair_contacts(&self.bodies[i], &self.bodies[j], &mut pair_hits);
+                if pair_hits.is_empty() {
                     continue;
-                };
+                }
+                let deepest = pair_hits
+                    .iter()
+                    .max_by(|a, b| a.penetration.total_cmp(&b.penetration))
+                    .unwrap();
                 events.push(CollisionEvent {
                     body_a: BodyHandle(i),
                     body_b: BodyHandle(j),
-                    normal,
-                    penetration: pen,
+                    normal: deepest.normal.to_array(),
+                    penetration: deepest.penetration,
                 });
                 if kind_a == RigidBodyKind::Sensor || kind_b == RigidBodyKind::Sensor {
                     continue;
                 }
-                let total_inv = inv_a + inv_b;
-                if total_inv <= 1e-8 {
-                    continue;
+                for mut c in pair_hits.drain(..) {
+                    c.body_a = Some(i);
+                    c.body_b = j;
+                    contacts.push(c);
                 }
+            }
+        }
 
-                // Positional separation
-                let slop = 0.001;
-                let percent = 0.85;
-                let corr = ((pen - slop).max(0.0) / total_inv) * percent;
-                for axis in 0..3 {
-                    self.bodies[i].position[axis] -= normal[axis] * corr * inv_a;
-                    self.bodies[j].position[axis] += normal[axis] * corr * inv_b;
+        // Mark grounded bodies
+        for c in &contacts {
+            if c.normal.y > 0.55 {
+                if self.bodies[c.body_b].body_kind == RigidBodyKind::Dynamic {
+                    self.bodies[c.body_b].on_ground = true;
                 }
-                if normal[1] > 0.55 && kind_b == RigidBodyKind::Dynamic {
-                    self.bodies[j].on_ground = true;
-                }
-                if normal[1] < -0.55 && kind_a == RigidBodyKind::Dynamic {
-                    self.bodies[i].on_ground = true;
-                }
-
-                let rv = [
-                    self.bodies[j].velocity[0] - self.bodies[i].velocity[0],
-                    self.bodies[j].velocity[1] - self.bodies[i].velocity[1],
-                    self.bodies[j].velocity[2] - self.bodies[i].velocity[2],
-                ];
-                let vel_along_normal = rv[0] * normal[0] + rv[1] * normal[1] + rv[2] * normal[2];
-                if vel_along_normal > 0.0 {
-                    continue;
-                }
-                let rest_a = self.bodies[i].restitution;
-                let rest_b = self.bodies[j].restitution;
-                let e = if vel_along_normal.abs() < 0.35 {
-                    0.0
-                } else {
-                    rest_a.max(rest_b) * 0.85
-                };
-                let j_impulse = -(1.0 + e) * vel_along_normal / total_inv;
-                for axis in 0..3 {
-                    let imp = j_impulse * normal[axis];
-                    self.bodies[i].velocity[axis] -= imp * inv_a;
-                    self.bodies[j].velocity[axis] += imp * inv_b;
-                }
-
-                // Tangential friction + rolling spin along contact surface
-                let rv2 = [
-                    self.bodies[j].velocity[0] - self.bodies[i].velocity[0],
-                    self.bodies[j].velocity[1] - self.bodies[i].velocity[1],
-                    self.bodies[j].velocity[2] - self.bodies[i].velocity[2],
-                ];
-                let vn2 = rv2[0] * normal[0] + rv2[1] * normal[1] + rv2[2] * normal[2];
-                let tangent = [
-                    rv2[0] - vn2 * normal[0],
-                    rv2[1] - vn2 * normal[1],
-                    rv2[2] - vn2 * normal[2],
-                ];
-                let t_len = sqrtf(
-                    tangent[0] * tangent[0]
-                        + tangent[1] * tangent[1]
-                        + tangent[2] * tangent[2],
-                );
-                if t_len > 1e-5 {
-                    let t_dir = [tangent[0] / t_len, tangent[1] / t_len, tangent[2] / t_len];
-                    let mu = sqrtf((self.bodies[i].friction * self.bodies[j].friction).max(0.0)) * 0.45;
-                    let jt_raw = -(rv2[0] * t_dir[0] + rv2[1] * t_dir[1] + rv2[2] * t_dir[2]) / total_inv;
-                    let jt = jt_raw.clamp(-j_impulse * mu, j_impulse * mu);
-                    for axis in 0..3 {
-                        let f_imp = jt * t_dir[axis];
-                        self.bodies[i].velocity[axis] -= f_imp * inv_a;
-                        self.bodies[j].velocity[axis] += f_imp * inv_b;
-                    }
-                    // Apply rolling angular velocity w = cross(n, v_t) / r
-                    if kind_b == RigidBodyKind::Dynamic {
-                        let r = self.bodies[j].effective_radius();
-                        let n_v = Vec3::new(normal[0], normal[1], normal[2]);
-                        let vt_v = Vec3::new(tangent[0], tangent[1], tangent[2]);
-                        let w_roll = n_v.cross(vt_v) * (1.0 / r);
-                        self.bodies[j].angular_velocity = [
-                            w_roll.x * 0.65 + self.bodies[j].angular_velocity[0] * 0.35,
-                            w_roll.y * 0.65 + self.bodies[j].angular_velocity[1] * 0.35,
-                            w_roll.z * 0.65 + self.bodies[j].angular_velocity[2] * 0.35,
-                        ];
-                    }
-                    if kind_a == RigidBodyKind::Dynamic {
-                        let r = self.bodies[i].effective_radius();
-                        let n_v = Vec3::new(-normal[0], -normal[1], -normal[2]);
-                        let vt_v = Vec3::new(-tangent[0], -tangent[1], -tangent[2]);
-                        let w_roll = n_v.cross(vt_v) * (1.0 / r);
-                        self.bodies[i].angular_velocity = [
-                            w_roll.x * 0.65 + self.bodies[i].angular_velocity[0] * 0.35,
-                            w_roll.y * 0.65 + self.bodies[i].angular_velocity[1] * 0.35,
-                            w_roll.z * 0.65 + self.bodies[i].angular_velocity[2] * 0.35,
-                        ];
+            } else if c.normal.y < -0.55 {
+                if let Some(a_idx) = c.body_a {
+                    if self.bodies[a_idx].body_kind == RigidBodyKind::Dynamic {
+                        self.bodies[a_idx].on_ground = true;
                     }
                 }
             }
         }
+
+        // 3. Sequential impulse solver (velocity + angular torque + contact-point friction)
+        let num_contacts = contacts.len();
+        let mut acc_jn = vec![0.0_f32; num_contacts];
+        let mut init_vn = vec![0.0_f32; num_contacts];
+        for (ci, c) in contacts.iter().enumerate() {
+            let vb = contact_point_velocity(&self.bodies[c.body_b], c.point);
+            let va = match c.body_a {
+                Some(ai) => contact_point_velocity(&self.bodies[ai], c.point),
+                None => Vec3::ZERO,
+            };
+            init_vn[ci] = (vb - va).dot(c.normal);
+        }
+
+        const VEL_ITERS: usize = 6;
+        for iter in 0..VEL_ITERS {
+            for (ci, c) in contacts.iter().enumerate() {
+                let b_idx = c.body_b;
+                let a_opt = c.body_a;
+
+                let pb = Vec3::new(
+                    self.bodies[b_idx].position[0],
+                    self.bodies[b_idx].position[1],
+                    self.bodies[b_idx].position[2],
+                );
+                let rb = c.point - pb;
+                let inv_mb = self.bodies[b_idx].inv_mass;
+
+                let (pa, ra, inv_ma) = match a_opt {
+                    Some(ai) => {
+                        let p = Vec3::new(
+                            self.bodies[ai].position[0],
+                            self.bodies[ai].position[1],
+                            self.bodies[ai].position[2],
+                        );
+                        (p, c.point - p, self.bodies[ai].inv_mass)
+                    }
+                    None => (Vec3::ZERO, Vec3::ZERO, 0.0),
+                };
+                let _ = pa;
+
+                if inv_ma + inv_mb <= 1e-8 {
+                    continue;
+                }
+
+                // Relative velocity at contact point
+                let vb = contact_point_velocity(&self.bodies[b_idx], c.point);
+                let va = match a_opt {
+                    Some(ai) => contact_point_velocity(&self.bodies[ai], c.point),
+                    None => Vec3::ZERO,
+                };
+                let rel_v = vb - va;
+                let vn = rel_v.dot(c.normal);
+
+                let (rest_a, fric_a) = match a_opt {
+                    Some(ai) => (self.bodies[ai].restitution, self.bodies[ai].friction),
+                    None => (self.ground_restitution, self.ground_friction),
+                };
+                let rest_b = self.bodies[b_idx].restitution;
+                let fric_b = self.bodies[b_idx].friction;
+                let e = if iter == 0 && init_vn[ci] < -0.45 {
+                    rest_a.max(rest_b)
+                } else {
+                    0.0
+                };
+                let target_vn = if iter == 0 && init_vn[ci] < -0.45 {
+                    -e * init_vn[ci]
+                } else {
+                    0.0
+                };
+
+                let r_a_cross_n = ra.cross(c.normal);
+                let r_b_cross_n = rb.cross(c.normal);
+                let ang_a = match a_opt {
+                    Some(ai) => self.bodies[ai].apply_world_inv_inertia(r_a_cross_n).cross(ra),
+                    None => Vec3::ZERO,
+                };
+                let ang_b = self.bodies[b_idx].apply_world_inv_inertia(r_b_cross_n).cross(rb);
+                let eff_mass_n = inv_ma + inv_mb + (ang_a + ang_b).dot(c.normal);
+                if eff_mass_n <= 1e-8 {
+                    continue;
+                }
+
+                let raw_jn = (target_vn - vn) / eff_mass_n;
+                let old_jn = acc_jn[ci];
+                let new_jn = (old_jn + raw_jn).max(0.0);
+                let d_jn = new_jn - old_jn;
+                acc_jn[ci] = new_jn;
+
+                if d_jn.abs() > 1e-7 {
+                    let imp = c.normal * d_jn;
+                    apply_impulse_at_point(&mut self.bodies, a_opt, b_idx, ra, rb, imp);
+                }
+
+                // Recompute contact velocity for tangential friction at contact point
+                let vb2 = contact_point_velocity(&self.bodies[b_idx], c.point);
+                let va2 = match a_opt {
+                    Some(ai) => contact_point_velocity(&self.bodies[ai], c.point),
+                    None => Vec3::ZERO,
+                };
+                let rel_v2 = vb2 - va2;
+                let vn2 = rel_v2.dot(c.normal);
+                let vt = rel_v2 - c.normal * vn2;
+                let vt_len = vt.length();
+                if vt_len > 1e-5 && acc_jn[ci] > 0.0 {
+                    let t_dir = vt * (1.0 / vt_len);
+                    let r_a_cross_t = ra.cross(t_dir);
+                    let r_b_cross_t = rb.cross(t_dir);
+                    let ang_ta = match a_opt {
+                        Some(ai) => self.bodies[ai].apply_world_inv_inertia(r_a_cross_t).cross(ra),
+                        None => Vec3::ZERO,
+                    };
+                    let ang_tb = self.bodies[b_idx].apply_world_inv_inertia(r_b_cross_t).cross(rb);
+                    let eff_mass_t = inv_ma + inv_mb + (ang_ta + ang_tb).dot(t_dir);
+                    if eff_mass_t > 1e-8 {
+                        let mu = sqrtf((fric_a * fric_b).max(0.0));
+                        let max_f = acc_jn[ci] * mu;
+                        let jt = (-vt_len / eff_mass_t).clamp(-max_f, max_f);
+                        let f_imp = t_dir * jt;
+                        apply_impulse_at_point(&mut self.bodies, a_opt, b_idx, ra, rb, f_imp);
+                    }
+                }
+            }
+        }
+
+        // Gentle rolling resistance for contacting dynamic bodies so rolling settles naturally
+        for c in &contacts {
+            let decay = (1.0 - 0.15 * dt).clamp(0.0, 1.0);
+            if self.bodies[c.body_b].body_kind == RigidBodyKind::Dynamic {
+                for axis in 0..3 {
+                    self.bodies[c.body_b].angular_velocity[axis] *= decay;
+                }
+            }
+            if let Some(ai) = c.body_a {
+                if self.bodies[ai].body_kind == RigidBodyKind::Dynamic {
+                    for axis in 0..3 {
+                        self.bodies[ai].angular_velocity[axis] *= decay;
+                    }
+                }
+            }
+        }
+
+        // 4. Positional penetration projection
+        const POS_ITERS: usize = 2;
+        let slop = 0.0015_f32;
+        let percent = 0.55_f32;
+        for _ in 0..POS_ITERS {
+            for c in &contacts {
+                let inv_mb = self.bodies[c.body_b].inv_mass;
+                let inv_ma = c.body_a.map_or(0.0, |ai| self.bodies[ai].inv_mass);
+                let total_inv = inv_ma + inv_mb;
+                if total_inv <= 1e-8 {
+                    continue;
+                }
+                let corr = ((c.penetration - slop).max(0.0) / total_inv) * percent / (POS_ITERS as f32);
+                let move_vec = c.normal * corr;
+                if let Some(ai) = c.body_a {
+                    for axis in 0..3 {
+                        self.bodies[ai].position[axis] -= move_vec.to_array()[axis] * inv_ma;
+                    }
+                }
+                for axis in 0..3 {
+                    self.bodies[c.body_b].position[axis] += move_vec.to_array()[axis] * inv_mb;
+                }
+            }
+        }
+
         events
     }
 
@@ -571,6 +707,7 @@ impl PhysicsWorld {
             return Vec::new();
         };
         let mut hits = Vec::new();
+        let mut scratch = Vec::new();
         for (idx, other) in self.bodies.iter().enumerate() {
             if idx == sensor.0 {
                 continue;
@@ -578,7 +715,9 @@ impl PhysicsWorld {
             if !aabb_overlaps(sb.world_aabb(), other.world_aabb()) {
                 continue;
             }
-            if collide_bodies(sb, other).is_some() {
+            scratch.clear();
+            collect_body_pair_contacts(sb, other, &mut scratch);
+            if !scratch.is_empty() {
                 hits.push(BodyHandle(idx));
             }
         }
@@ -589,13 +728,29 @@ impl PhysicsWorld {
         let dir_n = Vec3::new(dir[0], dir[1], dir[2]).normalized().to_array();
         let mut best: Option<RaycastHit> = None;
         for (idx, body) in self.bodies.iter().enumerate() {
+            let bpos = Vec3::new(body.position[0], body.position[1], body.position[2]);
             if !body.mesh_triangles.is_empty() {
+                let local_orig = quat_inv_rotate(
+                    body.orientation,
+                    Vec3::new(origin[0], origin[1], origin[2]) - bpos,
+                )
+                .to_array();
+                let local_dir = quat_inv_rotate(
+                    body.orientation,
+                    Vec3::new(dir_n[0], dir_n[1], dir_n[2]),
+                )
+                .to_array();
                 for tri in &body.mesh_triangles {
-                    let a = [tri[0][0] + body.position[0], tri[0][1] + body.position[1], tri[0][2] + body.position[2]];
-                    let b = [tri[1][0] + body.position[0], tri[1][1] + body.position[1], tri[1][2] + body.position[2]];
-                    let c = [tri[2][0] + body.position[0], tri[2][1] + body.position[1], tri[2][2] + body.position[2]];
-                    if let Some((dist, normal)) = ray_triangle(origin, dir_n, a, b, c, max_dist) {
+                    if let Some((dist, n_local)) =
+                        ray_triangle(local_orig, local_dir, tri[0], tri[1], tri[2], max_dist)
+                    {
                         if best.map_or(true, |prev| dist < prev.distance) {
+                            let n_world = quat_rotate(
+                                body.orientation,
+                                Vec3::new(n_local[0], n_local[1], n_local[2]),
+                            )
+                            .normalized()
+                            .to_array();
                             best = Some(RaycastHit {
                                 body: BodyHandle(idx),
                                 distance: dist,
@@ -604,34 +759,62 @@ impl PhysicsWorld {
                                     origin[1] + dir_n[1] * dist,
                                     origin[2] + dir_n[2] * dist,
                                 ],
-                                normal,
+                                normal: n_world,
                             });
                         }
                     }
                 }
                 continue;
             }
+
             for c in &body.colliders {
-                let center = [
-                    body.position[0] + c.offset[0],
-                    body.position[1] + c.offset[1],
-                    body.position[2] + c.offset[2],
-                ];
+                let center = bpos
+                    + quat_rotate(body.orientation, Vec3::new(c.offset[0], c.offset[1], c.offset[2]));
                 let hit = match c.shape {
                     ColliderShape::None => None,
                     ColliderShape::Box { half_extents } => {
-                        ray_box(origin, dir_n, center, half_extents, max_dist)
+                        let local_orig = quat_inv_rotate(
+                            body.orientation,
+                            Vec3::new(origin[0], origin[1], origin[2]) - center,
+                        )
+                        .to_array();
+                        let local_dir = quat_inv_rotate(
+                            body.orientation,
+                            Vec3::new(dir_n[0], dir_n[1], dir_n[2]),
+                        )
+                        .to_array();
+                        ray_box(local_orig, local_dir, [0.0; 3], half_extents, max_dist).map(
+                            |(dist, n_loc)| {
+                                let nw = quat_rotate(
+                                    body.orientation,
+                                    Vec3::new(n_loc[0], n_loc[1], n_loc[2]),
+                                )
+                                .normalized()
+                                .to_array();
+                                (dist, nw)
+                            },
+                        )
                     }
                     ColliderShape::Sphere { radius } => {
-                        ray_sphere(origin, dir_n, center, radius, max_dist)
+                        ray_sphere(origin, dir_n, center.to_array(), radius, max_dist)
                     }
                     ColliderShape::Capsule { radius, half_height } => {
-                        let aabb_h = [radius, half_height + radius, radius];
-                        ray_box(origin, dir_n, center, aabb_h, max_dist)
+                        let up = quat_rotate(body.orientation, Vec3::new(0.0, half_height, 0.0));
+                        let mut cap_best: Option<(f32, [f32; 3])> = None;
+                        for end in [center - up, center, center + up] {
+                            if let Some(h) =
+                                ray_sphere(origin, dir_n, end.to_array(), radius, max_dist)
+                            {
+                                if cap_best.map_or(true, |p| h.0 < p.0) {
+                                    cap_best = Some(h);
+                                }
+                            }
+                        }
+                        cap_best
                     }
                 };
                 if let Some((dist, normal)) = hit {
-                    if best.map_or(true, |b| dist < b.distance) {
+                    if best.map_or(true, |prev| dist < prev.distance) {
                         best = Some(RaycastHit {
                             body: BodyHandle(idx),
                             distance: dist,
@@ -650,141 +833,505 @@ impl PhysicsWorld {
     }
 }
 
-fn integrate_quat(q: [f32; 4], w: [f32; 3], dt: f32) -> [f32; 4] {
-    let w_sq = w[0] * w[0] + w[1] * w[1] + w[2] * w[2];
-    if w_sq < 1e-8 {
-        return q;
-    }
-    let half_dt = 0.5 * dt;
-    let dx = (w[0] * q[3] + w[1] * q[2] - w[2] * q[1]) * half_dt;
-    let dy = (-w[0] * q[2] + w[1] * q[3] + w[2] * q[0]) * half_dt;
-    let dz = (w[0] * q[1] - w[1] * q[0] + w[2] * q[3]) * half_dt;
-    let dw = (-w[0] * q[0] - w[1] * q[1] - w[2] * q[2]) * half_dt;
-    let nx = q[0] + dx;
-    let ny = q[1] + dy;
-    let nz = q[2] + dz;
-    let nw = q[3] + dw;
-    let len = sqrtf(nx * nx + ny * ny + nz * nz + nw * nw).max(1e-6);
-    [nx / len, ny / len, nz / len, nw / len]
+#[derive(Debug, Clone, Copy)]
+struct Contact {
+    body_a: Option<usize>,
+    body_b: usize,
+    point: Vec3,
+    normal: Vec3,
+    penetration: f32,
 }
 
-fn collide_bodies(a: &RigidBody, b: &RigidBody) -> Option<([f32; 3], f32)> {
-    // Mesh-vs-shape collisions (returns normal pointing from A to B)
-    if !a.mesh_triangles.is_empty() && !b.colliders.is_empty() && b.mesh_triangles.is_empty() {
-        return collide_mesh_vs_body(a, b);
-    }
-    if !b.mesh_triangles.is_empty() && !a.colliders.is_empty() && a.mesh_triangles.is_empty() {
-        return collide_mesh_vs_body(b, a).map(|(n, p)| ([-n[0], -n[1], -n[2]], p));
-    }
+fn contact_point_velocity(body: &RigidBody, world_point: Vec3) -> Vec3 {
+    let p = Vec3::new(body.position[0], body.position[1], body.position[2]);
+    let v = Vec3::new(body.velocity[0], body.velocity[1], body.velocity[2]);
+    let w = Vec3::new(
+        body.angular_velocity[0],
+        body.angular_velocity[1],
+        body.angular_velocity[2],
+    );
+    v + w.cross(world_point - p)
+}
 
-    let mut best_hit: Option<([f32; 3], f32)> = None;
-    for ca in &a.colliders {
-        let pa = [
-            a.position[0] + ca.offset[0],
-            a.position[1] + ca.offset[1],
-            a.position[2] + ca.offset[2],
-        ];
-        for cb in &b.colliders {
-            let pb = [
-                b.position[0] + cb.offset[0],
-                b.position[1] + cb.offset[1],
-                b.position[2] + cb.offset[2],
-            ];
-            if let Some((normal, pen)) = collide_shapes(pa, ca.shape, pb, cb.shape) {
-                if best_hit.map_or(true, |(_, prev_p)| pen > prev_p) {
-                    best_hit = Some((normal, pen));
-                }
+fn apply_impulse_at_point(
+    bodies: &mut [RigidBody],
+    a_opt: Option<usize>,
+    b_idx: usize,
+    ra: Vec3,
+    rb: Vec3,
+    impulse: Vec3,
+) {
+    if let Some(ai) = a_opt {
+        let inv_ma = bodies[ai].inv_mass;
+        if inv_ma > 0.0 {
+            let arr = impulse.to_array();
+            for axis in 0..3 {
+                bodies[ai].velocity[axis] -= arr[axis] * inv_ma;
             }
+            let dw = bodies[ai].apply_world_inv_inertia(ra.cross(impulse * -1.0));
+            bodies[ai].angular_velocity[0] += dw.x;
+            bodies[ai].angular_velocity[1] += dw.y;
+            bodies[ai].angular_velocity[2] += dw.z;
         }
     }
-    if best_hit.is_some() {
-        return best_hit;
-    }
-
-    // Fallback: two mesh-triangle bodies (use bounding shapes / mesh AABBs)
-    if !a.mesh_triangles.is_empty() && !b.mesh_triangles.is_empty() {
-        let aa = a.world_aabb();
-        let ab = b.world_aabb();
-        if aa.is_valid() && ab.is_valid() {
-            let (ca, sa) = ColliderShape::fit_box(aa);
-            let (cb, sb) = ColliderShape::fit_box(ab);
-            return collide_shapes(ca, sa, cb, sb);
+    let inv_mb = bodies[b_idx].inv_mass;
+    if inv_mb > 0.0 {
+        let arr = impulse.to_array();
+        for axis in 0..3 {
+            bodies[b_idx].velocity[axis] += arr[axis] * inv_mb;
         }
+        let dw = bodies[b_idx].apply_world_inv_inertia(rb.cross(impulse));
+        bodies[b_idx].angular_velocity[0] += dw.x;
+        bodies[b_idx].angular_velocity[1] += dw.y;
+        bodies[b_idx].angular_velocity[2] += dw.z;
     }
-    None
 }
 
-fn collide_mesh_vs_body(mesh_body: &RigidBody, shape_body: &RigidBody) -> Option<([f32; 3], f32)> {
-    let mut best: Option<([f32; 3], f32)> = None;
-    let mpos = mesh_body.position;
-    for c in &shape_body.colliders {
-        let pc = [
-            shape_body.position[0] + c.offset[0],
-            shape_body.position[1] + c.offset[1],
-            shape_body.position[2] + c.offset[2],
-        ];
-        match c.shape {
-            ColliderShape::Sphere { radius } => {
-                if let Some(hit) = collide_mesh_vs_sphere(&mesh_body.mesh_triangles, mpos, pc, radius) {
-                    if best.map_or(true, |(_, p)| hit.1 > p) {
-                        best = Some(hit);
+fn quat_normalize(q: [f32; 4]) -> [f32; 4] {
+    let len = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    if len > 1e-6 {
+        [q[0] / len, q[1] / len, q[2] / len, q[3] / len]
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    }
+}
+
+fn integrate_quat(q: [f32; 4], w: [f32; 3], dt: f32) -> [f32; 4] {
+    let half_dt = 0.5 * dt;
+    let dq = [
+        half_dt * (w[0] * q[3] + w[1] * q[2] - w[2] * q[1]),
+        half_dt * (w[1] * q[3] + w[2] * q[0] - w[0] * q[2]),
+        half_dt * (w[2] * q[3] + w[0] * q[1] - w[1] * q[0]),
+        half_dt * (-w[0] * q[0] - w[1] * q[1] - w[2] * q[2]),
+    ];
+    quat_normalize([
+        q[0] + dq[0],
+        q[1] + dq[1],
+        q[2] + dq[2],
+        q[3] + dq[3],
+    ])
+}
+
+fn quat_rotate(q: [f32; 4], v: Vec3) -> Vec3 {
+    let qv = Vec3::new(q[0], q[1], q[2]);
+    let t = qv.cross(v) * 2.0;
+    v + t * q[3] + qv.cross(t)
+}
+
+fn quat_inv_rotate(q: [f32; 4], v: Vec3) -> Vec3 {
+    let qv = Vec3::new(-q[0], -q[1], -q[2]);
+    let t = qv.cross(v) * 2.0;
+    v + t * q[3] + qv.cross(t)
+}
+
+fn quat_axes(q: [f32; 4]) -> [Vec3; 3] {
+    [
+        quat_rotate(q, Vec3::new(1.0, 0.0, 0.0)),
+        quat_rotate(q, Vec3::new(0.0, 1.0, 0.0)),
+        quat_rotate(q, Vec3::new(0.0, 0.0, 1.0)),
+    ]
+}
+
+fn obb_world_aabb(center: Vec3, axes: [Vec3; 3], h: [f32; 3]) -> Aabb {
+    let rx = axes[0].x.abs() * h[0] + axes[1].x.abs() * h[1] + axes[2].x.abs() * h[2];
+    let ry = axes[0].y.abs() * h[0] + axes[1].y.abs() * h[1] + axes[2].y.abs() * h[2];
+    let rz = axes[0].z.abs() * h[0] + axes[1].z.abs() * h[1] + axes[2].z.abs() * h[2];
+    Aabb {
+        min: [center.x - rx, center.y - ry, center.z - rz],
+        max: [center.x + rx, center.y + ry, center.z + rz],
+    }
+}
+
+fn collect_ground_contacts(body_idx: usize, body: &RigidBody, gy: f32, out: &mut Vec<Contact>) {
+    let pos = Vec3::new(body.position[0], body.position[1], body.position[2]);
+    let up_n = Vec3::new(0.0, 1.0, 0.0);
+
+    if !body.mesh_triangles.is_empty() && body.colliders.is_empty() {
+        let mut pts: Vec<(Vec3, f32)> = Vec::new();
+        let stride = (body.mesh_triangles.len() / 256).max(1);
+        for tri in body.mesh_triangles.iter().step_by(stride) {
+            for v in tri {
+                let w = pos + quat_rotate(body.orientation, Vec3::new(v[0], v[1], v[2]));
+                let pen = gy - w.y;
+                if pen > 0.0 {
+                    let dup = pts.iter().any(|(prev, _)| {
+                        let d = *prev - w;
+                        d.dot(d) < 1e-4
+                    });
+                    if !dup {
+                        pts.push((w, pen));
                     }
                 }
             }
+        }
+        pts.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (pt, pen) in pts.into_iter().take(8) {
+            out.push(Contact {
+                body_a: None,
+                body_b: body_idx,
+                point: Vec3::new(pt.x, gy, pt.z),
+                normal: up_n,
+                penetration: pen,
+            });
+        }
+        return;
+    }
+
+    for c in &body.colliders {
+        let cw = pos + quat_rotate(body.orientation, Vec3::new(c.offset[0], c.offset[1], c.offset[2]));
+        match c.shape {
+            ColliderShape::None => {}
+            ColliderShape::Sphere { radius } => {
+                let pen = gy - (cw.y - radius);
+                if pen > 0.0 {
+                    out.push(Contact {
+                        body_a: None,
+                        body_b: body_idx,
+                        point: Vec3::new(cw.x, gy, cw.z),
+                        normal: up_n,
+                        penetration: pen,
+                    });
+                }
+            }
             ColliderShape::Capsule { radius, half_height } => {
-                for dy in [-half_height, 0.0, half_height] {
-                    let pt = [pc[0], pc[1] + dy, pc[2]];
-                    if let Some(hit) = collide_mesh_vs_sphere(&mesh_body.mesh_triangles, mpos, pt, radius) {
-                        if best.map_or(true, |(_, p)| hit.1 > p) {
-                            best = Some(hit);
-                        }
+                let up = quat_rotate(body.orientation, Vec3::new(0.0, half_height, 0.0));
+                for end in [cw - up, cw + up] {
+                    let pen = gy - (end.y - radius);
+                    if pen > 0.0 {
+                        out.push(Contact {
+                            body_a: None,
+                            body_b: body_idx,
+                            point: Vec3::new(end.x, gy, end.z),
+                            normal: up_n,
+                            penetration: pen,
+                        });
                     }
                 }
             }
             ColliderShape::Box { half_extents } => {
-                let r = half_extents[0].min(half_extents[1]).min(half_extents[2]).max(0.05);
-                let sx = (half_extents[0] - r).max(0.0);
-                let sy = (half_extents[1] - r).max(0.0);
-                let sz = (half_extents[2] - r).max(0.0);
-                for &dx in &[-sx, sx] {
-                    for &dy in &[-sy, sy] {
-                        for &dz in &[-sz, sz] {
-                            let pt = [pc[0] + dx, pc[1] + dy, pc[2] + dz];
-                            if let Some(hit) = collide_mesh_vs_sphere(&mesh_body.mesh_triangles, mpos, pt, r) {
-                                if best.map_or(true, |(_, p)| hit.1 > p) {
-                                    best = Some(hit);
-                                }
+                for &sx in &[-half_extents[0], half_extents[0]] {
+                    for &sy in &[-half_extents[1], half_extents[1]] {
+                        for &sz in &[-half_extents[2], half_extents[2]] {
+                            let corner = cw
+                                + quat_rotate(body.orientation, Vec3::new(sx, sy, sz));
+                            let pen = gy - corner.y;
+                            if pen > 0.0 {
+                                out.push(Contact {
+                                    body_a: None,
+                                    body_b: body_idx,
+                                    point: Vec3::new(corner.x, gy, corner.z),
+                                    normal: up_n,
+                                    penetration: pen,
+                                });
                             }
                         }
                     }
                 }
-                if best.is_none() {
-                    if let Some(hit) = collide_mesh_vs_sphere(&mesh_body.mesh_triangles, mpos, pc, r) {
-                        best = Some(hit);
+            }
+        }
+    }
+}
+
+fn collect_body_pair_contacts(a: &RigidBody, b: &RigidBody, out: &mut Vec<Contact>) {
+    if !a.mesh_triangles.is_empty() && !b.colliders.is_empty() && b.mesh_triangles.is_empty() {
+        collect_mesh_vs_body_contacts(a, b, false, out);
+        return;
+    }
+    if !b.mesh_triangles.is_empty() && !a.colliders.is_empty() && a.mesh_triangles.is_empty() {
+        collect_mesh_vs_body_contacts(b, a, true, out);
+        return;
+    }
+    if !a.mesh_triangles.is_empty() && !b.mesh_triangles.is_empty() {
+        collect_mesh_vs_mesh_contacts(a, b, out);
+        return;
+    }
+
+    let pa_base = Vec3::new(a.position[0], a.position[1], a.position[2]);
+    let pb_base = Vec3::new(b.position[0], b.position[1], b.position[2]);
+    for ca in &a.colliders {
+        let pa = pa_base + quat_rotate(a.orientation, Vec3::new(ca.offset[0], ca.offset[1], ca.offset[2]));
+        for cb in &b.colliders {
+            let pb = pb_base
+                + quat_rotate(b.orientation, Vec3::new(cb.offset[0], cb.offset[1], cb.offset[2]));
+            collect_shape_pair_contacts(pa, a.orientation, ca.shape, pb, b.orientation, cb.shape, out);
+        }
+    }
+}
+
+fn collect_mesh_vs_mesh_contacts(a: &RigidBody, b: &RigidBody, out: &mut Vec<Contact>) {
+    let pa = Vec3::new(a.position[0], a.position[1], a.position[2]);
+    let pb = Vec3::new(b.position[0], b.position[1], b.position[2]);
+    let mut tmp: Vec<Contact> = Vec::new();
+    let catch_r = 0.075_f32;
+
+    let stride_b = (b.mesh_triangles.len() / 128).max(1);
+    for tri in b.mesh_triangles.iter().step_by(stride_b) {
+        for v in tri {
+            let pw = pb + quat_rotate(b.orientation, Vec3::new(v[0], v[1], v[2]));
+            let p_loc = quat_inv_rotate(a.orientation, pw - pa);
+            if let Some((pt_loc, n_loc, pen)) =
+                best_mesh_vs_sphere_contact(&a.mesh_triangles, p_loc, catch_r)
+            {
+                let actual_pen = pen - catch_r;
+                if actual_pen > 0.0 {
+                    let pw_hit = pa + quat_rotate(a.orientation, pt_loc);
+                    let nw = quat_rotate(a.orientation, n_loc).normalized();
+                    tmp.push(Contact {
+                        body_a: None,
+                        body_b: 0,
+                        point: pw_hit,
+                        normal: nw,
+                        penetration: actual_pen,
+                    });
+                }
+            }
+        }
+    }
+
+    let stride_a = (a.mesh_triangles.len() / 128).max(1);
+    for tri in a.mesh_triangles.iter().step_by(stride_a) {
+        for v in tri {
+            let pw = pa + quat_rotate(a.orientation, Vec3::new(v[0], v[1], v[2]));
+            let p_loc = quat_inv_rotate(b.orientation, pw - pb);
+            if let Some((pt_loc, n_loc, pen)) =
+                best_mesh_vs_sphere_contact(&b.mesh_triangles, p_loc, catch_r)
+            {
+                let actual_pen = pen - catch_r;
+                if actual_pen > 0.0 {
+                    let pw_hit = pb + quat_rotate(b.orientation, pt_loc);
+                    let nw = quat_rotate(b.orientation, n_loc).normalized() * -1.0;
+                    tmp.push(Contact {
+                        body_a: None,
+                        body_b: 0,
+                        point: pw_hit,
+                        normal: nw,
+                        penetration: actual_pen,
+                    });
+                }
+            }
+        }
+    }
+
+    if !tmp.is_empty() {
+        tmp.sort_by(|x, y| y.penetration.total_cmp(&x.penetration));
+        out.extend(tmp.into_iter().take(6));
+        return;
+    }
+
+    // Coarse OBB fallback only if vertex probes missed
+    if a.mesh_local_aabb.is_valid() && b.mesh_local_aabb.is_valid() {
+        let (ca, sa) = ColliderShape::fit_box(a.mesh_local_aabb);
+        let (cb, sb) = ColliderShape::fit_box(b.mesh_local_aabb);
+        let oa = pa + quat_rotate(a.orientation, Vec3::new(ca[0], ca[1], ca[2]));
+        let ob = pb + quat_rotate(b.orientation, Vec3::new(cb[0], cb[1], cb[2]));
+        collect_shape_pair_contacts(oa, a.orientation, sa, ob, b.orientation, sb, out);
+    }
+}
+
+fn collect_mesh_vs_body_contacts(
+    mesh_body: &RigidBody,
+    shape_body: &RigidBody,
+    flip_normal: bool,
+    out: &mut Vec<Contact>,
+) {
+    let mp = Vec3::new(mesh_body.position[0], mesh_body.position[1], mesh_body.position[2]);
+    let sp = Vec3::new(shape_body.position[0], shape_body.position[1], shape_body.position[2]);
+    let mq = mesh_body.orientation;
+    let sq = shape_body.orientation;
+    let sign = if flip_normal { -1.0 } else { 1.0 };
+
+    for c in &shape_body.colliders {
+        let cw = sp + quat_rotate(sq, Vec3::new(c.offset[0], c.offset[1], c.offset[2]));
+        match c.shape {
+            ColliderShape::None => {}
+            ColliderShape::Sphere { radius } => {
+                let p_loc = quat_inv_rotate(mq, cw - mp);
+                let mut local_hits = Vec::new();
+                collect_mesh_vs_sphere_contacts(&mesh_body.mesh_triangles, p_loc, radius, &mut local_hits);
+                for (pt_loc, n_loc, pen) in local_hits {
+                    out.push(Contact {
+                        body_a: None,
+                        body_b: 0,
+                        point: mp + quat_rotate(mq, pt_loc),
+                        normal: quat_rotate(mq, n_loc).normalized() * sign,
+                        penetration: pen,
+                    });
+                }
+            }
+            ColliderShape::Capsule { radius, half_height } => {
+                let up = quat_rotate(sq, Vec3::new(0.0, half_height, 0.0));
+                for end in [cw - up, cw, cw + up] {
+                    let p_loc = quat_inv_rotate(mq, end - mp);
+                    let mut local_hits = Vec::new();
+                    collect_mesh_vs_sphere_contacts(
+                        &mesh_body.mesh_triangles,
+                        p_loc,
+                        radius,
+                        &mut local_hits,
+                    );
+                    for (pt_loc, n_loc, pen) in local_hits {
+                        out.push(Contact {
+                            body_a: None,
+                            body_b: 0,
+                            point: mp + quat_rotate(mq, pt_loc),
+                            normal: quat_rotate(mq, n_loc).normalized() * sign,
+                            penetration: pen,
+                        });
                     }
                 }
             }
-            ColliderShape::None => {}
+            ColliderShape::Box { half_extents } => {
+                let min_h = half_extents[0].min(half_extents[1]).min(half_extents[2]);
+                let pr = (min_h * 0.12).clamp(0.015, 0.045);
+                let hx = (half_extents[0] - pr).max(0.0);
+                let hy = (half_extents[1] - pr).max(0.0);
+                let hz = (half_extents[2] - pr).max(0.0);
+                let mut probes: Vec<(Vec3, f32)> = Vec::with_capacity(27);
+                for &dx in &[-hx, hx] {
+                    for &dy in &[-hy, hy] {
+                        for &dz in &[-hz, hz] {
+                            probes.push((cw + quat_rotate(sq, Vec3::new(dx, dy, dz)), pr));
+                        }
+                    }
+                }
+                // 12 edge midpoints
+                for &sy in &[-hy, hy] {
+                    for &sz in &[-hz, hz] {
+                        probes.push((cw + quat_rotate(sq, Vec3::new(0.0, sy, sz)), pr));
+                    }
+                }
+                for &sx in &[-hx, hx] {
+                    for &sz in &[-hz, hz] {
+                        probes.push((cw + quat_rotate(sq, Vec3::new(sx, 0.0, sz)), pr));
+                    }
+                }
+                for &sx in &[-hx, hx] {
+                    for &sy in &[-hy, hy] {
+                        probes.push((cw + quat_rotate(sq, Vec3::new(sx, sy, 0.0)), pr));
+                    }
+                }
+                // 6 face centers
+                for local in [
+                    Vec3::new(-hx, 0.0, 0.0),
+                    Vec3::new(hx, 0.0, 0.0),
+                    Vec3::new(0.0, -hy, 0.0),
+                    Vec3::new(0.0, hy, 0.0),
+                    Vec3::new(0.0, 0.0, -hz),
+                    Vec3::new(0.0, 0.0, hz),
+                ] {
+                    probes.push((cw + quat_rotate(sq, local), pr));
+                }
+
+                let mut box_hits: Vec<Contact> = Vec::new();
+                for (pw, rad) in probes {
+                    let p_loc = quat_inv_rotate(mq, pw - mp);
+                    if let Some((pt_loc, n_loc, pen)) =
+                        best_mesh_vs_sphere_contact(&mesh_body.mesh_triangles, p_loc, rad)
+                    {
+                        box_hits.push(Contact {
+                            body_a: None,
+                            body_b: 0,
+                            point: mp + quat_rotate(mq, pt_loc),
+                            normal: quat_rotate(mq, n_loc).normalized() * sign,
+                            penetration: pen,
+                        });
+                    }
+                }
+
+                // Also test mesh vertices penetrating inside the OBB (e.g. pyramid apex hitting a box face)
+                let stride = (mesh_body.mesh_triangles.len() / 256).max(1);
+                for tri in mesh_body.mesh_triangles.iter().step_by(stride) {
+                    let a = Vec3::new(tri[0][0], tri[0][1], tri[0][2]);
+                    let b = Vec3::new(tri[1][0], tri[1][1], tri[1][2]);
+                    let c = Vec3::new(tri[2][0], tri[2][1], tri[2][2]);
+                    let tri_n_loc = (b - a).cross(c - a);
+                    if tri_n_loc.dot(tri_n_loc) <= 1e-10 {
+                        continue;
+                    }
+                    let tri_nw = quat_rotate(mq, tri_n_loc).normalized();
+                    let tri_n_box = quat_inv_rotate(sq, tri_nw);
+                    for v in tri {
+                        let vw = mp + quat_rotate(mq, Vec3::new(v[0], v[1], v[2]));
+                        let vl = quat_inv_rotate(sq, vw - cw);
+                        if vl.x.abs() < half_extents[0]
+                            && vl.y.abs() < half_extents[1]
+                            && vl.z.abs() < half_extents[2]
+                        {
+                            let px = half_extents[0] - vl.x.abs();
+                            let py = half_extents[1] - vl.y.abs();
+                            let pz = half_extents[2] - vl.z.abs();
+                            let (n_box_out, pen) = if px <= py && px <= pz {
+                                let sx = if vl.x >= 0.0 { -1.0 } else { 1.0 };
+                                (Vec3::new(sx, 0.0, 0.0), px)
+                            } else if py <= pz {
+                                let sy = if vl.y >= 0.0 { -1.0 } else { 1.0 };
+                                (Vec3::new(0.0, sy, 0.0), py)
+                            } else {
+                                let sz = if vl.z >= 0.0 { -1.0 } else { 1.0 };
+                                (Vec3::new(0.0, 0.0, sz), pz)
+                            };
+                            if tri_n_box.dot(n_box_out) > 0.1 {
+                                let nw = quat_rotate(sq, n_box_out).normalized() * sign;
+                                box_hits.push(Contact {
+                                    body_a: None,
+                                    body_b: 0,
+                                    point: vw,
+                                    normal: nw,
+                                    penetration: pen,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                box_hits.sort_by(|a, b| b.penetration.total_cmp(&a.penetration));
+                out.extend(box_hits.into_iter().take(8));
+            }
         }
     }
-    best
 }
 
-fn collide_mesh_vs_sphere(
+fn best_mesh_vs_sphere_contact(
     tris: &[[[f32; 3]; 3]],
-    mesh_pos: [f32; 3],
-    sphere_pos: [f32; 3],
+    sphere_local: Vec3,
     radius: f32,
-) -> Option<([f32; 3], f32)> {
-    let mut best: Option<([f32; 3], f32)> = None;
+) -> Option<(Vec3, Vec3, f32)> {
+    let mut hits = Vec::new();
+    collect_mesh_vs_sphere_contacts(tris, sphere_local, radius, &mut hits);
+    hits.into_iter()
+        .max_by(|a, b| a.2.total_cmp(&b.2))
+}
+
+fn collect_mesh_vs_sphere_contacts(
+    tris: &[[[f32; 3]; 3]],
+    sp: Vec3,
+    radius: f32,
+    out: &mut Vec<(Vec3, Vec3, f32)>,
+) {
     let r_sq = radius * radius;
-    let sp = Vec3::new(sphere_pos[0], sphere_pos[1], sphere_pos[2]);
+    let s_min = [sp.x - radius, sp.y - radius, sp.z - radius];
+    let s_max = [sp.x + radius, sp.y + radius, sp.z + radius];
 
     for tri in tris {
-        let a = Vec3::new(tri[0][0] + mesh_pos[0], tri[0][1] + mesh_pos[1], tri[0][2] + mesh_pos[2]);
-        let b = Vec3::new(tri[1][0] + mesh_pos[0], tri[1][1] + mesh_pos[1], tri[1][2] + mesh_pos[2]);
-        let c = Vec3::new(tri[2][0] + mesh_pos[0], tri[2][1] + mesh_pos[1], tri[2][2] + mesh_pos[2]);
+        let t_min_x = tri[0][0].min(tri[1][0]).min(tri[2][0]);
+        let t_max_x = tri[0][0].max(tri[1][0]).max(tri[2][0]);
+        if t_max_x < s_min[0] || t_min_x > s_max[0] {
+            continue;
+        }
+        let t_min_y = tri[0][1].min(tri[1][1]).min(tri[2][1]);
+        let t_max_y = tri[0][1].max(tri[1][1]).max(tri[2][1]);
+        if t_max_y < s_min[1] || t_min_y > s_max[1] {
+            continue;
+        }
+        let t_min_z = tri[0][2].min(tri[1][2]).min(tri[2][2]);
+        let t_max_z = tri[0][2].max(tri[1][2]).max(tri[2][2]);
+        if t_max_z < s_min[2] || t_min_z > s_max[2] {
+            continue;
+        }
 
+        let a = Vec3::new(tri[0][0], tri[0][1], tri[0][2]);
+        let b = Vec3::new(tri[1][0], tri[1][1], tri[1][2]);
+        let c = Vec3::new(tri[2][0], tri[2][1], tri[2][2]);
         let tri_n = (b - a).cross(c - a);
         if tri_n.dot(tri_n) <= 1e-10 {
             continue;
@@ -796,22 +1343,453 @@ fn collide_mesh_vs_sphere(
         if dist_sq > r_sq {
             continue;
         }
-        // Ignore contacts deeply behind a backface
-        if diff.dot(tri_n) < -radius * 0.45 {
+        let signed_d = diff.dot(tri_n);
+        if signed_d < -radius * 0.55 {
             continue;
         }
+
         let dist = sqrtf(dist_sq);
-        let normal = if dist > 1e-5 {
-            (diff * (1.0 / dist)).to_array()
+        let (mut normal, pen) = if signed_d < 0.0 {
+            // Sphere center passed slightly behind the front face: always push outward along tri_n
+            (tri_n, radius + (-signed_d))
         } else {
-            tri_n.to_array()
+            let n = if dist > 1e-5 {
+                diff * (1.0 / dist)
+            } else {
+                tri_n
+            };
+            (n, radius - dist)
         };
-        let pen = radius - dist;
-        if best.map_or(true, |(_, prev_pen)| pen > prev_pen) {
-            best = Some((normal, pen));
+
+        // Break razor-sharp symmetric apex equilibrium on sloped meshes (e.g. pyramid/cone tip)
+        if tri_n.y.abs() < 0.96 && normal.y > 0.97 && normal.x.abs() < 0.08 && normal.z.abs() < 0.08 {
+            let horiz = Vec3::new(tri_n.x, 0.0, tri_n.z);
+            let h_len = horiz.length();
+            if h_len > 1e-4 {
+                normal = (normal + horiz * (0.22 / h_len)).normalized();
+            }
+        }
+        if let Some(existing) = out.iter_mut().find(|(_, en, _)| en.dot(normal) > 0.92) {
+            if pen > existing.2 {
+                *existing = (closest, normal, pen);
+            }
+        } else if out.len() < 4 {
+            out.push((closest, normal, pen));
+        } else if let Some((min_idx, min_pen)) = out
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1 .2.total_cmp(&b.1 .2))
+            .map(|(idx, v)| (idx, v.2))
+        {
+            if pen > min_pen {
+                out[min_idx] = (closest, normal, pen);
+            }
         }
     }
-    best
+}
+
+fn collect_shape_pair_contacts(
+    pa: Vec3,
+    qa: [f32; 4],
+    sa: ColliderShape,
+    pb: Vec3,
+    qb: [f32; 4],
+    sb: ColliderShape,
+    out: &mut Vec<Contact>,
+) {
+    match (sa, sb) {
+        (ColliderShape::None, _) | (_, ColliderShape::None) => {}
+        (ColliderShape::Sphere { radius: ra }, ColliderShape::Sphere { radius: rb }) => {
+            if let Some((pt, n, pen)) = collide_spheres(pa, ra, pb, rb) {
+                out.push(Contact {
+                    body_a: None,
+                    body_b: 0,
+                    point: pt,
+                    normal: n,
+                    penetration: pen,
+                });
+            }
+        }
+        (ColliderShape::Sphere { radius }, ColliderShape::Box { half_extents }) => {
+            if let Some((pt, n_box_to_sph, pen)) = collide_sphere_obb(pa, radius, pb, qb, half_extents)
+            {
+                out.push(Contact {
+                    body_a: None,
+                    body_b: 0,
+                    point: pt,
+                    normal: n_box_to_sph * -1.0, // A(sphere) -> B(box)
+                    penetration: pen,
+                });
+            }
+        }
+        (ColliderShape::Box { half_extents }, ColliderShape::Sphere { radius }) => {
+            if let Some((pt, n_box_to_sph, pen)) = collide_sphere_obb(pb, radius, pa, qa, half_extents)
+            {
+                out.push(Contact {
+                    body_a: None,
+                    body_b: 0,
+                    point: pt,
+                    normal: n_box_to_sph, // A(box) -> B(sphere)
+                    penetration: pen,
+                });
+            }
+        }
+        (ColliderShape::Box { half_extents: ha }, ColliderShape::Box { half_extents: hb }) => {
+            collide_obbs(pa, qa, ha, pb, qb, hb, out);
+        }
+        (
+            ColliderShape::Capsule {
+                radius: r,
+                half_height: hh,
+            },
+            ColliderShape::Sphere { radius: rs },
+        ) => {
+            let up = quat_rotate(qa, Vec3::new(0.0, hh, 0.0));
+            let closest = closest_point_on_segment(pb, pa - up, pa + up);
+            if let Some((pt, n, pen)) = collide_spheres(closest, r, pb, rs) {
+                out.push(Contact {
+                    body_a: None,
+                    body_b: 0,
+                    point: pt,
+                    normal: n,
+                    penetration: pen,
+                });
+            }
+        }
+        (
+            ColliderShape::Sphere { radius: rs },
+            ColliderShape::Capsule {
+                radius: r,
+                half_height: hh,
+            },
+        ) => {
+            let up = quat_rotate(qb, Vec3::new(0.0, hh, 0.0));
+            let closest = closest_point_on_segment(pa, pb - up, pb + up);
+            if let Some((pt, n, pen)) = collide_spheres(pa, rs, closest, r) {
+                out.push(Contact {
+                    body_a: None,
+                    body_b: 0,
+                    point: pt,
+                    normal: n,
+                    penetration: pen,
+                });
+            }
+        }
+        (
+            ColliderShape::Capsule {
+                radius: r,
+                half_height: hh,
+            },
+            ColliderShape::Box { half_extents: h },
+        ) => {
+            let up = quat_rotate(qa, Vec3::new(0.0, hh, 0.0));
+            let p_mid = closest_point_on_segment(pb, pa - up, pa + up);
+            for pt_cap in [pa - up, p_mid, pa + up] {
+                if let Some((pt, n_box_to_cap, pen)) = collide_sphere_obb(pt_cap, r, pb, qb, h) {
+                    out.push(Contact {
+                        body_a: None,
+                        body_b: 0,
+                        point: pt,
+                        normal: n_box_to_cap * -1.0,
+                        penetration: pen,
+                    });
+                }
+            }
+        }
+        (
+            ColliderShape::Box { half_extents: h },
+            ColliderShape::Capsule {
+                radius: r,
+                half_height: hh,
+            },
+        ) => {
+            let up = quat_rotate(qb, Vec3::new(0.0, hh, 0.0));
+            let p_mid = closest_point_on_segment(pa, pb - up, pb + up);
+            for pt_cap in [pb - up, p_mid, pb + up] {
+                if let Some((pt, n_box_to_cap, pen)) = collide_sphere_obb(pt_cap, r, pa, qa, h) {
+                    out.push(Contact {
+                        body_a: None,
+                        body_b: 0,
+                        point: pt,
+                        normal: n_box_to_cap,
+                        penetration: pen,
+                    });
+                }
+            }
+        }
+        (
+            ColliderShape::Capsule {
+                radius: ra,
+                half_height: ha,
+            },
+            ColliderShape::Capsule {
+                radius: rb,
+                half_height: hb,
+            },
+        ) => {
+            let ua = quat_rotate(qa, Vec3::new(0.0, ha, 0.0));
+            let ub = quat_rotate(qb, Vec3::new(0.0, hb, 0.0));
+            let (ca, cb) = closest_points_segments(pa - ua, pa + ua, pb - ub, pb + ub);
+            if let Some((pt, n, pen)) = collide_spheres(ca, ra, cb, rb) {
+                out.push(Contact {
+                    body_a: None,
+                    body_b: 0,
+                    point: pt,
+                    normal: n,
+                    penetration: pen,
+                });
+            }
+        }
+    }
+}
+
+fn collide_spheres(pa: Vec3, ra: f32, pb: Vec3, rb: f32) -> Option<(Vec3, Vec3, f32)> {
+    let d = pb - pa;
+    let dist_sq = d.dot(d);
+    let r_sum = ra + rb;
+    if dist_sq >= r_sum * r_sum {
+        return None;
+    }
+    let dist = sqrtf(dist_sq);
+    let n = if dist > 1e-6 {
+        d * (1.0 / dist)
+    } else {
+        Vec3::new(0.0, 1.0, 0.0)
+    };
+    let pen = r_sum - dist;
+    let pt = pa + n * (ra - pen * 0.5);
+    Some((pt, n, pen))
+}
+
+fn collide_sphere_obb(
+    ps: Vec3,
+    r: f32,
+    pb: Vec3,
+    qb: [f32; 4],
+    hb: [f32; 3],
+) -> Option<(Vec3, Vec3, f32)> {
+    let local = quat_inv_rotate(qb, ps - pb);
+    let closest_local = Vec3::new(
+        local.x.clamp(-hb[0], hb[0]),
+        local.y.clamp(-hb[1], hb[1]),
+        local.z.clamp(-hb[2], hb[2]),
+    );
+    let diff = local - closest_local;
+    let dist_sq = diff.dot(diff);
+    if dist_sq > r * r {
+        return None;
+    }
+    let dist = sqrtf(dist_sq);
+    let (n_local, pen) = if dist > 1e-6 {
+        (diff * (1.0 / dist), r - dist)
+    } else {
+        let px = hb[0] - local.x.abs();
+        let py = hb[1] - local.y.abs();
+        let pz = hb[2] - local.z.abs();
+        if px <= py && px <= pz {
+            let sx = if local.x >= 0.0 { 1.0 } else { -1.0 };
+            (Vec3::new(sx, 0.0, 0.0), r + px)
+        } else if py <= pz {
+            let sy = if local.y >= 0.0 { 1.0 } else { -1.0 };
+            (Vec3::new(0.0, sy, 0.0), r + py)
+        } else {
+            let sz = if local.z >= 0.0 { 1.0 } else { -1.0 };
+            (Vec3::new(0.0, 0.0, sz), r + pz)
+        }
+    };
+    let closest_world = pb + quat_rotate(qb, closest_local);
+    let normal_world = quat_rotate(qb, n_local).normalized();
+    Some((closest_world, normal_world, pen))
+}
+
+fn collide_obbs(
+    pa: Vec3,
+    qa: [f32; 4],
+    ha: [f32; 3],
+    pb: Vec3,
+    qb: [f32; 4],
+    hb: [f32; 3],
+    out: &mut Vec<Contact>,
+) {
+    let ua = quat_axes(qa);
+    let ub = quat_axes(qb);
+    let t = pb - pa;
+
+    let mut abs_r = [[0.0_f32; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            let d = ua[i].dot(ub[j]);
+            abs_r[i][j] = d.abs() + 1e-5;
+        }
+    }
+
+    let mut min_pen = f32::INFINITY;
+    let mut best_axis = Vec3::new(0.0, 1.0, 0.0);
+
+    let t_a = [t.dot(ua[0]), t.dot(ua[1]), t.dot(ua[2])];
+    // 3 face axes of A
+    for i in 0..3 {
+        let ra = ha[i];
+        let rb = hb[0] * abs_r[i][0] + hb[1] * abs_r[i][1] + hb[2] * abs_r[i][2];
+        let dist = t_a[i].abs();
+        let pen = ra + rb - dist;
+        if pen <= 0.0 {
+            return;
+        }
+        if pen < min_pen {
+            min_pen = pen;
+            best_axis = if t_a[i] >= 0.0 { ua[i] } else { ua[i] * -1.0 };
+        }
+    }
+
+    // 3 face axes of B
+    let t_b = [t.dot(ub[0]), t.dot(ub[1]), t.dot(ub[2])];
+    for j in 0..3 {
+        let ra = ha[0] * abs_r[0][j] + ha[1] * abs_r[1][j] + ha[2] * abs_r[2][j];
+        let rb = hb[j];
+        let dist = t_b[j].abs();
+        let pen = ra + rb - dist;
+        if pen <= 0.0 {
+            return;
+        }
+        if pen < min_pen {
+            min_pen = pen;
+            best_axis = if t_b[j] >= 0.0 { ub[j] } else { ub[j] * -1.0 };
+        }
+    }
+
+    // 9 edge cross axes (with slight bias favoring faces)
+    for i in 0..3 {
+        for j in 0..3 {
+            let axis_raw = ua[i].cross(ub[j]);
+            let len_sq = axis_raw.dot(axis_raw);
+            if len_sq < 1e-6 {
+                continue;
+            }
+            let len = sqrtf(len_sq);
+            let axis = axis_raw * (1.0 / len);
+            let ra = ha[0] * ua[0].dot(axis).abs()
+                + ha[1] * ua[1].dot(axis).abs()
+                + ha[2] * ua[2].dot(axis).abs();
+            let rb = hb[0] * ub[0].dot(axis).abs()
+                + hb[1] * ub[1].dot(axis).abs()
+                + hb[2] * ub[2].dot(axis).abs();
+            let proj = t.dot(axis);
+            let pen = ra + rb - proj.abs();
+            if pen <= 0.0 {
+                return;
+            }
+            if pen * 1.04 < min_pen {
+                min_pen = pen;
+                best_axis = if proj >= 0.0 { axis } else { axis * -1.0 };
+            }
+        }
+    }
+
+    // Collect penetrating corner contacts (B corners in A, A corners in B)
+    let mut contacts: Vec<(Vec3, f32)> = Vec::new();
+    let tol = 0.015_f32;
+    for &sx in &[-hb[0], hb[0]] {
+        for &sy in &[-hb[1], hb[1]] {
+            for &sz in &[-hb[2], hb[2]] {
+                let cw = pb + quat_rotate(qb, Vec3::new(sx, sy, sz));
+                let cl = quat_inv_rotate(qa, cw - pa);
+                if cl.x.abs() <= ha[0] + tol && cl.y.abs() <= ha[1] + tol && cl.z.abs() <= ha[2] + tol {
+                    let depth = (ha[0] - cl.x.abs())
+                        .min(ha[1] - cl.y.abs())
+                        .min(ha[2] - cl.z.abs())
+                        .max(0.001)
+                        .min(min_pen);
+                    contacts.push((cw, depth));
+                }
+            }
+        }
+    }
+    for &sx in &[-ha[0], ha[0]] {
+        for &sy in &[-ha[1], ha[1]] {
+            for &sz in &[-ha[2], ha[2]] {
+                let cw = pa + quat_rotate(qa, Vec3::new(sx, sy, sz));
+                let cl = quat_inv_rotate(qb, cw - pb);
+                if cl.x.abs() <= hb[0] + tol && cl.y.abs() <= hb[1] + tol && cl.z.abs() <= hb[2] + tol {
+                    let depth = (hb[0] - cl.x.abs())
+                        .min(hb[1] - cl.y.abs())
+                        .min(hb[2] - cl.z.abs())
+                        .max(0.001)
+                        .min(min_pen);
+                    contacts.push((cw, depth));
+                }
+            }
+        }
+    }
+
+    if contacts.is_empty() {
+        let mid = (pa + pb) * 0.5;
+        out.push(Contact {
+            body_a: None,
+            body_b: 0,
+            point: mid,
+            normal: best_axis,
+            penetration: min_pen,
+        });
+    } else {
+        contacts.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (pt, pen) in contacts.into_iter().take(6) {
+            out.push(Contact {
+                body_a: None,
+                body_b: 0,
+                point: pt,
+                normal: best_axis,
+                penetration: pen.max(min_pen * 0.5),
+            });
+        }
+    }
+}
+
+fn closest_point_on_segment(p: Vec3, a: Vec3, b: Vec3) -> Vec3 {
+    let ab = b - a;
+    let denom = ab.dot(ab);
+    if denom <= 1e-8 {
+        return a;
+    }
+    let t = ((p - a).dot(ab) / denom).clamp(0.0, 1.0);
+    a + ab * t
+}
+
+fn closest_points_segments(p1: Vec3, q1: Vec3, p2: Vec3, q2: Vec3) -> (Vec3, Vec3) {
+    let d1 = q1 - p1;
+    let d2 = q2 - p2;
+    let r = p1 - p2;
+    let a = d1.dot(d1);
+    let e = d2.dot(d2);
+    let f = d2.dot(r);
+    let (s, t) = if a <= 1e-6 && e <= 1e-6 {
+        (0.0, 0.0)
+    } else if a <= 1e-6 {
+        (0.0, (f / e).clamp(0.0, 1.0))
+    } else {
+        let c = d1.dot(r);
+        if e <= 1e-6 {
+            ((-c / a).clamp(0.0, 1.0), 0.0)
+        } else {
+            let b = d1.dot(d2);
+            let denom = a * e - b * b;
+            let mut s = if denom != 0.0 {
+                ((b * f - c * e) / denom).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let mut t = (b * s + f) / e;
+            if t < 0.0 {
+                t = 0.0;
+                s = (-c / a).clamp(0.0, 1.0);
+            } else if t > 1.0 {
+                t = 1.0;
+                s = ((b - c) / a).clamp(0.0, 1.0);
+            }
+            (s, t)
+        }
+    };
+    (p1 + d1 * s, p2 + d2 * t)
 }
 
 fn closest_point_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
@@ -896,49 +1874,6 @@ fn ray_triangle(
     }
 }
 
-fn collider_world_aabb(center: [f32; 3], shape: ColliderShape) -> Aabb {
-    match shape {
-        ColliderShape::None => Aabb::EMPTY,
-        ColliderShape::Box { half_extents } => Aabb {
-            min: [
-                center[0] - half_extents[0],
-                center[1] - half_extents[1],
-                center[2] - half_extents[2],
-            ],
-            max: [
-                center[0] + half_extents[0],
-                center[1] + half_extents[1],
-                center[2] + half_extents[2],
-            ],
-        },
-        ColliderShape::Sphere { radius } => Aabb {
-            min: [center[0] - radius, center[1] - radius, center[2] - radius],
-            max: [center[0] + radius, center[1] + radius, center[2] + radius],
-        },
-        ColliderShape::Capsule { radius, half_height } => Aabb {
-            min: [
-                center[0] - radius,
-                center[1] - half_height - radius,
-                center[2] - radius,
-            ],
-            max: [
-                center[0] + radius,
-                center[1] + half_height + radius,
-                center[2] + radius,
-            ],
-        },
-    }
-}
-
-fn collider_bottom_y(center_y: f32, shape: ColliderShape) -> f32 {
-    match shape {
-        ColliderShape::None => center_y,
-        ColliderShape::Box { half_extents } => center_y - half_extents[1],
-        ColliderShape::Sphere { radius } => center_y - radius,
-        ColliderShape::Capsule { radius, half_height } => center_y - half_height - radius,
-    }
-}
-
 fn aabb_overlaps(a: Aabb, b: Aabb) -> bool {
     a.is_valid()
         && b.is_valid()
@@ -948,161 +1883,6 @@ fn aabb_overlaps(a: Aabb, b: Aabb) -> bool {
         && a.min[1] <= b.max[1]
         && a.max[2] >= b.min[2]
         && a.min[2] <= b.max[2]
-}
-
-fn collide_shapes(
-    pa: [f32; 3],
-    sa: ColliderShape,
-    pb: [f32; 3],
-    sb: ColliderShape,
-) -> Option<([f32; 3], f32)> {
-    match (sa, sb) {
-        (ColliderShape::None, _) | (_, ColliderShape::None) => None,
-        (ColliderShape::Sphere { radius: ra }, ColliderShape::Sphere { radius: rb }) => {
-            collide_spheres(pa, ra, pb, rb)
-        }
-        (ColliderShape::Box { half_extents: ha }, ColliderShape::Box { half_extents: hb }) => {
-            collide_boxes(pa, ha, pb, hb)
-        }
-        (ColliderShape::Sphere { radius }, ColliderShape::Box { half_extents }) => {
-            collide_sphere_box(pa, radius, pb, half_extents)
-        }
-        (ColliderShape::Box { half_extents }, ColliderShape::Sphere { radius }) => {
-            collide_sphere_box(pb, radius, pa, half_extents).map(|(n, p)| ([-n[0], -n[1], -n[2]], p))
-        }
-        (
-            ColliderShape::Capsule {
-                radius: r,
-                half_height: hh,
-            },
-            ColliderShape::Sphere { radius: rs },
-        ) => {
-            let closest_seg_y = pb[1].clamp(pa[1] - hh, pa[1] + hh);
-            collide_spheres([pa[0], closest_seg_y, pa[2]], r, pb, rs)
-        }
-        (
-            ColliderShape::Sphere { radius: rs },
-            ColliderShape::Capsule {
-                radius: r,
-                half_height: hh,
-            },
-        ) => {
-            let closest_seg_y = pa[1].clamp(pb[1] - hh, pb[1] + hh);
-            collide_spheres(pa, rs, [pb[0], closest_seg_y, pb[2]], r)
-        }
-        (
-            ColliderShape::Capsule {
-                radius: r,
-                half_height: hh,
-            },
-            ColliderShape::Box { half_extents: h },
-        ) => {
-            let closest_seg_y = pb[1].clamp(pa[1] - hh, pa[1] + hh);
-            collide_sphere_box([pa[0], closest_seg_y, pa[2]], r, pb, h)
-        }
-        (
-            ColliderShape::Box { half_extents: h },
-            ColliderShape::Capsule {
-                radius: r,
-                half_height: hh,
-            },
-        ) => {
-            let closest_seg_y = pa[1].clamp(pb[1] - hh, pb[1] + hh);
-            collide_sphere_box([pb[0], closest_seg_y, pb[2]], r, pa, h)
-                .map(|(n, p)| ([-n[0], -n[1], -n[2]], p))
-        }
-        (
-            ColliderShape::Capsule {
-                radius: ra,
-                half_height: ha,
-            },
-            ColliderShape::Capsule {
-                radius: rb,
-                half_height: hb,
-            },
-        ) => {
-            let ya = pb[1].clamp(pa[1] - ha, pa[1] + ha);
-            let yb = ya.clamp(pb[1] - hb, pb[1] + hb);
-            collide_spheres([pa[0], ya, pa[2]], ra, [pb[0], yb, pb[2]], rb)
-        }
-    }
-}
-
-fn collide_spheres(pa: [f32; 3], ra: f32, pb: [f32; 3], rb: f32) -> Option<([f32; 3], f32)> {
-    let d = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
-    let dist_sq = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-    let r_sum = ra + rb;
-    if dist_sq >= r_sum * r_sum {
-        return None;
-    }
-    let dist = sqrtf(dist_sq);
-    if dist > 1e-6 {
-        Some(([d[0] / dist, d[1] / dist, d[2] / dist], r_sum - dist))
-    } else {
-        Some(([0.0, 1.0, 0.0], r_sum))
-    }
-}
-
-fn collide_boxes(
-    pa: [f32; 3],
-    ha: [f32; 3],
-    pb: [f32; 3],
-    hb: [f32; 3],
-) -> Option<([f32; 3], f32)> {
-    let d = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
-    let ox = (ha[0] + hb[0]) - d[0].abs();
-    let oy = (ha[1] + hb[1]) - d[1].abs();
-    let oz = (ha[2] + hb[2]) - d[2].abs();
-    if ox <= 0.0 || oy <= 0.0 || oz <= 0.0 {
-        return None;
-    }
-    if ox <= oy && ox <= oz {
-        let sx = if d[0] >= 0.0 { 1.0 } else { -1.0 };
-        Some(([sx, 0.0, 0.0], ox))
-    } else if oy <= oz {
-        let sy = if d[1] >= 0.0 { 1.0 } else { -1.0 };
-        Some(([0.0, sy, 0.0], oy))
-    } else {
-        let sz = if d[2] >= 0.0 { 1.0 } else { -1.0 };
-        Some(([0.0, 0.0, sz], oz))
-    }
-}
-
-fn collide_sphere_box(
-    ps: [f32; 3],
-    r: f32,
-    pb: [f32; 3],
-    hb: [f32; 3],
-) -> Option<([f32; 3], f32)> {
-    let closest = [
-        ps[0].clamp(pb[0] - hb[0], pb[0] + hb[0]),
-        ps[1].clamp(pb[1] - hb[1], pb[1] + hb[1]),
-        ps[2].clamp(pb[2] - hb[2], pb[2] + hb[2]),
-    ];
-    let diff = [closest[0] - ps[0], closest[1] - ps[1], closest[2] - ps[2]];
-    let dist_sq = diff[0] * diff[0] + diff[1] * diff[1] + diff[2] * diff[2];
-    if dist_sq > r * r {
-        return None;
-    }
-    let dist = sqrtf(dist_sq);
-    if dist > 1e-6 {
-        Some(([diff[0] / dist, diff[1] / dist, diff[2] / dist], r - dist))
-    } else {
-        let rel = [ps[0] - pb[0], ps[1] - pb[1], ps[2] - pb[2]];
-        let px = hb[0] - rel[0].abs();
-        let py = hb[1] - rel[1].abs();
-        let pz = hb[2] - rel[2].abs();
-        if px <= py && px <= pz {
-            let sx = if rel[0] >= 0.0 { -1.0 } else { 1.0 };
-            Some(([sx, 0.0, 0.0], r + px))
-        } else if py <= pz {
-            let sy = if rel[1] >= 0.0 { -1.0 } else { 1.0 };
-            Some(([0.0, sy, 0.0], r + py))
-        } else {
-            let sz = if rel[2] >= 0.0 { -1.0 } else { 1.0 };
-            Some(([0.0, 0.0, sz], r + pz))
-        }
-    }
 }
 
 fn ray_box(
