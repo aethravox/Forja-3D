@@ -3756,8 +3756,12 @@ fn jni_take_exception<'local>(env: &mut jni::JNIEnv<'local>) -> Option<String> {
         if let Ok(msg_val) = env.call_method(&exc, "toString", "()Ljava/lang/String;", &[]) {
             if let Ok(msg_obj) = msg_val.l() {
                 let jstr: jni::objects::JString<'_> = msg_obj.into();
-                if let Ok(s) = env.get_string(&jstr) {
-                    return Some(s.to_string_lossy().into_owned());
+                let s_opt = env
+                    .get_string(&jstr)
+                    .ok()
+                    .map(|s| s.to_string_lossy().into_owned());
+                if let Some(s) = s_opt {
+                    return Some(s);
                 }
             }
         }
