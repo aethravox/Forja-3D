@@ -547,7 +547,7 @@ impl PhysicsWorld {
         }
 
         const VEL_ITERS: usize = 6;
-        for iter in 0..VEL_ITERS {
+        for _iter in 0..VEL_ITERS {
             for (ci, c) in contacts.iter().enumerate() {
                 let b_idx = c.body_b;
                 let a_opt = c.body_a;
@@ -592,12 +592,12 @@ impl PhysicsWorld {
                 };
                 let rest_b = self.bodies[b_idx].restitution;
                 let fric_b = self.bodies[b_idx].friction;
-                let e = if iter == 0 && init_vn[ci] < -0.45 {
+                let e = if init_vn[ci] < -0.45 {
                     rest_a.max(rest_b)
                 } else {
                     0.0
                 };
-                let target_vn = if iter == 0 && init_vn[ci] < -0.45 {
+                let target_vn = if init_vn[ci] < -0.45 {
                     -e * init_vn[ci]
                 } else {
                     0.0
@@ -1369,7 +1369,10 @@ fn collect_mesh_vs_sphere_contacts(
                 normal = (normal + horiz * (0.22 / h_len)).normalized();
             }
         }
-        if let Some(existing) = out.iter_mut().find(|(_, en, _)| en.dot(normal) > 0.92) {
+        if let Some(existing) = out.iter_mut().find(|(ec, en, _)| {
+            let d = *ec - closest;
+            d.dot(d) < 1e-6 || en.dot(normal) > 0.88
+        }) {
             if pen > existing.2 {
                 *existing = (closest, normal, pen);
             }
