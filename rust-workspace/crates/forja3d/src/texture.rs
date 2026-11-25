@@ -53,6 +53,7 @@ pub enum TextureError {
     InvalidFormat(u8),
     BufferTooShort,
     ChecksumMismatch { expected: u32, computed: u32 },
+    DecompressionError,
 }
 
 impl fmt::Display for TextureError {
@@ -65,6 +66,7 @@ impl fmt::Display for TextureError {
             Self::ChecksumMismatch { expected, computed } => {
                 write!(f, "checksum erróneo (esperado {expected:#x}, calculado {computed:#x})")
             }
+            Self::DecompressionError => write!(f, "error al descomprimir datos zlib/deflate"),
         }
     }
 }
@@ -80,7 +82,7 @@ impl Texture {
         }
     }
 
-    /// Encode texture into binary .f3t format.
+    /// Encode texture into binary .f3t format with zlib/deflate compression.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut payload = Vec::new();
         let name_len = self.name.len().min(u16::MAX as usize);
@@ -90,21 +92,23 @@ impl Texture {
         payload.extend_from_slice(&self.width.to_le_bytes());
         payload.extend_from_slice(&self.height.to_le_bytes());
         payload.push(self.format as u8);
-        payload.extend_from_slice(&(self.data.len() as u32).to_le_bytes());
-        payload.extend_from_slice(&self.data);
+
+        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&self.data, 6);
+        payload.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&compressed);
 
         let checksum = crate::format::fnv1a_32(&payload);
 
         let mut out = Vec::with_capacity(16 + payload.len());
         out.extend_from_slice(&F3T_MAGIC);
         out.extend_from_slice(&F3T_VERSION.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        out.extend_from_slice(&1u16.to_le_bytes()); // flags: bit 0 = zlib/deflate compressed
         out.extend_from_slice(&checksum.to_le_bytes());
         out.extend_from_slice(&payload);
         out
     }
 
-    /// Decode texture from binary .f3t format.
+    /// Decode texture from binary .f3t format (supporting both compressed and legacy uncompressed).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, TextureError> {
         if bytes.len() < 12 {
             return Err(TextureError::BufferTooShort);
@@ -116,6 +120,9 @@ impl Texture {
         if version != F3T_VERSION {
             return Err(TextureError::UnsupportedVersion(version));
         }
+        let flags = u16::from_le_bytes([bytes[6], bytes[7]]);
+        let is_compressed = (flags & 1) != 0;
+
         let expected_checksum = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
         let payload = &bytes[12..];
         let computed_checksum = crate::format::fnv1a_32(payload);
@@ -154,7 +161,13 @@ impl Texture {
         if payload.len() < cur + data_len {
             return Err(TextureError::BufferTooShort);
         }
-        let data = payload[cur..cur + data_len].to_vec();
+        let raw_data = &payload[cur..cur + data_len];
+        let data = if is_compressed {
+            miniz_oxide::inflate::decompress_to_vec_zlib(raw_data)
+                .map_err(|_| TextureError::DecompressionError)?
+        } else {
+            raw_data.to_vec()
+        };
 
         Ok(Self {
             name,
