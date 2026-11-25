@@ -351,7 +351,7 @@ impl StudioApp {
                 part_spec.position
             };
 
-            let mut part_phys = PhysicsSpec {
+            let mut part_phys = forja3d::PhysicsSpec {
                 body_kind: part_spec.body_kind,
                 mass: part_spec.mass.max(0.05),
                 friction: part_spec.friction,
