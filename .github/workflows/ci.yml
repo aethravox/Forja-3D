@@ -255,21 +255,31 @@ jobs:
       - name: Build & Sign Android Release APK (64-bit + 32-bit)
         run: |
           cargo apk build --manifest-path rust-workspace/crates/forja3d-studio/Cargo.toml --release --lib
-          APK_PATH=$(find rust-workspace/target -name "*.apk" 2>/dev/null | head -n 1)
+          APK_PATH=$(find rust-workspace/target -name "forja3d-studio.apk" 2>/dev/null | head -n 1)
           if [ -z "$APK_PATH" ]; then
-            APK_PATH=$(find rust-workspace -name "*.apk" 2>/dev/null | head -n 1)
+            APK_PATH=$(find rust-workspace -name "*.apk" ! -name "*-unaligned.apk" 2>/dev/null | head -n 1)
           fi
           echo "Found APK at: $APK_PATH"
           test -n "$APK_PATH"
-          cp "$APK_PATH" forja3d-studio-android.apk
+          ZIPALIGN="${ANDROID_SDK_ROOT}/build-tools/34.0.0/zipalign"
           APKSIGNER="${ANDROID_SDK_ROOT}/build-tools/34.0.0/apksigner"
-          if ! "$APKSIGNER" verify forja3d-studio-android.apk >/dev/null 2>&1; then
+          if ! "$ZIPALIGN" -c -p 4 "$APK_PATH" >/dev/null 2>&1; then
+            "$ZIPALIGN" -f -p 4 "$APK_PATH" forja3d-studio-android.apk
             "$APKSIGNER" sign \
               --ks "$CARGO_APK_RELEASE_KEYSTORE" \
               --ks-pass "pass:${CARGO_APK_RELEASE_KEYSTORE_PASSWORD}" \
               forja3d-studio-android.apk
+          else
+            cp "$APK_PATH" forja3d-studio-android.apk
+            if ! "$APKSIGNER" verify forja3d-studio-android.apk >/dev/null 2>&1; then
+              "$APKSIGNER" sign \
+                --ks "$CARGO_APK_RELEASE_KEYSTORE" \
+                --ks-pass "pass:${CARGO_APK_RELEASE_KEYSTORE_PASSWORD}" \
+                forja3d-studio-android.apk
+            fi
           fi
-          "$APKSIGNER" verify forja3d-studio-android.apk
+          "$ZIPALIGN" -c -p 4 forja3d-studio-android.apk
+          "$APKSIGNER" verify --verbose forja3d-studio-android.apk
 
       - uses: actions/upload-artifact@v4
         with:
