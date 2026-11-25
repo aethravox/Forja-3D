@@ -536,6 +536,7 @@ impl PhysicsWorld {
         // 3. Sequential impulse solver (velocity + angular torque + contact-point friction)
         let num_contacts = contacts.len();
         let mut acc_jn = vec![0.0_f32; num_contacts];
+        let mut acc_jt = vec![Vec3::ZERO; num_contacts];
         let mut init_vn = vec![0.0_f32; num_contacts];
         for (ci, c) in contacts.iter().enumerate() {
             let vb = contact_point_velocity(&self.bodies[c.body_b], c.point);
@@ -649,9 +650,17 @@ impl PhysicsWorld {
                     if eff_mass_t > 1e-8 {
                         let mu = sqrtf((fric_a * fric_b).max(0.0));
                         let max_f = acc_jn[ci] * mu;
-                        let jt = (-vt_len / eff_mass_t).clamp(-max_f, max_f);
-                        let f_imp = t_dir * jt;
-                        apply_impulse_at_point(&mut self.bodies, a_opt, b_idx, ra, rb, f_imp);
+                        let old_jt = acc_jt[ci];
+                        let mut new_jt = old_jt + t_dir * (-vt_len / eff_mass_t);
+                        let new_jt_len = new_jt.length();
+                        if new_jt_len > max_f && new_jt_len > 1e-8 {
+                            new_jt = new_jt * (max_f / new_jt_len);
+                        }
+                        let delta_jt = new_jt - old_jt;
+                        acc_jt[ci] = new_jt;
+                        if delta_jt.dot(delta_jt) > 1e-12 {
+                            apply_impulse_at_point(&mut self.bodies, a_opt, b_idx, ra, rb, delta_jt);
+                        }
                     }
                 }
             }
