@@ -1198,6 +1198,26 @@ fn is_point_inside_closed_mesh(tris: &[[[f32; 3]; 3]], aabb: Aabb, p: Vec3) -> b
     if tris.len() < 4 || !aabb_contains_point(aabb, p, 1e-4) {
         return false;
     }
+    let mut min_signed_d = f32::INFINITY;
+    for tri in tris {
+        let a = Vec3::new(tri[0][0], tri[0][1], tri[0][2]);
+        let b = Vec3::new(tri[1][0], tri[1][1], tri[1][2]);
+        let c = Vec3::new(tri[2][0], tri[2][1], tri[2][2]);
+        let tri_n = (b - a).cross(c - a);
+        if tri_n.dot(tri_n) <= 1e-10 {
+            continue;
+        }
+        let tri_n = tri_n.normalized();
+        let closest = closest_point_on_triangle(p, a, b, c);
+        let signed_d = (p - closest).dot(tri_n);
+        if signed_d < min_signed_d {
+            min_signed_d = signed_d;
+        }
+    }
+    if min_signed_d >= 0.0 {
+        return false;
+    }
+
     // Single-pass 6 cardinal raycast (+/-X, +/-Y, +/-Z): track nearest hit in each direction.
     // Inside a watertight/closed mesh, >= 5 cardinal rays hit an outward-facing triangle on exit.
     let mut best_t = [f32::INFINITY; 6];
@@ -1252,8 +1272,7 @@ fn is_point_inside_closed_mesh(tris: &[[[f32; 3]; 3]], aabb: Aabb, p: Vec3) -> b
 }
 
 fn closest_interior_escape(tris: &[[[f32; 3]; 3]], p: Vec3) -> Option<(Vec3, Vec3, f32)> {
-    let mut best_neg: Option<(Vec3, Vec3, f32)> = None;
-    let mut best_any: Option<(Vec3, Vec3, f32)> = None;
+    let mut best: Option<(Vec3, Vec3, f32)> = None;
     for tri in tris {
         let a = Vec3::new(tri[0][0], tri[0][1], tri[0][2]);
         let b = Vec3::new(tri[1][0], tri[1][1], tri[1][2]);
@@ -1265,18 +1284,15 @@ fn closest_interior_escape(tris: &[[[f32; 3]; 3]], p: Vec3) -> Option<(Vec3, Vec
         let tri_n = tri_n.normalized();
         let closest = closest_point_on_triangle(p, a, b, c);
         let diff = p - closest;
-        let dist = sqrtf(diff.dot(diff));
         let signed_d = diff.dot(tri_n);
-        if signed_d <= 1e-4 {
-            if best_neg.map_or(true, |(_, _, prev_d)| dist < prev_d) {
-                best_neg = Some((closest, tri_n, dist));
+        if signed_d < 0.0 {
+            let escape_dist = -signed_d;
+            if best.map_or(true, |(_, _, prev_esc)| escape_dist < prev_esc) {
+                best = Some((closest, tri_n, escape_dist));
             }
         }
-        if best_any.map_or(true, |(_, _, prev_d)| dist < prev_d) {
-            best_any = Some((closest, tri_n, dist));
-        }
     }
-    best_neg.or(best_any)
+    best
 }
 
 fn mesh_point_penetration(
@@ -1750,7 +1766,7 @@ fn collect_mesh_vs_sphere_contacts_with_aabb(
             continue;
         }
         let signed_d = diff.dot(tri_n);
-        if signed_d < -radius * 0.55 {
+        if signed_d < -radius * 0.9 {
             continue;
         }
 
