@@ -33,6 +33,8 @@ pub enum SvgIcon {
     Subdivide,
     Close,
     Eye,
+    Sun,
+    Texture,
 }
 
 impl SvgIcon {
@@ -69,6 +71,8 @@ impl SvgIcon {
             Self::Subdivide => egui::include_image!("../assets/icons/subdivide.svg"),
             Self::Close => egui::include_image!("../assets/icons/close.svg"),
             Self::Eye => egui::include_image!("../assets/icons/eye.svg"),
+            Self::Sun => egui::include_image!("../assets/icons/sun.svg"),
+            Self::Texture => egui::include_image!("../assets/icons/texture.svg"),
         }
     }
 }

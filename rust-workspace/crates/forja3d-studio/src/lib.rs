@@ -12,7 +12,8 @@ use forja3d::{
     AnimationTrack, ColliderShape, F2D_MAGIC, F3A_MAGIC, F3P_MAGIC, F3T_MAGIC, FLAG_COMPACT,
     FLAG_PHYSICS, ForjaPack, InterpolationMode, Keyframe, Mat4, Material, MeshDeformKind,
     MeshPart, Model, PartSpec, PrimitiveKind, RigidBodyKind, RustExportTarget,
-    SceneDocument, ShadingMode, TerrainPreset, TerrainStamp, Texture, UiDocument2D, Vec3, Vertex,
+    SceneDocument, ShadingMode, SunLightSpec, TerrainPreset, TerrainStamp, Texture,
+    UiDocument2D, Vec3, Vertex,
 };
 use forja3d_physics::{BodyHandle, PhysicsWorld, RigidBody};
 
@@ -23,7 +24,9 @@ use editor_2d::{
 use icons::{
     icon_btn, icon_btn_enabled, icon_text_btn, icon_text_btn_enabled, SvgIcon,
 };
-use renderer::{ray_intersects_aabb, GlViewportRenderer, OrbitCamera};
+use renderer::{
+    ray_intersects_aabb, GlViewportRenderer, OrbitCamera, RenderSunLight, RenderSunMarker,
+};
 
 const MAX_UNDO_HISTORY: usize = 32;
 
@@ -98,6 +101,7 @@ enum GizmoAxis {
 enum Selection {
     Part(usize),
     Group(String),
+    Sun(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +114,7 @@ struct ActiveGizmoDrag {
     axis: GizmoAxis,
     mode: GizmoMode,
     start_parts: Vec<PartSpec>,
+    start_suns: Vec<SunLightSpec>,
     accum_pixels: f32,
 }
 
@@ -158,6 +163,9 @@ pub struct StudioApp {
     terrain_brush_strength: f32,
     terrain_sculpt_last: Option<[f32; 2]>,
     imported_textures: Vec<Texture>,
+    textures_shared: Arc<Vec<Texture>>,
+    texture_generation: u64,
+    textures_enabled: bool,
     new_group_draft: String,
     export_tab: ExportTab,
     mobile_tab: MobileTab,
@@ -240,6 +248,9 @@ impl StudioApp {
             terrain_brush_strength: 0.22,
             terrain_sculpt_last: None,
             imported_textures: Vec::new(),
+            textures_shared: Arc::new(Vec::new()),
+            texture_generation: 1,
+            textures_enabled: false,
             new_group_draft: String::from("Grupo"),
             export_tab: ExportTab::F3dBinary,
             mobile_tab: MobileTab::Viewport,
@@ -519,6 +530,28 @@ impl StudioApp {
         self.cached_obj_src = self.baked_model.to_obj();
     }
 
+    fn sync_textures_cache(&mut self) {
+        self.texture_generation = self.texture_generation.wrapping_add(1).max(1);
+        self.textures_shared = Arc::new(self.imported_textures.clone());
+    }
+
+    fn assign_texture_index_to_selection_or_all(&mut self, tex_idx: usize) {
+        let selected_indices = self.selected_part_indices();
+        if selected_indices.is_empty() {
+            for p in &mut self.scene.parts {
+                p.texture_index = Some(tex_idx);
+                p.texture_enabled = true;
+            }
+        } else {
+            for idx in selected_indices {
+                if let Some(p) = self.scene.parts.get_mut(idx) {
+                    p.texture_index = Some(tex_idx);
+                    p.texture_enabled = true;
+                }
+            }
+        }
+    }
+
     fn import_model_bytes(
         &mut self,
         filename: Option<&str>,
@@ -531,6 +564,10 @@ impl StudioApp {
         let is_f3a_magic = bytes.len() >= 4 && bytes[0..4] == F3A_MAGIC;
         let is_f2d_magic = bytes.len() >= 4 && bytes[0..4] == F2D_MAGIC;
         let is_f3t_magic = bytes.len() >= 4 && bytes[0..4] == F3T_MAGIC;
+        let is_image_ext = lower.ends_with(".png")
+            || lower.ends_with(".jpg")
+            || lower.ends_with(".jpeg")
+            || lower.ends_with(".webp");
         let is_glb_magic = bytes.len() >= 4 && &bytes[0..4] == b"glTF";
         let is_gltf = lower.ends_with(".glb") || lower.ends_with(".gltf") || is_glb_magic;
 
@@ -547,6 +584,8 @@ impl StudioApp {
                     let has_physics = (flags & FLAG_PHYSICS) != 0;
                     self.scene = SceneDocument::from_model(decoded);
                     self.imported_textures.clear();
+                    self.textures_enabled = false;
+                    self.sync_textures_cache();
                     self.selection = if self.scene.parts.is_empty() {
                         None
                     } else {
@@ -575,6 +614,8 @@ impl StudioApp {
                     self.push_undo();
                     let mut summary = Vec::new();
                     self.imported_textures = pack.textures.clone();
+                    self.textures_enabled = !self.imported_textures.is_empty();
+                    self.sync_textures_cache();
                     if let Some(model) = pack.model {
                         let tri = model.triangle_count();
                         self.scene = SceneDocument::from_model(model);
@@ -641,16 +682,46 @@ impl StudioApp {
         } else if is_f3t_magic || lower.ends_with(".f3t") {
             match Texture::from_bytes(bytes) {
                 Ok(tex) => {
-                    let src = filename.unwrap_or(&tex.name);
-                    self.status_note = format!(
-                        "Textura .f3t '{src}' válida ({}x{} px, {} bytes)",
-                        tex.width,
-                        tex.height,
-                        tex.data.len()
-                    );
+                    self.push_undo();
+                    let src = filename.unwrap_or(&tex.name).to_string();
+                    let w = tex.width;
+                    let h = tex.height;
+                    let tex_idx = self.imported_textures.len();
+                    self.imported_textures.push(tex);
+                    self.sync_textures_cache();
+                    self.textures_enabled = true;
+                    self.assign_texture_index_to_selection_or_all(tex_idx);
+                    self.status_note = format!("Textura .f3t '{src}' aplicada ({w}x{h} px)");
                 }
                 Err(err) => {
                     self.status_note = format!("Error al importar .f3t: {err}");
+                }
+            }
+        } else if is_image_ext {
+            match image::load_from_memory(bytes) {
+                Ok(mut dyn_img) => {
+                    self.push_undo();
+                    if dyn_img.width() > 2048 || dyn_img.height() > 2048 {
+                        dyn_img = dyn_img.resize(2048, 2048, image::imageops::FilterType::Triangle);
+                    }
+                    let rgba_img = dyn_img.to_rgba8();
+                    let (w, h) = rgba_img.dimensions();
+                    let tex_name = filename.unwrap_or("textura_imagen").to_string();
+                    let tex = Texture::new_rgba(
+                        tex_name.clone(),
+                        w.clamp(1, u16::MAX as u32) as u16,
+                        h.clamp(1, u16::MAX as u32) as u16,
+                        rgba_img.into_raw(),
+                    );
+                    let tex_idx = self.imported_textures.len();
+                    self.imported_textures.push(tex);
+                    self.sync_textures_cache();
+                    self.textures_enabled = true;
+                    self.assign_texture_index_to_selection_or_all(tex_idx);
+                    self.status_note = format!("Imagen '{tex_name}' cargada ({w}x{h} px)");
+                }
+                Err(err) => {
+                    self.status_note = format!("Error al leer imagen: {err}");
                 }
             }
         } else {
@@ -660,6 +731,8 @@ impl StudioApp {
                     self.scene = imported.scene;
                     let tex_count = imported.textures.len();
                     self.imported_textures = imported.textures;
+                    self.textures_enabled = tex_count > 0;
+                    self.sync_textures_cache();
                     self.selection = if self.scene.parts.is_empty() {
                         None
                     } else {
@@ -797,6 +870,8 @@ impl StudioApp {
         self.push_undo();
         self.scene = scene;
         self.imported_textures.clear();
+        self.textures_enabled = false;
+        self.sync_textures_cache();
         self.selection = if self.scene.parts.is_empty() {
             None
         } else {
@@ -806,6 +881,20 @@ impl StudioApp {
         self.rebuild_outputs();
         self.camera.frame_bounds(self.baked_model.bounds());
         self.status_note = format!("Escena: {}", self.scene.model_name);
+    }
+
+    fn add_sun_light(&mut self) {
+        self.push_undo();
+        let idx = self.scene.sun_lights.len();
+        let mut sun = SunLightSpec::new(format!("Sol_{}", idx + 1));
+        if idx > 0 {
+            let angle = (idx as f32) * 1.4;
+            sun.position = [3.6 * angle.cos(), 4.5 + (idx as f32) * 0.4, 3.6 * angle.sin()];
+        }
+        self.scene.sun_lights.push(sun);
+        self.selection = Some(Selection::Sun(idx));
+        self.selected_vertex_idx = None;
+        self.status_note = format!("Sol_{} añadido (intensidad 1.25x)", idx + 1);
     }
 
     fn add_primitive(&mut self, kind: PrimitiveKind) {
@@ -1074,6 +1163,9 @@ impl StudioApp {
     }
 
     fn selection_pivot(&self) -> Option<[f32; 3]> {
+        if let Some(Selection::Sun(sun_idx)) = self.selection {
+            return self.scene.sun_lights.get(sun_idx).map(|s| s.position);
+        }
         let indices = self.selected_part_indices();
         if indices.is_empty() {
             return None;
@@ -1136,6 +1228,109 @@ impl StudioApp {
                         self.load_preset(SceneDocument::new("MiModelo"));
                     }
                 });
+            });
+
+        egui::CollapsingHeader::new(egui::RichText::new("Iluminación y texturas").strong())
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if icon_text_btn(ui, SvgIcon::Sun, 14.0, "Añadir Sol", [110.0, btn_h], false)
+                        .on_hover_text("Crea un objeto Sol direccional con intensidad modificable")
+                        .clicked()
+                    {
+                        self.add_sun_light();
+                    }
+                    if icon_text_btn(
+                        ui,
+                        SvgIcon::Texture,
+                        14.0,
+                        "Texturas",
+                        [98.0, btn_h],
+                        self.textures_enabled,
+                    )
+                    .on_hover_text("Activar o desactivar texturas en el modelo")
+                    .clicked()
+                    {
+                        self.textures_enabled = !self.textures_enabled;
+                        self.status_note = if self.textures_enabled {
+                            String::from("Texturas del modelo activadas")
+                        } else {
+                            String::from("Texturas del modelo desactivadas")
+                        };
+                    }
+                });
+                if !self.scene.sun_lights.is_empty() {
+                    ui.add_space(4.0);
+                    let mut delete_sun: Option<usize> = None;
+                    let mut dup_sun: Option<usize> = None;
+                    let mut toggle_sun_vis: Option<usize> = None;
+                    let mut toggle_sun_en: Option<usize> = None;
+                    for (idx, sun) in self.scene.sun_lights.iter().enumerate() {
+                        let is_sel = self.selection == Some(Selection::Sun(idx));
+                        ui.horizontal(|ui| {
+                            let eye_sz = if compact { [30.0, 28.0] } else { [24.0, 22.0] };
+                            if icon_btn(ui, SvgIcon::Eye, 13.0, eye_sz, sun.visible)
+                                .on_hover_text("Mostrar/ocultar marcador del Sol")
+                                .clicked()
+                            {
+                                toggle_sun_vis = Some(idx);
+                            }
+                            if icon_btn(ui, SvgIcon::Sun, 13.0, eye_sz, sun.enabled)
+                                .on_hover_text("Encender/apagar iluminación del Sol")
+                                .clicked()
+                            {
+                                toggle_sun_en = Some(idx);
+                            }
+                            let label = format!("{} ({:.2}x)", sun.name, sun.intensity);
+                            if ui.selectable_label(is_sel, label).clicked() {
+                                self.selection = Some(Selection::Sun(idx));
+                                self.selected_vertex_idx = None;
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let act_sz = if compact { [30.0, 28.0] } else { [22.0, 22.0] };
+                                if icon_btn(ui, SvgIcon::Trash, 12.0, act_sz, false)
+                                    .on_hover_text("Eliminar Sol")
+                                    .clicked()
+                                {
+                                    delete_sun = Some(idx);
+                                }
+                                if icon_btn(ui, SvgIcon::Duplicate, 12.0, act_sz, false)
+                                    .on_hover_text("Duplicar Sol")
+                                    .clicked()
+                                {
+                                    dup_sun = Some(idx);
+                                }
+                            });
+                        });
+                    }
+                    if let Some(idx) = toggle_sun_vis {
+                        self.push_undo();
+                        self.scene.sun_lights[idx].visible = !self.scene.sun_lights[idx].visible;
+                    }
+                    if let Some(idx) = toggle_sun_en {
+                        self.push_undo();
+                        self.scene.sun_lights[idx].enabled = !self.scene.sun_lights[idx].enabled;
+                    }
+                    if let Some(idx) = dup_sun {
+                        self.push_undo();
+                        let mut c = self.scene.sun_lights[idx].clone();
+                        c.name = format!("{}_copia", c.name);
+                        c.position[0] += 1.2;
+                        self.scene.sun_lights.push(c);
+                        self.selection = Some(Selection::Sun(self.scene.sun_lights.len() - 1));
+                    }
+                    if let Some(idx) = delete_sun {
+                        self.push_undo();
+                        self.scene.sun_lights.remove(idx);
+                        self.selection = if !self.scene.sun_lights.is_empty() {
+                            Some(Selection::Sun(idx.min(self.scene.sun_lights.len() - 1)))
+                        } else if !self.scene.parts.is_empty() {
+                            Some(Selection::Part(0))
+                        } else {
+                            None
+                        };
+                    }
+                }
             });
 
         egui::CollapsingHeader::new(egui::RichText::new("Añadir primitiva").strong())
@@ -1395,6 +1590,207 @@ impl StudioApp {
             _ => None,
         };
 
+        if let Some(Selection::Sun(sun_idx)) = self.selection {
+            if sun_idx < self.scene.sun_lights.len() {
+                let mut changed_continuous = false;
+                let mut sun_action: Option<&'static str> = None;
+                {
+                    let sun = &mut self.scene.sun_lights[sun_idx];
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Inspector de Sol").strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if icon_btn(ui, SvgIcon::Trash, 14.0, [30.0, btn_h], false)
+                                .on_hover_text("Eliminar Sol")
+                                .clicked()
+                            {
+                                sun_action = Some("delete");
+                            }
+                            if icon_btn(ui, SvgIcon::Duplicate, 14.0, [30.0, btn_h], false)
+                                .on_hover_text("Duplicar Sol")
+                                .clicked()
+                            {
+                                sun_action = Some("duplicate");
+                            }
+                        });
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Nombre:");
+                        if ui.text_edit_singleline(&mut sun.name).changed() {
+                            changed_continuous = true;
+                        }
+                    });
+
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.checkbox(&mut sun.enabled, "Sol encendido").changed() {
+                            changed_continuous = true;
+                        }
+                        if ui.checkbox(&mut sun.visible, "Mostrar 3D").changed() {
+                            changed_continuous = true;
+                        }
+                    });
+
+                    ui.add_space(4.0);
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut sun.intensity, 0.0..=5.0)
+                                .fixed_decimals(2)
+                                .text("Intensidad"),
+                        )
+                        .changed()
+                    {
+                        changed_continuous = true;
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        for (lbl, val) in [
+                            ("0.5x", 0.5_f32),
+                            ("1.0x", 1.0),
+                            ("1.5x", 1.5),
+                            ("2.5x", 2.5),
+                            ("4.0x", 4.0),
+                        ] {
+                            let active = (sun.intensity - val).abs() < 0.05;
+                            if ui
+                                .add_sized([46.0, btn_h], egui::Button::selectable(active, lbl))
+                                .clicked()
+                            {
+                                sun.intensity = val;
+                                changed_continuous = true;
+                            }
+                        }
+                    });
+
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut sun.ambient, 0.0..=0.8)
+                                .fixed_decimals(2)
+                                .text("Luz ambiental"),
+                        )
+                        .changed()
+                    {
+                        changed_continuous = true;
+                    }
+
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Color luz:");
+                        let mut rgba = sun.color;
+                        if ui.color_edit_button_srgba_unmultiplied(&mut rgba).changed() {
+                            sun.color = rgba;
+                            changed_continuous = true;
+                        }
+                        for (lbl, col) in [
+                            ("Mediodía", [255, 248, 232, 255]),
+                            ("Cálido", [255, 224, 170, 255]),
+                            ("Ocaso", [255, 160, 96, 255]),
+                            ("Frío", [185, 220, 255, 255]),
+                        ] {
+                            if ui
+                                .add_sized([68.0, btn_h], egui::Button::new(lbl))
+                                .clicked()
+                            {
+                                sun.color = col;
+                                changed_continuous = true;
+                            }
+                        }
+                    });
+
+                    ui.add_space(4.0);
+                    let drag_w = if compact { 72.0 } else { 64.0 };
+                    egui::Grid::new("sun_transform_grid")
+                        .num_columns(4)
+                        .spacing([6.0, 6.0])
+                        .show(ui, |ui| {
+                            ui.label("Pos");
+                            for axis in 0..3 {
+                                if ui
+                                    .add_sized(
+                                        [drag_w, if compact { 32.0 } else { 22.0 }],
+                                        egui::DragValue::new(&mut sun.position[axis])
+                                            .speed(0.05)
+                                            .fixed_decimals(2),
+                                    )
+                                    .changed()
+                                {
+                                    changed_continuous = true;
+                                }
+                            }
+                            ui.end_row();
+                        });
+
+                    if ui
+                        .checkbox(&mut sun.aim_at_origin, "Apuntar siempre al origen (0,0,0)")
+                        .changed()
+                    {
+                        changed_continuous = true;
+                    }
+
+                    if !sun.aim_at_origin {
+                        egui::Grid::new("sun_dir_grid")
+                            .num_columns(4)
+                            .spacing([6.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.label("Dir");
+                                for axis in 0..3 {
+                                    if ui
+                                        .add_sized(
+                                            [drag_w, if compact { 32.0 } else { 22.0 }],
+                                            egui::DragValue::new(&mut sun.direction[axis])
+                                                .speed(0.02)
+                                                .fixed_decimals(2),
+                                        )
+                                        .changed()
+                                    {
+                                        changed_continuous = true;
+                                    }
+                                }
+                                ui.end_row();
+                            });
+                        if ui
+                            .add_sized([140.0, btn_h], egui::Button::new("Apuntar al centro"))
+                            .clicked()
+                        {
+                            sun.aim_at_origin = true;
+                            changed_continuous = true;
+                        }
+                    }
+                }
+
+                if changed_continuous {
+                    self.begin_continuous_edit(ui);
+                }
+                self.flush_continuous_edit(ui);
+
+                if let Some(act) = sun_action {
+                    match act {
+                        "duplicate" => {
+                            self.push_undo();
+                            let mut cloned = self.scene.sun_lights[sun_idx].clone();
+                            cloned.name = format!("{}_copia", cloned.name);
+                            cloned.position[0] += 1.2;
+                            self.scene.sun_lights.push(cloned);
+                            self.selection = Some(Selection::Sun(self.scene.sun_lights.len() - 1));
+                        }
+                        "delete" => {
+                            self.push_undo();
+                            self.scene.sun_lights.remove(sun_idx);
+                            self.selection = if !self.scene.sun_lights.is_empty() {
+                                Some(Selection::Sun(sun_idx.min(self.scene.sun_lights.len() - 1)))
+                            } else if !self.scene.parts.is_empty() {
+                                Some(Selection::Part(0))
+                            } else {
+                                None
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                self.render_model_physics_section(ui, dirty, compact);
+                return;
+            }
+        }
+
         if let Some(Selection::Group(g_name)) = self.selection.clone() {
             let group_parts: Vec<usize> = self
                 .scene
@@ -1469,6 +1865,16 @@ impl StudioApp {
                 let mut brush_strength = self.terrain_brush_strength;
                 let mut sculpt_last = self.terrain_sculpt_last;
                 let mut sel_vert_idx = self.selected_vertex_idx;
+                let mut global_tex_on = self.textures_enabled;
+                let mut tex_action: Option<&'static str> = None;
+                let mut discrete_part_tex_toggle: Option<bool> = None;
+                let mut discrete_part_tex_idx: Option<Option<usize>> = None;
+                let tex_choices: Vec<(usize, String, u16, u16)> = self
+                    .imported_textures
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| (i, t.name.clone(), t.width, t.height))
+                    .collect();
 
                 {
                     let part = &mut self.scene.parts[sel_idx];
@@ -1747,6 +2153,63 @@ impl StudioApp {
                         changed_continuous = true;
                         *dirty = true;
                     }
+
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.label(egui::RichText::new("Textura del modelo y pieza").strong());
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(&mut global_tex_on, "Activar texturas (modelo)");
+                        let mut part_tex = part.texture_enabled;
+                        if ui.checkbox(&mut part_tex, "En esta pieza").changed() {
+                            discrete_part_tex_toggle = Some(part_tex);
+                        }
+                    });
+                    let cur_tex_label = match part.texture_index.and_then(|ti| tex_choices.get(ti)) {
+                        Some((_, name, w, h)) => format!("{name} ({w}x{h})"),
+                        None if !tex_choices.is_empty() => format!("Auto ({})", tex_choices[0].1),
+                        None => String::from("Por defecto (Damero 16x16)"),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label("Mapa:");
+                        egui::ComboBox::from_id_salt("part_texture_combo")
+                            .selected_text(cur_tex_label)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(part.texture_index.is_none(), "Por defecto / Auto")
+                                    .clicked()
+                                {
+                                    discrete_part_tex_idx = Some(None);
+                                }
+                                for (ti, name, w, h) in &tex_choices {
+                                    let active = part.texture_index == Some(*ti);
+                                    if ui
+                                        .selectable_label(active, format!("{name} ({w}x{h})"))
+                                        .clicked()
+                                    {
+                                        discrete_part_tex_idx = Some(Some(*ti));
+                                    }
+                                }
+                            });
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        if icon_text_btn(ui, SvgIcon::Texture, 13.0, "Generar textura", [118.0, btn_h], false)
+                            .clicked()
+                        {
+                            tex_action = Some("generate_tex");
+                        }
+                        if icon_text_btn(ui, SvgIcon::Upload, 13.0, "Cargar imagen", [112.0, btn_h], false)
+                            .on_hover_text("Importa una textura .png, .jpg o .f3t")
+                            .clicked()
+                        {
+                            tex_action = Some("load_tex");
+                        }
+                        if ui
+                            .add_sized([114.0, btn_h], egui::Button::new("Aplicar a todas"))
+                            .clicked()
+                        {
+                            tex_action = Some("apply_tex_all");
+                        }
+                    });
 
                     ui.add_space(6.0);
                     ui.horizontal_wrapped(|ui| {
@@ -2333,6 +2796,53 @@ impl StudioApp {
                     self.scene.parts[sel_idx].collider_auto_fit = auto_fit;
                     *dirty = true;
                 }
+                if global_tex_on != self.textures_enabled {
+                    self.textures_enabled = global_tex_on;
+                    self.status_note = if self.textures_enabled {
+                        String::from("Texturas del modelo activadas")
+                    } else {
+                        String::from("Texturas del modelo desactivadas")
+                    };
+                }
+                if let Some(t_en) = discrete_part_tex_toggle {
+                    self.push_undo();
+                    self.scene.parts[sel_idx].texture_enabled = t_en;
+                }
+                if let Some(t_idx) = discrete_part_tex_idx {
+                    self.push_undo();
+                    self.scene.parts[sel_idx].texture_index = t_idx;
+                    self.scene.parts[sel_idx].texture_enabled = true;
+                    self.textures_enabled = true;
+                }
+                if let Some(act) = tex_action {
+                    match act {
+                        "generate_tex" => {
+                            self.push_undo();
+                            let tex = self.build_texture_asset();
+                            let idx = self.imported_textures.len();
+                            self.imported_textures.push(tex);
+                            self.sync_textures_cache();
+                            self.textures_enabled = true;
+                            self.scene.parts[sel_idx].texture_index = Some(idx);
+                            self.scene.parts[sel_idx].texture_enabled = true;
+                            self.status_note = String::from("Textura de paleta generada y aplicada");
+                        }
+                        "load_tex" => {
+                            self.request_import(ui.ctx(), ".png,.jpg,.jpeg,.webp,.f3t");
+                        }
+                        "apply_tex_all" => {
+                            self.push_undo();
+                            let t_idx = self.scene.parts[sel_idx].texture_index;
+                            let t_en = self.scene.parts[sel_idx].texture_enabled;
+                            for p in &mut self.scene.parts {
+                                p.texture_index = t_idx;
+                                p.texture_enabled = t_en;
+                            }
+                            self.status_note = String::from("Textura aplicada a todas las piezas");
+                        }
+                        _ => {}
+                    }
+                }
 
                 ui.horizontal(|ui| {
                     ui.add_sized([120.0, btn_h], egui::TextEdit::singleline(&mut self.new_group_draft));
@@ -2450,13 +2960,13 @@ impl StudioApp {
                             ui,
                             SvgIcon::Folder,
                             15.0,
-                            "Abrir .f3d / .f2d / .f3*",
-                            [184.0, btn_h],
+                            "Abrir .f3* / .png / .jpg",
+                            [190.0, btn_h],
                             false,
                         )
                         .clicked()
                         {
-                            self.request_import(ui.ctx(), ".f3d,.f3a,.f3p,.f2d,.f3t,.glb,.gltf");
+                            self.request_import(ui.ctx(), ".f3d,.f3a,.f3p,.f2d,.f3t,.png,.jpg,.jpeg,.webp,.glb,.gltf");
                         }
                     });
 
@@ -2711,9 +3221,40 @@ impl StudioApp {
     fn apply_gizmo_drag(&mut self, world_delta: f32) {
         let Some(drag) = &self.active_gizmo_drag else { return };
         let axis_idx = drag.axis as usize;
-        let indices = self.selected_part_indices();
         let snap = self.snap_enabled;
 
+        if let Some(Selection::Sun(sun_idx)) = self.selection {
+            if let (Some(start_sun), Some(sun)) = (
+                drag.start_suns.get(sun_idx),
+                self.scene.sun_lights.get_mut(sun_idx),
+            ) {
+                match drag.mode {
+                    GizmoMode::Translate => {
+                        let mut v = start_sun.position[axis_idx] + world_delta;
+                        if snap {
+                            v = Self::snap_step(v, 0.25);
+                        }
+                        sun.position[axis_idx] = v;
+                    }
+                    GizmoMode::Rotate => {
+                        let angle = world_delta * 0.75;
+                        sun.aim_at_origin = false;
+                        sun.direction = rotate_vec3_axis(start_sun.direction, axis_idx, angle);
+                    }
+                    GizmoMode::Scale => {
+                        let mut v = (start_sun.intensity + world_delta).clamp(0.0, 5.0);
+                        if snap {
+                            v = Self::snap_step(v, 0.25);
+                        }
+                        sun.intensity = v;
+                    }
+                    GizmoMode::Vertices => {}
+                }
+            }
+            return;
+        }
+
+        let indices = self.selected_part_indices();
         for idx in indices {
             let Some(start_part) = drag.start_parts.get(idx) else { continue };
             let Some(part) = self.scene.parts.get_mut(idx) else { continue };
@@ -2848,6 +3389,7 @@ impl StudioApp {
                     axis,
                     mode: self.gizmo_mode,
                     start_parts: self.scene.parts.clone(),
+                    start_suns: self.scene.sun_lights.clone(),
                     accum_pixels: 0.0,
                 });
             }
@@ -2942,9 +3484,10 @@ impl StudioApp {
 
         if response.drag_stopped() {
             if let Some(drag) = self.active_gizmo_drag.take() {
-                if drag.start_parts != self.scene.parts {
+                if drag.start_parts != self.scene.parts || drag.start_suns != self.scene.sun_lights {
                     let mut prev_scene = self.scene.clone();
                     prev_scene.parts = drag.start_parts;
+                    prev_scene.sun_lights = drag.start_suns;
                     self.push_undo_entry(HistoryEntry {
                         scene: prev_scene,
                         selection: self.selection.clone(),
@@ -2983,16 +3526,27 @@ impl StudioApp {
                 let (ray_origin, ray_dir) = self.camera.screen_ray(norm_x, norm_y, aspect);
 
                 let mut best_t = f32::INFINITY;
-                let mut best_part = None;
+                let mut best_sel: Option<Selection> = None;
                 for (mesh_idx, baked) in self.baked_model.parts.iter().enumerate() {
                     if let Some(t) = ray_intersects_aabb(ray_origin, ray_dir, baked.bounds) {
                         if t < best_t {
                             best_t = t;
-                            best_part = self.part_map.get(mesh_idx).copied();
+                            best_sel = self.part_map.get(mesh_idx).copied().map(Selection::Part);
                         }
                     }
                 }
-                self.selection = best_part.map(Selection::Part);
+                for (sun_idx, sun) in self.scene.sun_lights.iter().enumerate() {
+                    if !sun.visible {
+                        continue;
+                    }
+                    if let Some(t) = ray_intersects_sphere(ray_origin, ray_dir, sun.position, 0.36) {
+                        if t < best_t {
+                            best_t = t;
+                            best_sel = Some(Selection::Sun(sun_idx));
+                        }
+                    }
+                }
+                self.selection = best_sel;
                 self.selected_vertex_idx = None;
             }
         }
@@ -3005,6 +3559,70 @@ impl StudioApp {
         let show_grid = self.show_grid;
         let show_colliders = self.show_colliders || self.sim_world.is_some();
         let wireframe = self.wireframe;
+        let textures_enabled = self.textures_enabled;
+        let tex_gen = self.texture_generation;
+        let textures_arc = Arc::clone(&self.textures_shared);
+        let part_use_tex: Vec<bool> = self
+            .part_map
+            .iter()
+            .map(|&src_idx| {
+                self.scene
+                    .parts
+                    .get(src_idx)
+                    .map_or(true, |p| p.texture_enabled)
+            })
+            .collect();
+        let part_tex_indices: Vec<Option<usize>> = self
+            .part_map
+            .iter()
+            .map(|&src_idx| {
+                self.scene
+                    .parts
+                    .get(src_idx)
+                    .and_then(|p| p.texture_index)
+            })
+            .collect();
+        let has_scene_suns = !self.scene.sun_lights.is_empty();
+        let sun_lights: Vec<RenderSunLight> = self
+            .scene
+            .sun_lights
+            .iter()
+            .filter(|s| s.enabled && s.intensity > 0.0001)
+            .take(4)
+            .map(|s| RenderSunLight {
+                dir_to_light: s.light_vector(),
+                color: [
+                    s.color[0] as f32 / 255.0,
+                    s.color[1] as f32 / 255.0,
+                    s.color[2] as f32 / 255.0,
+                ],
+                intensity: s.intensity,
+                ambient: s.ambient,
+            })
+            .collect();
+        let selected_sun_idx = match self.selection {
+            Some(Selection::Sun(i)) => Some(i),
+            _ => None,
+        };
+        let sun_markers: Vec<RenderSunMarker> = self
+            .scene
+            .sun_lights
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.visible)
+            .map(|(i, s)| RenderSunMarker {
+                position: s.position,
+                ray_dir: s.ray_direction(),
+                color: [
+                    s.color[0] as f32 / 255.0,
+                    s.color[1] as f32 / 255.0,
+                    s.color[2] as f32 / 255.0,
+                ],
+                intensity: s.intensity,
+                enabled: s.enabled,
+                selected: selected_sun_idx == Some(i),
+            })
+            .collect();
         let part_transforms = self.sim_part_transforms.clone();
         let aspect = rect.width() / rect.height().max(1.0);
 
@@ -3016,6 +3634,7 @@ impl StudioApp {
                     if let Some(renderer) = guard.as_mut() {
                         unsafe {
                             renderer.sync_model(gl, &model_clone, generation);
+                            renderer.sync_textures(gl, &textures_arc, tex_gen);
                             renderer.sync_collider_debug(gl, &model_clone, generation, show_colliders);
                             renderer.paint(
                                 gl,
@@ -3024,6 +3643,12 @@ impl StudioApp {
                                 &selected_mask,
                                 show_grid,
                                 wireframe,
+                                textures_enabled,
+                                &part_use_tex,
+                                &part_tex_indices,
+                                has_scene_suns,
+                                &sun_lights,
+                                &sun_markers,
                                 &part_transforms,
                             );
                         }
@@ -3150,7 +3775,7 @@ impl StudioApp {
         });
 
         // Bottom-left floating viewport display controls
-        let bar_w = if compact { (rect.width() - 16.0).max(200.0) } else { 460.0 };
+        let bar_w = if compact { (rect.width() - 16.0).max(200.0) } else { 548.0 };
         let bar_h = if compact { 38.0 } else { 32.0 };
         let overlay_rect = egui::Rect::from_min_size(
             rect.left_bottom() + egui::vec2(8.0, -(bar_h + 8.0)),
@@ -3168,6 +3793,17 @@ impl StudioApp {
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 let bh = if compact { 28.0 } else { 22.0 };
+                                if icon_text_btn(ui, SvgIcon::Texture, 14.0, "Texturas", [82.0, bh], self.textures_enabled)
+                                    .on_hover_text("Activar/desactivar texturas del modelo")
+                                    .clicked()
+                                {
+                                    self.textures_enabled = !self.textures_enabled;
+                                    self.status_note = if self.textures_enabled {
+                                        String::from("Texturas del modelo activadas")
+                                    } else {
+                                        String::from("Texturas del modelo desactivadas")
+                                    };
+                                }
                                 if icon_text_btn(ui, SvgIcon::Wire, 14.0, "Malla", [66.0, bh], self.wireframe).clicked() {
                                     self.wireframe = !self.wireframe;
                                 }
@@ -3767,6 +4403,41 @@ fn dist_point_to_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
     let t = ((p - a).dot(ab) / len_sq).clamp(0.0, 1.0);
     let proj = a + ab * t;
     p.distance(proj)
+}
+
+fn ray_intersects_sphere(origin: [f32; 3], dir: [f32; 3], center: [f32; 3], radius: f32) -> Option<f32> {
+    let oc = [
+        origin[0] - center[0],
+        origin[1] - center[1],
+        origin[2] - center[2],
+    ];
+    let a = dot_v(dir, dir);
+    let half_b = dot_v(oc, dir);
+    let c = dot_v(oc, oc) - radius * radius;
+    let disc = half_b * half_b - a * c;
+    if disc < 0.0 || a <= 1e-8 {
+        return None;
+    }
+    let sqrt_d = disc.sqrt();
+    let t1 = (-half_b - sqrt_d) / a;
+    if t1 >= 0.0 {
+        return Some(t1);
+    }
+    let t2 = (-half_b + sqrt_d) / a;
+    if t2 >= 0.0 {
+        return Some(t2);
+    }
+    None
+}
+
+fn rotate_vec3_axis(v: [f32; 3], axis: usize, angle_rad: f32) -> [f32; 3] {
+    let (s, c) = angle_rad.sin_cos();
+    let out = match axis {
+        0 => [v[0], v[1] * c - v[2] * s, v[1] * s + v[2] * c],
+        1 => [v[0] * c + v[2] * s, v[1], -v[0] * s + v[2] * c],
+        _ => [v[0] * c - v[1] * s, v[0] * s + v[1] * c, v[2]],
+    };
+    normalize_v(out)
 }
 
 #[cfg(target_os = "android")]

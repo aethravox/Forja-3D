@@ -57,6 +57,20 @@ pub fn import_gltf_or_glb_full(
 
     let buffers = resolve_buffers(&gltf.document, gltf.blob.as_deref(), base_dir)?;
     let images = resolve_images(&gltf.document, &buffers, base_dir);
+    let mut image_to_tex_idx: Vec<Option<usize>> = vec![None; images.len()];
+    let mut textures: Vec<Texture> = Vec::new();
+    for (img_idx, img_opt) in images.iter().enumerate() {
+        if let Some(img) = img_opt {
+            if let (Ok(w), Ok(h)) = (u16::try_from(img.width), u16::try_from(img.height)) {
+                if w > 0 && h > 0 {
+                    let tex_idx = textures.len();
+                    textures.push(Texture::new_rgba(img.name.clone(), w, h, img.rgba.clone()));
+                    image_to_tex_idx[img_idx] = Some(tex_idx);
+                }
+            }
+        }
+    }
+
     let mut parts: Vec<PartSpec> = Vec::new();
     let saw_draco = gltf
         .document
@@ -73,11 +87,25 @@ pub fn import_gltf_or_glb_full(
         .or_else(|| gltf.document.scenes().next())
     {
         for node in scene.nodes() {
-            collect_node(&node, IDENTITY, &buffers, &images, &mut parts);
+            collect_node(
+                &node,
+                IDENTITY,
+                &buffers,
+                &images,
+                &image_to_tex_idx,
+                &mut parts,
+            );
         }
     } else {
         for node in gltf.document.nodes() {
-            collect_node(&node, IDENTITY, &buffers, &images, &mut parts);
+            collect_node(
+                &node,
+                IDENTITY,
+                &buffers,
+                &images,
+                &image_to_tex_idx,
+                &mut parts,
+            );
         }
     }
 
@@ -110,19 +138,6 @@ pub fn import_gltf_or_glb_full(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| String::from("ModeloGLTF"));
 
-    let textures = images
-        .into_iter()
-        .flatten()
-        .filter_map(|img| {
-            let w = u16::try_from(img.width).ok()?;
-            let h = u16::try_from(img.height).ok()?;
-            if w == 0 || h == 0 {
-                return None;
-            }
-            Some(Texture::new_rgba(img.name, w, h, img.rgba))
-        })
-        .collect();
-
     Ok(ImportedGltf {
         scene: SceneDocument {
             model_name,
@@ -138,6 +153,7 @@ fn collect_node(
     parent_world: [[f32; 4]; 4],
     buffers: &[Vec<u8>],
     images: &[Option<DecodedImage>],
+    image_to_tex_idx: &[Option<usize>],
     out_parts: &mut Vec<PartSpec>,
 ) {
     let local = node.transform().matrix();
@@ -153,7 +169,7 @@ fn collect_node(
 
         let prim_count = mesh.primitives().count();
         for (prim_idx, primitive) in mesh.primitives().enumerate() {
-            if let Some(mesh_part) = convert_primitive(
+            if let Some((mesh_part, tex_idx)) = convert_primitive(
                 &primitive,
                 &base_name,
                 prim_idx,
@@ -162,8 +178,11 @@ fn collect_node(
                 norm_mat,
                 buffers,
                 images,
+                image_to_tex_idx,
             ) {
                 let mut part = PartSpec::from_mesh_part(mesh_part);
+                part.texture_index = tex_idx;
+                part.texture_enabled = tex_idx.is_some();
                 if prim_count > 1 {
                     part.group = Some(base_name.clone());
                 }
@@ -173,7 +192,7 @@ fn collect_node(
     }
 
     for child in node.children() {
-        collect_node(&child, world, buffers, images, out_parts);
+        collect_node(&child, world, buffers, images, image_to_tex_idx, out_parts);
     }
 }
 
@@ -187,7 +206,8 @@ fn convert_primitive(
     norm_mat: [[f32; 3]; 3],
     buffers: &[Vec<u8>],
     images: &[Option<DecodedImage>],
-) -> Option<MeshPart> {
+    image_to_tex_idx: &[Option<usize>],
+) -> Option<(MeshPart, Option<usize>)> {
     let reader = primitive.reader(|buffer| buffers.get(buffer.index()).map(Vec::as_slice));
     let positions: Vec<[f32; 3]> = reader.read_positions()?.collect();
     if positions.is_empty() {
@@ -224,10 +244,15 @@ fn convert_primitive(
         float_to_u8(cf[2]),
         float_to_u8(cf[3]),
     ];
-    let tex_img = pbr
+    let tex_source_idx = pbr
         .base_color_texture()
-        .and_then(|info| images.get(info.texture().source().index()))
+        .map(|info| info.texture().source().index());
+    let tex_img = tex_source_idx
+        .and_then(|idx| images.get(idx))
         .and_then(|opt| opt.as_ref());
+    let mapped_tex_idx = tex_source_idx
+        .and_then(|idx| image_to_tex_idx.get(idx).copied().flatten());
+    let uses_gpu_tex = mapped_tex_idx.is_some() && uvs.is_some();
 
     let metallic = pbr.metallic_factor().clamp(0.0, 1.0);
     let roughness = pbr.roughness_factor().clamp(0.05, 1.0);
@@ -254,12 +279,14 @@ fn convert_primitive(
 
         let mut color = base_factor;
         if let Some(img) = tex_img {
-            let tc = if uvs.is_some() {
-                img.sample(uv)
-            } else {
-                img.average
-            };
-            color = mul_rgba(color, tc);
+            if !uses_gpu_tex {
+                let tc = if uvs.is_some() {
+                    img.sample(uv)
+                } else {
+                    img.average
+                };
+                color = mul_rgba(color, tc);
+            }
         }
         if let Some(vc) = colors.as_ref().and_then(|c| c.get(i).copied()) {
             color = mul_rgba(color, vc);
@@ -284,7 +311,7 @@ fn convert_primitive(
         (sum_rgba[2] / n_verts) as u8,
         (sum_rgba[3] / n_verts) as u8,
     ];
-    let display_base_color = if tex_img.is_some() || colors.is_some() {
+    let display_base_color = if (!uses_gpu_tex && tex_img.is_some()) || colors.is_some() {
         avg_color
     } else {
         base_factor
@@ -314,7 +341,7 @@ fn convert_primitive(
         bounds: Aabb::EMPTY,
     };
     mesh_part.recompute_bounds();
-    Some(mesh_part)
+    Some((mesh_part, if uses_gpu_tex { mapped_tex_idx } else { None }))
 }
 
 #[inline]

@@ -30,7 +30,7 @@ pub use mesh_ops::{
     TerrainSpec, TerrainStamp,
 };
 pub use pack::{ForjaPack, Pack, F3P_MAGIC, F3P_VERSION};
-pub use primitives::{PartSpec, PrimitiveKind, SceneDocument};
+pub use primitives::{PartSpec, PrimitiveKind, SceneDocument, SunLightSpec};
 pub use skeleton::{Joint, Skeleton, VertexSkinning};
 pub use texture::{Texture, TextureError, TexturePixelFormat, F3T_MAGIC, F3T_VERSION};
 pub use ui2d::{Anchor2D, Document2D, UiDocument2D, Widget2D, WidgetKind2D, F2D_MAGIC, F2D_VERSION};

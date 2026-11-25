@@ -1,7 +1,25 @@
 use eframe::glow;
 use glow::HasContext;
 
-use forja3d::{Aabb, ColliderShape, Model};
+use forja3d::{Aabb, ColliderShape, Model, Texture, TexturePixelFormat};
+
+#[derive(Debug, Clone, Copy)]
+pub struct RenderSunLight {
+    pub dir_to_light: [f32; 3],
+    pub color: [f32; 3],
+    pub intensity: f32,
+    pub ambient: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RenderSunMarker {
+    pub position: [f32; 3],
+    pub ray_dir: [f32; 3],
+    pub color: [f32; 3],
+    pub intensity: f32,
+    pub enabled: bool,
+    pub selected: bool,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct OrbitCamera {
@@ -161,6 +179,11 @@ pub struct GlViewportRenderer {
     debug_vao: glow::VertexArray,
     debug_vbo: glow::Buffer,
     debug_ranges: Vec<(Option<usize>, i32, i32)>,
+    sun_vao: glow::VertexArray,
+    sun_vbo: glow::Buffer,
+    gpu_textures: Vec<glow::Texture>,
+    fallback_texture: glow::Texture,
+    uploaded_tex_gen: u64,
     parts: Vec<GpuPart>,
     uploaded_generation: u64,
     uploaded_debug_key: u64,
@@ -179,6 +202,7 @@ impl GlViewportRenderer {
             layout(location = 0) in vec3 a_pos;
             layout(location = 1) in vec3 a_normal;
             layout(location = 2) in vec4 a_color;
+            layout(location = 3) in vec2 a_uv;
 
             uniform mat4 u_mvp;
             uniform vec3 u_pivot;
@@ -187,6 +211,7 @@ impl GlViewportRenderer {
             out vec3 v_world_pos;
             out vec3 v_normal;
             out vec4 v_color;
+            out vec2 v_uv;
 
             vec3 rotate_quat(vec4 q, vec3 v) {{
                 vec3 t = 2.0 * cross(q.xyz, v);
@@ -198,6 +223,7 @@ impl GlViewportRenderer {
                 v_world_pos = pos;
                 v_normal = rotate_quat(u_quat, a_normal);
                 v_color = a_color;
+                v_uv = a_uv;
                 gl_Position = u_mvp * vec4(pos, 1.0);
             }}"
         );
@@ -207,34 +233,67 @@ impl GlViewportRenderer {
             in vec3 v_world_pos;
             in vec3 v_normal;
             in vec4 v_color;
+            in vec2 v_uv;
 
             uniform vec3 u_eye;
             uniform float u_metallic;
             uniform float u_roughness;
             uniform float u_selected;
+            uniform sampler2D u_tex;
+            uniform float u_use_tex;
+            uniform float u_use_scene_suns;
+            uniform int u_sun_count;
+            uniform float u_scene_ambient;
+            uniform vec3 u_sun_dirs[4];
+            uniform vec3 u_sun_colors[4];
+            uniform float u_sun_intensities[4];
             out vec4 frag_color;
 
             void main() {{
                 float n_len = length(v_normal);
                 vec3 n = n_len > 0.0001 ? (v_normal / n_len) : vec3(0.0, 1.0, 0.0);
                 vec3 v = normalize(u_eye - v_world_pos);
-                vec3 key_dir = normalize(vec3(0.55, 0.85, 0.45));
-                vec3 fill_dir = normalize(vec3(-0.7, 0.35, -0.5));
-
-                float key_diff = max(dot(n, key_dir), 0.0);
-                float fill_diff = max(dot(n, fill_dir), 0.0);
-                vec3 half_vec = normalize(key_dir + v);
+                vec4 tex_sample = texture(u_tex, v_uv);
+                vec4 albedo = mix(v_color, vec4(v_color.rgb * tex_sample.rgb, v_color.a * tex_sample.a), u_use_tex);
                 float shininess = mix(96.0, 8.0, clamp(u_roughness, 0.05, 1.0));
-                float spec = pow(max(dot(n, half_vec), 0.0), shininess) * mix(0.25, 1.15, u_metallic);
+                float spec_strength = mix(0.25, 1.15, u_metallic);
+
+                vec3 ambient = vec3(0.0);
+                vec3 diffuse = vec3(0.0);
+                vec3 spec_col = vec3(0.0);
+
+                if (u_use_scene_suns > 0.5) {{
+                    float hemi = max(n.y * 0.5 + 0.5, 0.0);
+                    ambient = albedo.rgb * (u_scene_ambient * (0.85 + 0.25 * hemi));
+                    for (int i = 0; i < 4; ++i) {{
+                        if (i >= u_sun_count) {{
+                            break;
+                        }}
+                        float inten = max(u_sun_intensities[i], 0.0);
+                        vec3 l_dir = normalize(u_sun_dirs[i]);
+                        float l_diff = max(dot(n, l_dir), 0.0);
+                        vec3 half_vec = normalize(l_dir + v);
+                        float l_spec = pow(max(dot(n, half_vec), 0.0), shininess) * spec_strength;
+                        diffuse += albedo.rgb * u_sun_colors[i] * (l_diff * inten);
+                        spec_col += mix(u_sun_colors[i], albedo.rgb * u_sun_colors[i], u_metallic) * (l_spec * inten);
+                    }}
+                }} else {{
+                    vec3 key_dir = normalize(vec3(0.55, 0.85, 0.45));
+                    vec3 fill_dir = normalize(vec3(-0.7, 0.35, -0.5));
+                    float key_diff = max(dot(n, key_dir), 0.0);
+                    float fill_diff = max(dot(n, fill_dir), 0.0);
+                    vec3 half_vec = normalize(key_dir + v);
+                    float spec = pow(max(dot(n, half_vec), 0.0), shininess) * spec_strength;
+                    ambient = albedo.rgb * 0.24;
+                    diffuse = albedo.rgb * (key_diff * 0.85 + fill_diff * 0.28);
+                    spec_col = mix(vec3(1.0), albedo.rgb, u_metallic) * spec;
+                }}
 
                 float rim = pow(1.0 - max(dot(n, v), 0.0), 2.5);
-                vec3 ambient = v_color.rgb * 0.24;
-                vec3 diffuse = v_color.rgb * (key_diff * 0.85 + fill_diff * 0.28);
-                vec3 spec_col = mix(vec3(1.0), v_color.rgb, u_metallic) * spec;
                 vec3 rim_col = mix(vec3(0.45, 0.55, 0.72), vec3(0.98, 0.65, 0.12), u_selected) * rim * mix(0.22, 0.85, u_selected);
 
                 vec3 col = ambient + diffuse + spec_col + rim_col;
-                frag_color = vec4(col, v_color.a);
+                frag_color = vec4(col, albedo.a);
             }}"
         );
 
@@ -297,6 +356,19 @@ impl GlViewportRenderer {
         gl.vertex_attrib_pointer_f32(1, 3, glow::FLOAT, false, 24, 12);
         gl.bind_vertex_array(None);
 
+        let sun_vao = gl.create_vertex_array()?;
+        let sun_vbo = gl.create_buffer()?;
+        gl.bind_vertex_array(Some(sun_vao));
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(sun_vbo));
+        gl.enable_vertex_attrib_array(0);
+        gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, 24, 0);
+        gl.enable_vertex_attrib_array(1);
+        gl.vertex_attrib_pointer_f32(1, 3, glow::FLOAT, false, 24, 12);
+        gl.bind_vertex_array(None);
+
+        let fallback_rgba = build_default_checker_rgba();
+        let fallback_texture = create_rgba_texture(gl, 16, 16, &fallback_rgba)?;
+
         Ok(Self {
             program,
             line_program,
@@ -306,10 +378,31 @@ impl GlViewportRenderer {
             debug_vao,
             debug_vbo,
             debug_ranges: Vec::new(),
+            sun_vao,
+            sun_vbo,
+            gpu_textures: Vec::new(),
+            fallback_texture,
+            uploaded_tex_gen: 0,
             parts: Vec::new(),
             uploaded_generation: 0,
             uploaded_debug_key: 0,
         })
+    }
+
+    pub unsafe fn sync_textures(&mut self, gl: &glow::Context, textures: &[Texture], tex_gen: u64) {
+        if self.uploaded_tex_gen == tex_gen {
+            return;
+        }
+        self.uploaded_tex_gen = tex_gen;
+        for tex in self.gpu_textures.drain(..) {
+            gl.delete_texture(tex);
+        }
+        for tex in textures {
+            let rgba = decode_texture_rgba(tex);
+            if let Ok(gl_tex) = create_rgba_texture(gl, tex.width as i32, tex.height as i32, &rgba) {
+                self.gpu_textures.push(gl_tex);
+            }
+        }
     }
 
     pub unsafe fn sync_collider_debug(
@@ -357,7 +450,7 @@ impl GlViewportRenderer {
         }
 
         for part in &model.parts {
-            let mut vdata: Vec<f32> = Vec::with_capacity(part.vertices.len() * 10);
+            let mut vdata: Vec<f32> = Vec::with_capacity(part.vertices.len() * 12);
             for v in &part.vertices {
                 vdata.extend_from_slice(&v.position);
                 vdata.extend_from_slice(&v.normal);
@@ -365,6 +458,7 @@ impl GlViewportRenderer {
                 vdata.push(v.color[1] as f32 / 255.0);
                 vdata.push(v.color[2] as f32 / 255.0);
                 vdata.push(v.color[3] as f32 / 255.0);
+                vdata.extend_from_slice(&v.uv);
             }
 
             let mut wire_indices: Vec<u32> = Vec::with_capacity(part.indices.len() * 2);
@@ -384,11 +478,13 @@ impl GlViewportRenderer {
             gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytemuck_slice(&vdata), glow::STATIC_DRAW);
 
             gl.enable_vertex_attrib_array(0);
-            gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, 40, 0);
+            gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, 48, 0);
             gl.enable_vertex_attrib_array(1);
-            gl.vertex_attrib_pointer_f32(1, 3, glow::FLOAT, false, 40, 12);
+            gl.vertex_attrib_pointer_f32(1, 3, glow::FLOAT, false, 48, 12);
             gl.enable_vertex_attrib_array(2);
-            gl.vertex_attrib_pointer_f32(2, 4, glow::FLOAT, false, 40, 24);
+            gl.vertex_attrib_pointer_f32(2, 4, glow::FLOAT, false, 48, 24);
+            gl.enable_vertex_attrib_array(3);
+            gl.vertex_attrib_pointer_f32(3, 2, glow::FLOAT, false, 48, 40);
 
             gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ebo));
             gl.buffer_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, bytemuck_slice(&part.indices), glow::STATIC_DRAW);
@@ -411,6 +507,7 @@ impl GlViewportRenderer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn paint(
         &self,
         gl: &glow::Context,
@@ -419,6 +516,12 @@ impl GlViewportRenderer {
         selected_mask: &[bool],
         show_grid: bool,
         wireframe: bool,
+        textures_enabled: bool,
+        part_use_tex: &[bool],
+        part_tex_indices: &[Option<usize>],
+        has_scene_suns: bool,
+        sun_lights: &[RenderSunLight],
+        sun_markers: &[RenderSunMarker],
         part_transforms: &[([f32; 3], [f32; 4], [f32; 3])],
     ) {
         let view = camera.view_matrix();
@@ -463,6 +566,45 @@ impl GlViewportRenderer {
         if let Some(loc) = gl.get_uniform_location(self.program, "u_eye") {
             gl.uniform_3_f32_slice(Some(&loc), &eye);
         }
+        if let Some(loc) = gl.get_uniform_location(self.program, "u_tex") {
+            gl.uniform_1_i32(Some(&loc), 0);
+        }
+        if let Some(loc) = gl.get_uniform_location(self.program, "u_use_scene_suns") {
+            gl.uniform_1_f32(Some(&loc), if has_scene_suns { 1.0 } else { 0.0 });
+        }
+        let sun_count = sun_lights.len().min(4);
+        if let Some(loc) = gl.get_uniform_location(self.program, "u_sun_count") {
+            gl.uniform_1_i32(Some(&loc), sun_count as i32);
+        }
+        let scene_ambient = if sun_lights.is_empty() {
+            0.08
+        } else {
+            sun_lights
+                .iter()
+                .map(|s| s.ambient)
+                .fold(0.0_f32, f32::max)
+        };
+        if let Some(loc) = gl.get_uniform_location(self.program, "u_scene_ambient") {
+            gl.uniform_1_f32(Some(&loc), scene_ambient);
+        }
+        for i in 0..4 {
+            let (dir, col, inten) = if let Some(s) = sun_lights.get(i) {
+                (s.dir_to_light, s.color, s.intensity)
+            } else {
+                ([0.0, 1.0, 0.0], [1.0, 1.0, 1.0], 0.0)
+            };
+            if let Some(loc) = gl.get_uniform_location(self.program, &format!("u_sun_dirs[{i}]")) {
+                gl.uniform_3_f32_slice(Some(&loc), &dir);
+            }
+            if let Some(loc) = gl.get_uniform_location(self.program, &format!("u_sun_colors[{i}]")) {
+                gl.uniform_3_f32_slice(Some(&loc), &col);
+            }
+            if let Some(loc) = gl.get_uniform_location(self.program, &format!("u_sun_intensities[{i}]")) {
+                gl.uniform_1_f32(Some(&loc), inten);
+            }
+        }
+
+        gl.active_texture(glow::TEXTURE0);
 
         for (idx, part) in self.parts.iter().enumerate() {
             let is_sel = selected_mask.get(idx).copied().unwrap_or(false);
@@ -471,6 +613,24 @@ impl GlViewportRenderer {
                 .copied()
                 .unwrap_or((zero_vec, id_quat, zero_vec));
 
+            let part_tex_on = textures_enabled && part_use_tex.get(idx).copied().unwrap_or(true);
+            let bound_tex = if part_tex_on {
+                part_tex_indices
+                    .get(idx)
+                    .copied()
+                    .flatten()
+                    .and_then(|ti| self.gpu_textures.get(ti))
+                    .or_else(|| self.gpu_textures.first())
+                    .copied()
+                    .unwrap_or(self.fallback_texture)
+            } else {
+                self.fallback_texture
+            };
+            gl.bind_texture(glow::TEXTURE_2D, Some(bound_tex));
+
+            if let Some(loc) = gl.get_uniform_location(self.program, "u_use_tex") {
+                gl.uniform_1_f32(Some(&loc), if part_tex_on { 1.0 } else { 0.0 });
+            }
             if let Some(loc) = gl.get_uniform_location(self.program, "u_pivot") {
                 gl.uniform_3_f32_slice(Some(&loc), &pivot);
             }
@@ -521,6 +681,7 @@ impl GlViewportRenderer {
                 gl.use_program(Some(self.program));
             }
         }
+        gl.bind_texture(glow::TEXTURE_2D, None);
 
         if !self.debug_ranges.is_empty() {
             gl.use_program(Some(self.line_program));
@@ -548,6 +709,36 @@ impl GlViewportRenderer {
             }
         }
 
+        if !sun_markers.is_empty() {
+            let sun_verts = build_sun_marker_vertices(sun_markers);
+            if !sun_verts.is_empty() {
+                gl.use_program(Some(self.line_program));
+                if let Some(loc) = gl.get_uniform_location(self.line_program, "u_mvp") {
+                    gl.uniform_matrix_4_f32_slice(Some(&loc), false, &mvp);
+                }
+                if let Some(loc) = gl.get_uniform_location(self.line_program, "u_pivot") {
+                    gl.uniform_3_f32_slice(Some(&loc), &zero_vec);
+                }
+                if let Some(loc) = gl.get_uniform_location(self.line_program, "u_quat") {
+                    gl.uniform_4_f32_slice(Some(&loc), &id_quat);
+                }
+                if let Some(loc) = gl.get_uniform_location(self.line_program, "u_offset") {
+                    gl.uniform_3_f32_slice(Some(&loc), &zero_vec);
+                }
+                if let Some(loc) = gl.get_uniform_location(self.line_program, "u_use_override") {
+                    gl.uniform_1_f32(Some(&loc), 0.0);
+                }
+                gl.bind_vertex_array(Some(self.sun_vao));
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.sun_vbo));
+                gl.buffer_data_u8_slice(
+                    glow::ARRAY_BUFFER,
+                    bytemuck_slice(&sun_verts),
+                    glow::DYNAMIC_DRAW,
+                );
+                gl.draw_arrays(glow::LINES, 0, (sun_verts.len() / 6) as i32);
+            }
+        }
+
         gl.bind_vertex_array(None);
         gl.use_program(None);
         gl.disable(glow::DEPTH_TEST);
@@ -560,6 +751,12 @@ impl GlViewportRenderer {
         gl.delete_buffer(self.grid_vbo);
         gl.delete_vertex_array(self.debug_vao);
         gl.delete_buffer(self.debug_vbo);
+        gl.delete_vertex_array(self.sun_vao);
+        gl.delete_buffer(self.sun_vbo);
+        gl.delete_texture(self.fallback_texture);
+        for tex in self.gpu_textures.drain(..) {
+            gl.delete_texture(tex);
+        }
         for p in self.parts.drain(..) {
             gl.delete_vertex_array(p.vao);
             gl.delete_buffer(p.vbo);
@@ -786,5 +983,168 @@ fn build_collider_debug_vertices(model: &Model) -> (Vec<f32>, Vec<(Option<usize>
         }
     }
     (out, ranges)
+}
+
+unsafe fn create_rgba_texture(
+    gl: &glow::Context,
+    width: i32,
+    height: i32,
+    rgba: &[u8],
+) -> Result<glow::Texture, String> {
+    let tex = gl.create_texture()?;
+    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::REPEAT as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::REPEAT as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+    gl.tex_image_2d(
+        glow::TEXTURE_2D,
+        0,
+        glow::RGBA as i32,
+        width.max(1),
+        height.max(1),
+        0,
+        glow::RGBA,
+        glow::UNSIGNED_BYTE,
+        glow::PixelUnpackData::Slice(Some(rgba)),
+    );
+    gl.bind_texture(glow::TEXTURE_2D, None);
+    Ok(tex)
+}
+
+fn build_default_checker_rgba() -> Vec<u8> {
+    let size = 16usize;
+    let mut out = Vec::with_capacity(size * size * 4);
+    for y in 0..size {
+        for x in 0..size {
+            let checker = ((x / 4) + (y / 4)) % 2 == 0;
+            let border = x == 0 || y == 0 || x == size - 1 || y == size - 1;
+            let v = if border {
+                235
+            } else if checker {
+                215
+            } else {
+                160
+            };
+            out.extend_from_slice(&[v, v, v, 255]);
+        }
+    }
+    out
+}
+
+fn decode_texture_rgba(tex: &Texture) -> Vec<u8> {
+    let w = (tex.width as usize).max(1);
+    let h = (tex.height as usize).max(1);
+    let expected_pixels = w * h;
+    let mut out = vec![255u8; expected_pixels * 4];
+    match tex.format {
+        TexturePixelFormat::Rgba8 => {
+            let copy_len = tex.data.len().min(out.len());
+            out[..copy_len].copy_from_slice(&tex.data[..copy_len]);
+        }
+        TexturePixelFormat::Rgb8 => {
+            for i in 0..expected_pixels {
+                let src = i * 3;
+                if src + 2 < tex.data.len() {
+                    let dst = i * 4;
+                    out[dst] = tex.data[src];
+                    out[dst + 1] = tex.data[src + 1];
+                    out[dst + 2] = tex.data[src + 2];
+                    out[dst + 3] = 255;
+                }
+            }
+        }
+        TexturePixelFormat::R8 => {
+            for i in 0..expected_pixels {
+                if let Some(&g) = tex.data.get(i) {
+                    let dst = i * 4;
+                    out[dst] = g;
+                    out[dst + 1] = g;
+                    out[dst + 2] = g;
+                    out[dst + 3] = 255;
+                }
+            }
+        }
+        TexturePixelFormat::RleRgba8 => {
+            let mut dst = 0usize;
+            for chunk in tex.data.chunks_exact(5) {
+                let count = chunk[0].max(1) as usize;
+                for _ in 0..count {
+                    if dst + 3 >= out.len() {
+                        break;
+                    }
+                    out[dst] = chunk[1];
+                    out[dst + 1] = chunk[2];
+                    out[dst + 2] = chunk[3];
+                    out[dst + 3] = chunk[4];
+                    dst += 4;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn build_sun_marker_vertices(markers: &[RenderSunMarker]) -> Vec<f32> {
+    let mut out = Vec::new();
+    for m in markers {
+        let col = if !m.enabled || m.intensity <= 0.001 {
+            [0.45, 0.48, 0.54]
+        } else if m.selected {
+            [0.99, 0.78, 0.18]
+        } else {
+            m.color
+        };
+        let c = m.position;
+        let r = 0.24_f32;
+        push_circle_wire(&mut out, c, r, 0, col);
+        push_circle_wire(&mut out, c, r, 1, col);
+        push_circle_wire(&mut out, c, r, 2, col);
+        if m.selected {
+            push_circle_wire(&mut out, c, r * 1.45, 0, [0.98, 0.65, 0.12]);
+            push_circle_wire(&mut out, c, r * 1.45, 1, [0.98, 0.65, 0.12]);
+        }
+
+        // Radial sunbeams
+        let ray_dirs = [
+            [1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+            [0.707, 0.707, 0.0],
+            [-0.707, 0.707, 0.0],
+            [0.707, -0.707, 0.0],
+            [-0.707, -0.707, 0.0],
+        ];
+        let inner = r * 1.15;
+        let outer = r * (1.55 + (m.intensity * 0.15).clamp(0.0, 0.45));
+        for d in ray_dirs {
+            push_line(
+                &mut out,
+                [c[0] + d[0] * inner, c[1] + d[1] * inner, c[2] + d[2] * inner],
+                [c[0] + d[0] * outer, c[1] + d[1] * outer, c[2] + d[2] * outer],
+                col,
+            );
+        }
+
+        // Light direction ray from sun toward scene
+        let dir = normalize(m.ray_dir);
+        let ray_len = 1.25;
+        let tip = [
+            c[0] + dir[0] * ray_len,
+            c[1] + dir[1] * ray_len,
+            c[2] + dir[2] * ray_len,
+        ];
+        let ray_col = if m.enabled && m.intensity > 0.001 {
+            [1.0, 0.90, 0.45]
+        } else {
+            [0.42, 0.44, 0.50]
+        };
+        push_line(&mut out, c, tip, ray_col);
+    }
+    out
 }
 

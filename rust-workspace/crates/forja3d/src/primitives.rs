@@ -93,6 +93,8 @@ pub struct PartSpec {
     pub restitution: f32,
     pub linear_damping: f32,
     pub gravity_scale: f32,
+    pub texture_enabled: bool,
+    pub texture_index: Option<usize>,
 }
 
 impl PartSpec {
@@ -140,6 +142,8 @@ impl PartSpec {
             },
             linear_damping: 0.04,
             gravity_scale: 1.0,
+            texture_enabled: true,
+            texture_index: None,
         }
     }
 
@@ -307,6 +311,8 @@ impl PartSpec {
             restitution: 0.3,
             linear_damping: 0.04,
             gravity_scale: 1.0,
+            texture_enabled: true,
+            texture_index: None,
         }
     }
 
@@ -441,9 +447,63 @@ impl PartSpec {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct SunLightSpec {
+    pub name: String,
+    pub position: [f32; 3],
+    pub direction: [f32; 3],
+    pub color: [u8; 4],
+    pub intensity: f32,
+    pub ambient: f32,
+    pub enabled: bool,
+    pub visible: bool,
+    pub aim_at_origin: bool,
+}
+
+impl SunLightSpec {
+    pub fn new(name: impl Into<String>) -> Self {
+        let pos = [3.2, 4.8, 2.6];
+        let dir = Vec3::new(-pos[0], -pos[1], -pos[2]).normalized().to_array();
+        Self {
+            name: name.into(),
+            position: pos,
+            direction: dir,
+            color: [255, 244, 214, 255],
+            intensity: 1.25,
+            ambient: 0.24,
+            enabled: true,
+            visible: true,
+            aim_at_origin: true,
+        }
+    }
+
+    /// Normalized direction vector from the illuminated surface toward the sun light source.
+    pub fn light_vector(&self) -> [f32; 3] {
+        if self.aim_at_origin {
+            let v = Vec3::new(self.position[0], self.position[1], self.position[2]);
+            if v.dot(v) > 1e-6 {
+                return v.normalized().to_array();
+            }
+        }
+        let d = Vec3::new(-self.direction[0], -self.direction[1], -self.direction[2]);
+        if d.dot(d) > 1e-6 {
+            d.normalized().to_array()
+        } else {
+            Vec3::new(0.55, 0.85, 0.45).normalized().to_array()
+        }
+    }
+
+    /// Normalized direction vector of light rays traveling from the sun toward the scene.
+    pub fn ray_direction(&self) -> [f32; 3] {
+        let lv = self.light_vector();
+        [-lv[0], -lv[1], -lv[2]]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SceneDocument {
     pub model_name: String,
     pub parts: Vec<PartSpec>,
+    pub sun_lights: Vec<SunLightSpec>,
     pub physics_enabled: bool,
     pub physics: PhysicsSpec,
 }
@@ -453,6 +513,7 @@ impl Default for SceneDocument {
         Self {
             model_name: String::from("MiModelo"),
             parts: Vec::new(),
+            sun_lights: Vec::new(),
             physics_enabled: false,
             physics: PhysicsSpec::default(),
         }
@@ -508,6 +569,7 @@ impl SceneDocument {
         Self {
             model_name: model.name,
             parts,
+            sun_lights: Vec::new(),
             physics_enabled,
             physics,
         }
@@ -620,6 +682,7 @@ impl SceneDocument {
                     ..PartSpec::new("brazo_transversal", PrimitiveKind::Cylinder)
                 },
             ],
+            sun_lights: Vec::new(),
             physics_enabled: true,
             physics: PhysicsSpec {
                 body_kind: RigidBodyKind::Dynamic,
@@ -671,6 +734,7 @@ impl SceneDocument {
                     ..PartSpec::new("corona", PrimitiveKind::Pyramid)
                 },
             ],
+            sun_lights: Vec::new(),
             physics_enabled: true,
             physics: PhysicsSpec {
                 body_kind: RigidBodyKind::Static,
@@ -716,6 +780,7 @@ impl SceneDocument {
                     ..PartSpec::new("faro_cumbre", PrimitiveKind::Pyramid)
                 },
             ],
+            sun_lights: Vec::new(),
             physics_enabled: true,
             physics: PhysicsSpec {
                 body_kind: RigidBodyKind::Static,
