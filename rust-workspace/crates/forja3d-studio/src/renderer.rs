@@ -21,12 +21,23 @@ pub struct RenderSunMarker {
     pub selected: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CameraViewPreset {
+    Front,
+    Back,
+    Right,
+    Left,
+    Top,
+    Iso,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct OrbitCamera {
     pub yaw: f32,
     pub pitch: f32,
     pub distance: f32,
     pub target: [f32; 3],
+    pub ortho: bool,
 }
 
 impl Default for OrbitCamera {
@@ -36,11 +47,41 @@ impl Default for OrbitCamera {
             pitch: 0.45,
             distance: 5.0,
             target: [0.0, 0.75, 0.0],
+            ortho: false,
         }
     }
 }
 
 impl OrbitCamera {
+    pub fn set_view_preset(&mut self, preset: CameraViewPreset) {
+        match preset {
+            CameraViewPreset::Front => {
+                self.yaw = core::f32::consts::FRAC_PI_2;
+                self.pitch = 0.0;
+            }
+            CameraViewPreset::Back => {
+                self.yaw = -core::f32::consts::FRAC_PI_2;
+                self.pitch = 0.0;
+            }
+            CameraViewPreset::Right => {
+                self.yaw = 0.0;
+                self.pitch = 0.0;
+            }
+            CameraViewPreset::Left => {
+                self.yaw = core::f32::consts::PI;
+                self.pitch = 0.0;
+            }
+            CameraViewPreset::Top => {
+                self.yaw = core::f32::consts::FRAC_PI_2;
+                self.pitch = 1.555;
+            }
+            CameraViewPreset::Iso => {
+                self.yaw = 0.72;
+                self.pitch = 0.45;
+            }
+        }
+    }
+
     pub fn eye(&self) -> [f32; 3] {
         let cp = self.pitch.cos();
         [
@@ -48,6 +89,23 @@ impl OrbitCamera {
             self.target[1] + self.distance * self.pitch.sin(),
             self.target[2] + self.distance * cp * self.yaw.sin(),
         ]
+    }
+
+    fn basis(&self) -> ([f32; 3], [f32; 3], [f32; 3], [f32; 3]) {
+        let eye = self.eye();
+        let forward = normalize([
+            self.target[0] - eye[0],
+            self.target[1] - eye[1],
+            self.target[2] - eye[2],
+        ]);
+        let world_up = if forward[1].abs() > 0.995 {
+            [0.0, 0.0, if forward[1] < 0.0 { -1.0 } else { 1.0 }]
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+        let right = normalize(cross(forward, world_up));
+        let up = cross(right, forward);
+        (eye, forward, right, up)
     }
 
     pub fn frame_bounds(&mut self, bounds: Aabb) {
@@ -66,23 +124,31 @@ impl OrbitCamera {
     }
 
     pub fn view_matrix(&self) -> [f32; 16] {
-        look_at(self.eye(), self.target, [0.0, 1.0, 0.0])
+        let (eye, forward, _, _) = self.basis();
+        let world_up = if forward[1].abs() > 0.995 {
+            [0.0, 0.0, if forward[1] < 0.0 { -1.0 } else { 1.0 }]
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+        look_at(eye, self.target, world_up)
     }
 
     pub fn proj_matrix(&self, aspect: f32) -> [f32; 16] {
-        let near = (self.distance * 0.004).clamp(0.005, 1.0);
-        let far = (self.distance * 30.0).max(500.0);
-        perspective(45.0_f32.to_radians(), aspect.max(0.1), near, far)
+        let aspect = aspect.max(0.1);
+        if self.ortho {
+            let half_h = (self.distance * (45.0_f32.to_radians() * 0.5).tan()).max(0.05);
+            let half_w = half_h * aspect;
+            let span = (self.distance * 30.0).max(500.0);
+            orthographic(-half_w, half_w, -half_h, half_h, -span, span)
+        } else {
+            let near = (self.distance * 0.004).clamp(0.005, 1.0);
+            let far = (self.distance * 30.0).max(500.0);
+            perspective(45.0_f32.to_radians(), aspect, near, far)
+        }
     }
 
     pub fn pan(&mut self, dx: f32, dy: f32) {
-        let forward = normalize([
-            self.target[0] - self.eye()[0],
-            self.target[1] - self.eye()[1],
-            self.target[2] - self.eye()[2],
-        ]);
-        let right = normalize(cross(forward, [0.0, 1.0, 0.0]));
-        let up = cross(right, forward);
+        let (_, _, right, up) = self.basis();
         let speed = self.distance * 0.0022;
         for i in 0..3 {
             self.target[i] += (-right[i] * dx + up[i] * dy) * speed;
@@ -91,22 +157,27 @@ impl OrbitCamera {
 
     pub fn screen_ray(&self, norm_x: f32, norm_y: f32, aspect: f32) -> ([f32; 3], [f32; 3]) {
         // norm_x, norm_y in [-1, 1] NDC
-        let eye = self.eye();
-        let forward = normalize([
-            self.target[0] - eye[0],
-            self.target[1] - eye[1],
-            self.target[2] - eye[2],
-        ]);
-        let right = normalize(cross(forward, [0.0, 1.0, 0.0]));
-        let up = cross(right, forward);
-        let half_h = (45.0_f32.to_radians() * 0.5).tan();
-        let half_w = half_h * aspect.max(0.1);
-        let dir = normalize([
-            forward[0] + right[0] * (norm_x * half_w) + up[0] * (norm_y * half_h),
-            forward[1] + right[1] * (norm_x * half_w) + up[1] * (norm_y * half_h),
-            forward[2] + right[2] * (norm_x * half_w) + up[2] * (norm_y * half_h),
-        ]);
-        (eye, dir)
+        let (eye, forward, right, up) = self.basis();
+        let aspect = aspect.max(0.1);
+        if self.ortho {
+            let half_h = (self.distance * (45.0_f32.to_radians() * 0.5).tan()).max(0.05);
+            let half_w = half_h * aspect;
+            let origin = [
+                eye[0] + right[0] * (norm_x * half_w) + up[0] * (norm_y * half_h),
+                eye[1] + right[1] * (norm_x * half_w) + up[1] * (norm_y * half_h),
+                eye[2] + right[2] * (norm_x * half_w) + up[2] * (norm_y * half_h),
+            ];
+            (origin, forward)
+        } else {
+            let half_h = (45.0_f32.to_radians() * 0.5).tan();
+            let half_w = half_h * aspect;
+            let dir = normalize([
+                forward[0] + right[0] * (norm_x * half_w) + up[0] * (norm_y * half_h),
+                forward[1] + right[1] * (norm_x * half_w) + up[1] * (norm_y * half_h),
+                forward[2] + right[2] * (norm_x * half_w) + up[2] * (norm_y * half_h),
+            ]);
+            (eye, dir)
+        }
     }
 
     pub fn project_to_screen(&self, world: [f32; 3], rect_min: [f32; 2], rect_size: [f32; 2]) -> Option<[f32; 2]> {
@@ -249,51 +320,110 @@ impl GlViewportRenderer {
             uniform float u_sun_intensities[4];
             out vec4 frag_color;
 
+            const float PI = 3.14159265359;
+
+            float distribution_ggx(vec3 n, vec3 h, float roughness) {{
+                float a = roughness * roughness;
+                float a2 = a * a;
+                float n_dot_h = max(dot(n, h), 0.0);
+                float n_dot_h2 = n_dot_h * n_dot_h;
+                float denom = (n_dot_h2 * (a2 - 1.0) + 1.0);
+                denom = PI * denom * denom;
+                return a2 / max(denom, 0.0001);
+            }}
+
+            float geometry_schlick_ggx(float n_dot_v, float roughness) {{
+                float r = roughness + 1.0;
+                float k = (r * r) / 8.0;
+                return n_dot_v / max(n_dot_v * (1.0 - k) + k, 0.0001);
+            }}
+
+            float geometry_smith(vec3 n, vec3 v, vec3 l, float roughness) {{
+                float n_dot_v = max(dot(n, v), 0.0);
+                float n_dot_l = max(dot(n, l), 0.0);
+                return geometry_schlick_ggx(n_dot_v, roughness) * geometry_schlick_ggx(n_dot_l, roughness);
+            }}
+
+            vec3 fresnel_schlick(float cos_theta, vec3 f0) {{
+                return f0 + (1.0 - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
+            }}
+
+            vec3 eval_pbr_light(
+                vec3 n,
+                vec3 v,
+                vec3 l,
+                vec3 radiance,
+                vec3 albedo,
+                float roughness,
+                float metallic,
+                vec3 f0
+            ) {{
+                vec3 h = normalize(v + l);
+                float ndf = distribution_ggx(n, h, roughness);
+                float g = geometry_smith(n, v, l, roughness);
+                vec3 f = fresnel_schlick(max(dot(h, v), 0.0), f0);
+
+                vec3 numerator = ndf * g * f;
+                float denom = 4.0 * max(dot(n, v), 0.0) * max(dot(n, l), 0.0) + 0.0001;
+                vec3 specular = numerator / denom;
+
+                vec3 ks = f;
+                vec3 kd = (vec3(1.0) - ks) * (1.0 - metallic);
+                float n_dot_l = max(dot(n, l), 0.0);
+                return (kd * albedo / PI + specular) * radiance * n_dot_l;
+            }}
+
+            vec3 aces_tonemap(vec3 x) {{
+                return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+            }}
+
             void main() {{
                 float n_len = length(v_normal);
                 vec3 n = n_len > 0.0001 ? (v_normal / n_len) : vec3(0.0, 1.0, 0.0);
                 vec3 v = normalize(u_eye - v_world_pos);
                 vec4 tex_sample = texture(u_tex, v_uv);
-                vec4 albedo = mix(v_color, vec4(v_color.rgb * tex_sample.rgb, v_color.a * tex_sample.a), u_use_tex);
-                float shininess = mix(96.0, 8.0, clamp(u_roughness, 0.05, 1.0));
-                float spec_strength = mix(0.25, 1.15, u_metallic);
+                vec4 albedo_srgb = mix(v_color, vec4(v_color.rgb * tex_sample.rgb, v_color.a * tex_sample.a), u_use_tex);
+                vec3 albedo = pow(max(albedo_srgb.rgb, vec3(0.0)), vec3(2.2));
+                float roughness = clamp(u_roughness, 0.045, 1.0);
+                float metallic = clamp(u_metallic, 0.0, 1.0);
+                vec3 f0 = mix(vec3(0.04), albedo, metallic);
 
-                vec3 ambient = vec3(0.0);
-                vec3 diffuse = vec3(0.0);
-                vec3 spec_col = vec3(0.0);
+                vec3 lo = vec3(0.0);
+                float amb_scale = 0.24;
 
                 if (u_use_scene_suns > 0.5) {{
-                    float hemi = max(n.y * 0.5 + 0.5, 0.0);
-                    ambient = albedo.rgb * (u_scene_ambient * (0.85 + 0.25 * hemi));
+                    amb_scale = max(u_scene_ambient, 0.02);
                     for (int i = 0; i < 4; ++i) {{
                         if (i >= u_sun_count) {{
                             break;
                         }}
-                        float inten = max(u_sun_intensities[i], 0.0);
+                        float inten = max(u_sun_intensities[i], 0.0) * 2.2;
                         vec3 l_dir = normalize(u_sun_dirs[i]);
-                        float l_diff = max(dot(n, l_dir), 0.0);
-                        vec3 half_vec = normalize(l_dir + v);
-                        float l_spec = pow(max(dot(n, half_vec), 0.0), shininess) * spec_strength;
-                        diffuse += albedo.rgb * u_sun_colors[i] * (l_diff * inten);
-                        spec_col += mix(u_sun_colors[i], albedo.rgb * u_sun_colors[i], u_metallic) * (l_spec * inten);
+                        vec3 sun_lin = pow(max(u_sun_colors[i], vec3(0.0)), vec3(2.2));
+                        lo += eval_pbr_light(n, v, l_dir, sun_lin * inten, albedo, roughness, metallic, f0);
                     }}
                 }} else {{
                     vec3 key_dir = normalize(vec3(0.55, 0.85, 0.45));
                     vec3 fill_dir = normalize(vec3(-0.7, 0.35, -0.5));
-                    float key_diff = max(dot(n, key_dir), 0.0);
-                    float fill_diff = max(dot(n, fill_dir), 0.0);
-                    vec3 half_vec = normalize(key_dir + v);
-                    float spec = pow(max(dot(n, half_vec), 0.0), shininess) * spec_strength;
-                    ambient = albedo.rgb * 0.24;
-                    diffuse = albedo.rgb * (key_diff * 0.85 + fill_diff * 0.28);
-                    spec_col = mix(vec3(1.0), albedo.rgb, u_metallic) * spec;
+                    lo += eval_pbr_light(n, v, key_dir, vec3(2.4, 2.36, 2.28), albedo, roughness, metallic, f0);
+                    lo += eval_pbr_light(n, v, fill_dir, vec3(0.65, 0.76, 0.92), albedo, roughness, metallic, f0);
                 }}
 
-                float rim = pow(1.0 - max(dot(n, v), 0.0), 2.5);
-                vec3 rim_col = mix(vec3(0.45, 0.55, 0.72), vec3(0.98, 0.65, 0.12), u_selected) * rim * mix(0.22, 0.85, u_selected);
+                vec3 refl = reflect(-v, n);
+                float hemi = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
+                float refl_hemi = clamp(refl.y * 0.5 + 0.5, 0.0, 1.0);
+                vec3 env_spec = mix(vec3(0.08, 0.10, 0.14), vec3(0.42, 0.52, 0.68), refl_hemi);
+                vec3 f_amb = fresnel_schlick(max(dot(n, v), 0.0), f0);
+                vec3 kd_amb = (vec3(1.0) - f_amb) * (1.0 - metallic);
+                vec3 ambient = (kd_amb * albedo * (0.65 + 0.45 * hemi) + f_amb * env_spec * (1.0 - roughness * 0.65)) * amb_scale;
 
-                vec3 col = ambient + diffuse + spec_col + rim_col;
-                frag_color = vec4(col, albedo.a);
+                vec3 hdr = ambient + lo;
+                vec3 srgb = pow(aces_tonemap(hdr), vec3(1.0 / 2.2));
+
+                float rim = pow(1.0 - max(dot(n, v), 0.0), 2.5);
+                vec3 rim_col = mix(vec3(0.45, 0.55, 0.72), vec3(0.98, 0.65, 0.12), u_selected) * rim * mix(0.18, 0.85, u_selected);
+
+                frag_color = vec4(srgb + rim_col, albedo_srgb.a);
             }}"
         );
 
@@ -862,6 +992,18 @@ fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> [f32; 16] {
         0.0, f, 0.0, 0.0,
         0.0, 0.0, (far + near) * nf, -1.0,
         0.0, 0.0, 2.0 * far * near * nf, 0.0,
+    ]
+}
+
+fn orthographic(left: f32, right: f32, bottom: f32, top: f32, near: f32, far: f32) -> [f32; 16] {
+    let rl = 1.0 / (right - left);
+    let tb = 1.0 / (top - bottom);
+    let fn_inv = 1.0 / (far - near);
+    [
+        2.0 * rl, 0.0, 0.0, 0.0,
+        0.0, 2.0 * tb, 0.0, 0.0,
+        0.0, 0.0, -2.0 * fn_inv, 0.0,
+        -(right + left) * rl, -(top + bottom) * tb, -(far + near) * fn_inv, 1.0,
     ]
 }
 

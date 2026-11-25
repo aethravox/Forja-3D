@@ -9,11 +9,11 @@ use eframe::egui;
 use forja3d::{
     default_extrude_profile, default_lathe_profile, deform_vertices, fnv1a_32,
     subdivide_triangles, terrain_height_at, AnimationClip, AnimationProperty, AnimationSet,
-    AnimationTrack, ColliderShape, F2D_MAGIC, F3A_MAGIC, F3P_MAGIC, F3T_MAGIC, FLAG_COMPACT,
-    FLAG_PHYSICS, ForjaPack, InterpolationMode, Keyframe, Mat4, Material, MeshDeformKind,
-    MeshPart, Model, PartSpec, PrimitiveKind, RigidBodyKind, RustExportTarget,
-    SceneDocument, ShadingMode, SunLightSpec, TerrainPreset, TerrainStamp, Texture,
-    UiDocument2D, Vec3, Vertex,
+    AnimationTrack, ColliderShape, F2D_MAGIC, F3A_MAGIC, F3P_MAGIC, F3S_MAGIC, F3T_MAGIC,
+    FLAG_COMPACT, FLAG_PHYSICS, ForjaPack, ForjaProject, InterpolationMode, Keyframe, Mat4,
+    Material, MeshDeformKind, MeshPart, Model, PartSpec, PrimitiveKind, ProjectCameraState,
+    ProjectViewportState, RigidBodyKind, RustExportTarget, SceneDocument, ShadingMode,
+    SunLightSpec, TerrainPreset, TerrainStamp, Texture, UiDocument2D, Vec3, Vertex,
 };
 use forja3d_physics::{BodyHandle, PhysicsWorld, RigidBody};
 
@@ -25,7 +25,8 @@ use icons::{
     icon_btn, icon_btn_enabled, icon_text_btn, icon_text_btn_enabled, SvgIcon,
 };
 use renderer::{
-    ray_intersects_aabb, GlViewportRenderer, OrbitCamera, RenderSunLight, RenderSunMarker,
+    ray_intersects_aabb, CameraViewPreset, GlViewportRenderer, OrbitCamera, RenderSunLight,
+    RenderSunMarker,
 };
 
 const MAX_UNDO_HISTORY: usize = 32;
@@ -49,6 +50,7 @@ enum ViewMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExportTab {
+    ProjectForja,
     F3dBinary,
     AssetFormats,
     RustSource,
@@ -254,7 +256,7 @@ impl StudioApp {
             textures_enabled: false,
             import_tex_for_selection_only: false,
             new_group_draft: String::from("Grupo"),
-            export_tab: ExportTab::F3dBinary,
+            export_tab: ExportTab::ProjectForja,
             mobile_tab: MobileTab::Viewport,
             rust_target,
             f3d_compact: false,
@@ -589,6 +591,7 @@ impl StudioApp {
         let selection_only = std::mem::take(&mut self.import_tex_for_selection_only);
         let lower = filename.unwrap_or("").to_ascii_lowercase();
         let is_f3d_magic = bytes.len() >= 4 && bytes[0..4] == forja3d::MAGIC;
+        let is_f3s_magic = bytes.len() >= 4 && bytes[0..4] == F3S_MAGIC;
         let is_f3p_magic = bytes.len() >= 4 && bytes[0..4] == F3P_MAGIC;
         let is_f3a_magic = bytes.len() >= 4 && bytes[0..4] == F3A_MAGIC;
         let is_f2d_magic = bytes.len() >= 4 && bytes[0..4] == F2D_MAGIC;
@@ -600,7 +603,51 @@ impl StudioApp {
         let is_glb_magic = bytes.len() >= 4 && &bytes[0..4] == b"glTF";
         let is_gltf = lower.ends_with(".glb") || lower.ends_with(".gltf") || is_glb_magic;
 
-        if is_f3d_magic || (lower.ends_with(".f3d") && !is_gltf) {
+        if is_f3s_magic || lower.ends_with(".forja") || lower.ends_with(".f3s") {
+            match ForjaProject::from_bytes(bytes) {
+                Ok(proj) => {
+                    self.push_undo();
+                    self.scene = proj.scene;
+                    self.imported_textures = proj.textures;
+                    self.sync_textures_cache();
+                    self.textures_enabled = proj.viewport.textures_enabled;
+                    self.wireframe = proj.viewport.wireframe;
+                    self.show_grid = proj.viewport.show_grid;
+                    self.show_colliders = proj.viewport.show_colliders;
+                    self.camera = OrbitCamera {
+                        yaw: proj.camera.yaw,
+                        pitch: proj.camera.pitch,
+                        distance: proj.camera.distance,
+                        target: proj.camera.target,
+                        ortho: proj.camera.ortho,
+                    };
+                    if let Some(doc2d) = proj.doc2d {
+                        self.selected_widget_2d = if doc2d.widgets.is_empty() { None } else { Some(0) };
+                        self.doc2d = doc2d;
+                    }
+                    self.selection = if !self.scene.parts.is_empty() {
+                        Some(Selection::Part(0))
+                    } else if !self.scene.sun_lights.is_empty() {
+                        Some(Selection::Sun(0))
+                    } else {
+                        None
+                    };
+                    self.selected_vertex_idx = None;
+                    self.rebuild_outputs();
+                    let src = filename.unwrap_or(&self.scene.model_name);
+                    self.status_note = format!(
+                        "Proyecto '{src}' abierto ({} piezas, {} soles, {} tex)",
+                        self.scene.parts.len(),
+                        self.scene.sun_lights.len(),
+                        self.imported_textures.len()
+                    );
+                    self.view_mode = ViewMode::Mode3D;
+                }
+                Err(err) => {
+                    self.status_note = format!("Error al abrir .forja: {err}");
+                }
+            }
+        } else if is_f3d_magic || (lower.ends_with(".f3d") && !is_gltf) {
             match Model::from_bytes(bytes) {
                 Ok(decoded) => {
                     self.push_undo();
@@ -808,6 +855,27 @@ impl StudioApp {
                     self.status_note = err;
                 }
             }
+        }
+    }
+
+    fn build_project_asset(&self) -> ForjaProject {
+        ForjaProject {
+            scene: self.scene.clone(),
+            textures: self.imported_textures.clone(),
+            camera: ProjectCameraState {
+                yaw: self.camera.yaw,
+                pitch: self.camera.pitch,
+                distance: self.camera.distance,
+                target: self.camera.target,
+                ortho: self.camera.ortho,
+            },
+            viewport: ProjectViewportState {
+                textures_enabled: self.textures_enabled,
+                wireframe: self.wireframe,
+                show_grid: self.show_grid,
+                show_colliders: self.show_colliders,
+            },
+            doc2d: Some(self.doc2d.clone()),
         }
     }
 
@@ -3004,8 +3072,14 @@ impl StudioApp {
                         ui.add_space(4.0);
                     }
 
-                    ui.label(egui::RichText::new("Importar archivo 3D / 2D / Assets").strong());
+                    ui.label(egui::RichText::new("Proyecto (.forja) e Importación 3D / 2D").strong());
                     ui.horizontal_wrapped(|ui| {
+                        if icon_text_btn(ui, SvgIcon::Folder, 15.0, "Abrir .forja", [122.0, btn_h], false)
+                            .clicked()
+                        {
+                            self.import_tex_for_selection_only = false;
+                            self.request_import(ui.ctx(), ".forja,.f3s");
+                        }
                         if icon_text_btn(ui, SvgIcon::Upload, 15.0, "Importar GLB / GLTF", [164.0, btn_h], false)
                             .clicked()
                         {
@@ -3023,15 +3097,18 @@ impl StudioApp {
                         .clicked()
                         {
                             self.import_tex_for_selection_only = false;
-                            self.request_import(ui.ctx(), ".f3d,.f3a,.f3p,.f2d,.f3t,.png,.jpg,.jpeg,.webp,.glb,.gltf");
+                            self.request_import(ui.ctx(), ".forja,.f3s,.f3d,.f3a,.f3p,.f2d,.f3t,.png,.jpg,.jpeg,.webp,.glb,.gltf");
                         }
                     });
 
                     ui.add_space(8.0);
                     ui.separator();
-                    ui.label(egui::RichText::new("Exportar proyecto").strong());
-                    let tab_w = if compact { 92.0 } else { 112.0 };
+                    ui.label(egui::RichText::new("Guardar y Exportar").strong());
+                    let tab_w = if compact { 92.0 } else { 104.0 };
                     ui.horizontal_wrapped(|ui| {
+                        if ui.add_sized([tab_w, btn_h], egui::Button::selectable(self.export_tab == ExportTab::ProjectForja, "Proyecto .forja")).clicked() {
+                            self.export_tab = ExportTab::ProjectForja;
+                        }
                         if ui.add_sized([tab_w, btn_h], egui::Button::selectable(self.export_tab == ExportTab::F3dBinary, "Modelo .f3d")).clicked() {
                             self.export_tab = ExportTab::F3dBinary;
                         }
@@ -3048,6 +3125,50 @@ impl StudioApp {
                     ui.add_space(6.0);
 
                     match self.export_tab {
+                        ExportTab::ProjectForja => {
+                            let proj_bytes = self.build_project_asset().to_bytes();
+                            ui.label(format!(
+                                "Escena editable completa: {} piezas · {} soles · {} texturas · cámara ({}) · {} B",
+                                self.scene.parts.len(),
+                                self.scene.sun_lights.len(),
+                                self.imported_textures.len(),
+                                if self.camera.ortho { "Ortográfica" } else { "Perspectiva" },
+                                proj_bytes.len(),
+                            ));
+                            ui.label(
+                                egui::RichText::new("Conserva primitivas paramétricas, perfiles 2D, terrenos/stamps, materiales PBR, físicas y pantalla 2D.")
+                                    .size(11.5)
+                                    .color(egui::Color32::from_gray(175)),
+                            );
+                            ui.add_space(4.0);
+                            ui.horizontal_wrapped(|ui| {
+                                if icon_text_btn(ui, SvgIcon::Download, 14.0, "Guardar .forja", [140.0, btn_h], false)
+                                    .clicked()
+                                {
+                                    let file = format!("{}.forja", self.scene.model_name.to_lowercase());
+                                    match trigger_download(&file, &proj_bytes, "application/octet-stream") {
+                                        Ok(Some(saved)) => self.status_note = format!("Proyecto guardado: {saved}"),
+                                        Ok(None) => self.status_note = format!("Exportado {file} ({} B)", proj_bytes.len()),
+                                        Err(err) => self.status_note = err,
+                                    }
+                                }
+                                if ui.add_sized([148.0, btn_h], egui::Button::new("Verificar .forja")).clicked() {
+                                    match ForjaProject::from_bytes(&proj_bytes) {
+                                        Ok(dec) => {
+                                            let h = fnv1a_32(&proj_bytes[12..]);
+                                            self.status_note = format!(
+                                                "Proyecto OK: '{}' ({} piezas, {} soles, 0x{:08X})",
+                                                dec.scene.model_name,
+                                                dec.scene.parts.len(),
+                                                dec.scene.sun_lights.len(),
+                                                h
+                                            );
+                                        }
+                                        Err(err) => self.status_note = format!("Error .forja: {err}"),
+                                    }
+                                }
+                            });
+                        }
                         ExportTab::F3dBinary => {
                             ui.checkbox(&mut self.f3d_compact, "Compresión compacta (17 B/vértice + u16 idx)");
                             let std_len = self.cached_f3d_bytes.len();
@@ -3836,8 +3957,8 @@ impl StudioApp {
                 });
         });
 
-        // Bottom-left floating viewport display controls
-        let bar_w = if compact { (rect.width() - 16.0).max(200.0) } else { 548.0 };
+        // Bottom-left floating viewport display & camera preset controls
+        let bar_w = if compact { (rect.width() - 16.0).max(200.0) } else { (rect.width() - 16.0).min(805.0) };
         let bar_h = if compact { 38.0 } else { 32.0 };
         let overlay_rect = egui::Rect::from_min_size(
             rect.left_bottom() + egui::vec2(8.0, -(bar_h + 8.0)),
@@ -3888,8 +4009,40 @@ impl StudioApp {
                                     self.camera.distance = (self.camera.distance * 1.22).clamp(0.15, 5000.0);
                                 }
                                 if icon_text_btn(ui, SvgIcon::Center, 14.0, "Centrar", [82.0, bh], false).clicked() {
-                                    self.camera = OrbitCamera::default();
+                                    let keep_ortho = self.camera.ortho;
+                                    self.camera = OrbitCamera {
+                                        ortho: keep_ortho,
+                                        ..OrbitCamera::default()
+                                    };
                                     self.camera.frame_bounds(self.baked_model.bounds());
+                                }
+                                ui.separator();
+                                for (lbl, tip, preset) in [
+                                    ("Frente", "Vista Frontal (tecla 1)", CameraViewPreset::Front),
+                                    ("Lat", "Vista Lateral Derecha (tecla 3)", CameraViewPreset::Right),
+                                    ("Sup", "Vista Superior (tecla 7)", CameraViewPreset::Top),
+                                    ("Iso", "Vista Isométrica", CameraViewPreset::Iso),
+                                ] {
+                                    if ui
+                                        .add_sized([46.0, bh], egui::Button::new(lbl))
+                                        .on_hover_text(tip)
+                                        .clicked()
+                                    {
+                                        self.camera.set_view_preset(preset);
+                                    }
+                                }
+                                let proj_lbl = if self.camera.ortho { "Orto" } else { "Persp" };
+                                if ui
+                                    .add_sized([50.0, bh], egui::Button::selectable(self.camera.ortho, proj_lbl))
+                                    .on_hover_text("Alternar Perspectiva / Ortográfica (tecla 5)")
+                                    .clicked()
+                                {
+                                    self.camera.ortho = !self.camera.ortho;
+                                    self.status_note = if self.camera.ortho {
+                                        String::from("Cámara ortográfica activada")
+                                    } else {
+                                        String::from("Cámara en perspectiva activada")
+                                    };
                                 }
                             });
                         });
@@ -4095,17 +4248,49 @@ impl eframe::App for StudioApp {
             }
         }
 
-        let (want_undo, want_redo) = ui.ctx().input(|i| {
+        let (want_undo, want_redo, cam_shortcut) = ui.ctx().input(|i| {
             let cmd = i.modifiers.command;
             let undo = cmd && !i.modifiers.shift && i.key_pressed(egui::Key::Z);
             let redo = (cmd && i.key_pressed(egui::Key::Y))
                 || (cmd && i.modifiers.shift && i.key_pressed(egui::Key::Z));
-            (undo, redo)
+            let shortcut = if !cmd && !i.modifiers.alt {
+                if i.key_pressed(egui::Key::Num1) {
+                    Some(if i.modifiers.shift { -1 } else { 1 })
+                } else if i.key_pressed(egui::Key::Num3) {
+                    Some(if i.modifiers.shift { -3 } else { 3 })
+                } else if i.key_pressed(egui::Key::Num7) {
+                    Some(7)
+                } else if i.key_pressed(egui::Key::Num5) {
+                    Some(5)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            (undo, redo, shortcut)
         });
         if want_undo {
             self.undo();
         } else if want_redo {
             self.redo();
+        } else if self.view_mode == ViewMode::Mode3D && !ui.ctx().egui_wants_keyboard_input() {
+            match cam_shortcut {
+                Some(1) => self.camera.set_view_preset(CameraViewPreset::Front),
+                Some(-1) => self.camera.set_view_preset(CameraViewPreset::Back),
+                Some(3) => self.camera.set_view_preset(CameraViewPreset::Right),
+                Some(-3) => self.camera.set_view_preset(CameraViewPreset::Left),
+                Some(7) => self.camera.set_view_preset(CameraViewPreset::Top),
+                Some(5) => {
+                    self.camera.ortho = !self.camera.ortho;
+                    self.status_note = if self.camera.ortho {
+                        String::from("Cámara ortográfica activada")
+                    } else {
+                        String::from("Cámara en perspectiva activada")
+                    };
+                }
+                _ => {}
+            }
         }
 
         #[cfg(target_os = "android")]

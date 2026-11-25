@@ -1,9 +1,10 @@
 use forja3d::{
     default_extrude_profile, AnimationClip, AnimationProperty, AnimationSet,
-    AnimationTargetKind, AnimationTrack, ColliderShape, DecodeError, ForjaPack,
-    InterpolationMode, Keyframe, Model, PartSpec, PrimitiveKind, RigidBodyKind, RustExportTarget,
-    SceneDocument, ShadingMode, TerrainPreset, TerrainStamp, Texture, UiDocument2D, Widget2D,
-    F2D_MAGIC, F3A_MAGIC, F3P_MAGIC, F3T_MAGIC, FLAG_COMPACT, FLAG_PHYSICS, MAGIC,
+    AnimationTargetKind, AnimationTrack, ColliderShape, DecodeError, ForjaPack, ForjaProject,
+    InterpolationMode, Keyframe, Model, PartSpec, PrimitiveKind, ProjectCameraState,
+    ProjectViewportState, RigidBodyKind, RustExportTarget, SceneDocument, ShadingMode,
+    SunLightSpec, TerrainPreset, TerrainStamp, Texture, UiDocument2D, Widget2D, F2D_MAGIC,
+    F3A_MAGIC, F3P_MAGIC, F3S_MAGIC, F3T_MAGIC, FLAG_COMPACT, FLAG_PHYSICS, MAGIC,
 };
 
 #[test]
@@ -412,4 +413,57 @@ fn terrain_generates_non_flat_relief_supports_stamps_and_roundtrips_f3d() {
     assert_eq!(decoded.parts.len(), model.parts.len());
     assert_eq!(decoded.triangle_count(), model.triangle_count());
 }
+
+#[test]
+fn roundtrip_forja_project_preserves_scene_lights_textures_and_camera() {
+    let mut scene = SceneDocument::preset_terrain();
+    let mut custom = PartSpec::new("cristal", PrimitiveKind::Pyramid);
+    custom.convert_to_custom_mesh();
+    custom.texture_index = Some(0);
+    custom.texture_enabled = true;
+    scene.parts.push(custom);
+
+    let mut sun = SunLightSpec::new("SolPrincipal");
+    sun.position = [4.0, 6.0, -2.5];
+    sun.intensity = 1.8;
+    scene.sun_lights.push(sun);
+
+    let tex = Texture::new_rgba("roca_albedo", 2, 2, vec![128; 16]);
+    let doc2d = UiDocument2D::from_profile("HudJuego", default_extrude_profile(), true);
+
+    let project = ForjaProject {
+        scene,
+        textures: vec![tex],
+        camera: ProjectCameraState {
+            yaw: 1.25,
+            pitch: 0.62,
+            distance: 8.5,
+            target: [1.0, 0.5, -0.5],
+            ortho: true,
+        },
+        viewport: ProjectViewportState {
+            textures_enabled: true,
+            wireframe: true,
+            show_grid: false,
+            show_colliders: true,
+        },
+        doc2d: Some(doc2d),
+    };
+
+    let bytes = project.to_bytes();
+    assert_eq!(&bytes[0..4], &F3S_MAGIC);
+    let decoded = ForjaProject::from_bytes(&bytes).expect("valid .forja project should decode");
+    assert_eq!(decoded, project);
+
+    let mut corrupted = bytes.clone();
+    let last = corrupted.len() - 1;
+    corrupted[last] ^= 0xAA;
+    assert!(matches!(
+        ForjaProject::from_bytes(&corrupted),
+        Err(DecodeError::ChecksumMismatch { .. })
+    ));
+    corrupted[0] = b'B';
+    assert_eq!(ForjaProject::from_bytes(&corrupted), Err(DecodeError::InvalidMagic));
+}
+
 

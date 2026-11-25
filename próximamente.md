@@ -6,7 +6,7 @@ Hoja de ruta de mejoras planificadas para **Forja-3D** (`forja3d`, `forja3d-phys
 
 ## 1. Gráficos, Iluminación y Post-procesado
 - [ ] **Sombras en tiempo real (Shadow Mapping)** para los objetos **Sol**, con mapa de sombras direccional y suavizado (PCF).
-- [ ] **Shader PBR real (Cook-Torrance)** con Fresnel y respuesta física realista a `metallic`, `roughness` e intensidad del Sol.
+- [x] **Shader PBR real (Cook-Torrance)** con Fresnel y respuesta física realista a `metallic`, `roughness` e intensidad del Sol.
 - [ ] **Luces puntuales y focos (`PointLight` / `SpotLight`)** además del Sol (faroles, motores, antorchas, interiores).
 - [ ] **Cielo atmosférico / HDRI procedural** ligado a la dirección e intensidad del Sol.
 - [ ] **Post-procesado**: niebla atmosférica, **Bloom** (brillo en luces y emisivos) y **Anti-aliasing (MSAA)**.
@@ -41,13 +41,13 @@ Hoja de ruta de mejoras planificadas para **Forja-3D** (`forja3d`, `forja3d-phys
 - [ ] **Snapping (imán) entre caras/vértices** y **pivote editable** por pieza.
 - [ ] **Jerarquía padre-hijo real** entre piezas (transformaciones en espacio local del padre).
 - [ ] **Operaciones de modelado avanzadas**: booleanas y extrusión directa de caras.
-- [ ] **Vistas rápidas de cámara** (Frontal, Lateral, Superior, Perspectiva / Ortográfica) y soporte de múltiples cámaras.
+- [x] **Vistas rápidas de cámara** (Frontal, Lateral, Superior, Isométrica, Perspectiva / Ortográfica) *(pendiente: soporte de múltiples cámaras)*.
 
 ---
 
 ## 6. Formatos y Exportación
 - [ ] **Exportador a `.glb` (glTF binario)** conservando mallas, texturas, materiales y luces.
-- [ ] **Archivo de proyecto completo (`.forja` / `.f3s`)** que guarde y cargue escenas enteras con luces de Sol, texturas, estado de texturas por pieza, cámara y configuración física completa.
+- [x] **Archivo de proyecto completo (`.forja` / `.f3s`)** que guarde y cargue escenas enteras con luces de Sol, texturas, estado de texturas por pieza, cámara y configuración física completa.
 
 ---
 
