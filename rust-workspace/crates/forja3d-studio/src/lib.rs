@@ -8,10 +8,10 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 use forja3d::{
     default_extrude_profile, default_lathe_profile, deform_vertices, fnv1a_32,
-    subdivide_triangles, terrain_height_at, AnimationClip, AnimationProperty, AnimationSet,
-    AnimationTrack, ColliderShape, F2D_MAGIC, F3A_MAGIC, F3P_MAGIC, F3S_MAGIC, F3T_MAGIC,
-    FLAG_COMPACT, FLAG_PHYSICS, ForjaPack, ForjaProject, InterpolationMode, Keyframe, Mat4,
-    Material, MaterialPreset, MeshDeformKind, MeshPart, Model, PartSpec, PrimitiveKind,
+    subdivide_triangles, terrain_height_at, AlignMode, AnimationClip, AnimationProperty,
+    AnimationSet, AnimationTrack, ColliderShape, F2D_MAGIC, F3A_MAGIC, F3P_MAGIC, F3S_MAGIC,
+    F3T_MAGIC, FLAG_COMPACT, FLAG_PHYSICS, ForjaPack, ForjaProject, InterpolationMode, Keyframe,
+    Mat4, Material, MaterialPreset, MeshDeformKind, MeshPart, Model, PartSpec, PrimitiveKind,
     ProjectCameraState, ProjectViewportState, RigidBodyKind, RustExportTarget, SceneDocument,
     ShadingMode, SunLightSpec, TerrainPreset, TerrainStamp, Texture, UiDocument2D, Vec3, Vertex,
 };
@@ -26,7 +26,7 @@ use icons::{
 };
 use renderer::{
     ray_intersects_aabb, CameraViewPreset, GlViewportRenderer, OrbitCamera, RenderSunLight,
-    RenderSunMarker,
+    RenderSunMarker, ViewportOverlay,
 };
 
 const MAX_UNDO_HISTORY: usize = 32;
@@ -52,6 +52,7 @@ enum ViewMode {
 enum ExportTab {
     ProjectForja,
     GlbBinary,
+    Print3d,
     F3dBinary,
     AssetFormats,
     RustSource,
@@ -171,6 +172,9 @@ pub struct StudioApp {
     textures_enabled: bool,
     import_tex_for_selection_only: bool,
     new_group_draft: String,
+    scene_search: String,
+    solo_part: Option<usize>,
+    viewport_overlay: ViewportOverlay,
     export_tab: ExportTab,
     mobile_tab: MobileTab,
     rust_target: RustExportTarget,
@@ -257,6 +261,9 @@ impl StudioApp {
             textures_enabled: false,
             import_tex_for_selection_only: false,
             new_group_draft: String::from("Grupo"),
+            scene_search: String::new(),
+            solo_part: None,
+            viewport_overlay: ViewportOverlay::Shaded,
             export_tab: ExportTab::ProjectForja,
             mobile_tab: MobileTab::Viewport,
             rust_target,
@@ -994,6 +1001,7 @@ impl StudioApp {
         self.scene = scene;
         self.imported_textures.clear();
         self.textures_enabled = false;
+        self.solo_part = None;
         self.sync_textures_cache();
         self.selection = if self.scene.parts.is_empty() {
             None
@@ -1628,16 +1636,48 @@ impl StudioApp {
         // Parts list WITHOUT nested ScrollArea so it never gets crushed to 2 rows
         ui.add_space(8.0);
         ui.separator();
-        ui.label(egui::RichText::new(format!("Piezas ({})", self.scene.parts.len())).strong());
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("Piezas ({})", self.scene.parts.len())).strong());
+            if self.solo_part.is_some() {
+                if ui.small_button("Salir Solo").clicked() {
+                    self.solo_part = None;
+                    self.status_note = String::from("Modo Solo desactivado");
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.scene_search)
+                    .hint_text("Buscar pieza o grupo...")
+                    .desired_width(if compact { 160.0 } else { 150.0 }),
+            );
+            if !self.scene_search.is_empty() && ui.small_button("×").clicked() {
+                self.scene_search.clear();
+            }
+        });
 
+        let query = self.scene_search.trim().to_lowercase();
         let mut to_delete: Option<usize> = None;
         let mut to_duplicate: Option<usize> = None;
         let mut vis_toggled = false;
+        let mut lock_toggled = false;
+        let mut solo_toggle: Option<usize> = None;
 
         for (idx, part) in self.scene.parts.iter_mut().enumerate() {
+            if !query.is_empty() {
+                let name_match = part.name.to_lowercase().contains(&query);
+                let group_match = part
+                    .group
+                    .as_deref()
+                    .map_or(false, |g| g.to_lowercase().contains(&query));
+                if !name_match && !group_match {
+                    continue;
+                }
+            }
             let is_sel = self.selection == Some(Selection::Part(idx));
+            let is_solo = self.solo_part == Some(idx);
             ui.horizontal(|ui| {
-                let eye_sz = if compact { [30.0, 28.0] } else { [24.0, 22.0] };
+                let eye_sz = if compact { [28.0, 28.0] } else { [22.0, 22.0] };
                 if icon_btn(ui, SvgIcon::Eye, 13.0, eye_sz, part.visible)
                     .on_hover_text("Mostrar/ocultar pieza")
                     .clicked()
@@ -1645,7 +1685,24 @@ impl StudioApp {
                     part.visible = !part.visible;
                     vis_toggled = true;
                 }
+                if ui
+                    .add_sized([22.0, 22.0], egui::Button::selectable(is_solo, "S"))
+                    .on_hover_text("Aislar pieza (Solo)")
+                    .clicked()
+                {
+                    solo_toggle = Some(idx);
+                }
+                let lock_lbl = if part.locked { "L" } else { "·" };
+                if ui
+                    .add_sized([20.0, 22.0], egui::Button::selectable(part.locked, lock_lbl))
+                    .on_hover_text(if part.locked { "Desbloquear pieza" } else { "Bloquear edición/borrado" })
+                    .clicked()
+                {
+                    part.locked = !part.locked;
+                    lock_toggled = true;
+                }
                 let mirror_tag = if part.mirror.iter().any(|&m| m) { " [M]" } else { "" };
+                let lock_tag = if part.locked { " [Bloq]" } else { "" };
                 let phys_tag = match part.body_kind {
                     RigidBodyKind::Static => String::from(" [Fijo]"),
                     RigidBodyKind::Kinematic => String::from(" [Cinem.]"),
@@ -1658,15 +1715,15 @@ impl StudioApp {
                         }
                     }
                 };
-                let label = format!("{}{}{}", part.name, mirror_tag, phys_tag);
+                let label = format!("{}{}{}{}", part.name, mirror_tag, lock_tag, phys_tag);
                 if ui.selectable_label(is_sel, label).clicked() {
                     self.selection = Some(Selection::Part(idx));
                     self.selected_vertex_idx = None;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let act_sz = if compact { [32.0, 28.0] } else { [24.0, 22.0] };
-                    if icon_btn(ui, SvgIcon::Trash, 13.0, act_sz, false)
-                        .on_hover_text("Eliminar")
+                    let act_sz = if compact { [30.0, 28.0] } else { [22.0, 22.0] };
+                    if icon_btn_enabled(ui, !part.locked, SvgIcon::Trash, 13.0, act_sz)
+                        .on_hover_text(if part.locked { "Pieza bloqueada" } else { "Eliminar" })
                         .clicked()
                     {
                         to_delete = Some(idx);
@@ -1681,7 +1738,18 @@ impl StudioApp {
             });
         }
 
-        if vis_toggled {
+        if let Some(idx) = solo_toggle {
+            self.solo_part = if self.solo_part == Some(idx) {
+                None
+            } else {
+                Some(idx)
+            };
+            self.status_note = match self.solo_part {
+                Some(i) => format!("Solo: '{}'", self.scene.parts[i].name),
+                None => String::from("Modo Solo desactivado"),
+            };
+        }
+        if vis_toggled || lock_toggled {
             *dirty = true;
         }
         if let Some(idx) = to_duplicate {
@@ -1689,6 +1757,7 @@ impl StudioApp {
             let mut cloned = self.scene.parts[idx].clone();
             cloned.name = format!("{}_copia", cloned.name);
             cloned.position[0] += 0.45;
+            cloned.locked = false;
             self.scene.parts.push(cloned);
             self.selection = Some(Selection::Part(self.scene.parts.len() - 1));
             *dirty = true;
@@ -1696,6 +1765,13 @@ impl StudioApp {
         if let Some(idx) = to_delete {
             self.push_undo();
             self.scene.parts.remove(idx);
+            if self.solo_part == Some(idx) {
+                self.solo_part = None;
+            } else if let Some(s) = self.solo_part {
+                if s > idx {
+                    self.solo_part = Some(s - 1);
+                }
+            }
             self.selection = if self.scene.parts.is_empty() {
                 None
             } else {
@@ -2005,8 +2081,8 @@ impl StudioApp {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Inspector de pieza").strong());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if icon_btn(ui, SvgIcon::Trash, 14.0, [30.0, btn_h], false)
-                                .on_hover_text("Eliminar pieza")
+                            if icon_btn_enabled(ui, !part.locked, SvgIcon::Trash, 14.0, [30.0, btn_h])
+                                .on_hover_text(if part.locked { "Pieza bloqueada" } else { "Eliminar pieza" })
                                 .clicked()
                             {
                                 discrete_action = Some("delete");
@@ -2016,6 +2092,15 @@ impl StudioApp {
                                 .clicked()
                             {
                                 discrete_action = Some("duplicate");
+                            }
+                            let lock_btn_lbl = if part.locked { "Bloq" } else { "Libre" };
+                            if ui
+                                .add_sized([46.0, btn_h], egui::Button::selectable(part.locked, lock_btn_lbl))
+                                .on_hover_text("Bloquear o desbloquear edición de la pieza")
+                                .clicked()
+                            {
+                                part.locked = !part.locked;
+                                *dirty = true;
                             }
                         });
                     });
@@ -2172,7 +2257,7 @@ impl StudioApp {
                             changed_continuous = true;
                             *dirty = true;
                         }
-                        if ui.add_sized([84.0, btn_h], egui::Button::new("Al suelo Y=0")).clicked() {
+                        if ui.add_sized([92.0, btn_h], egui::Button::new("Sentar suelo")).clicked() {
                             discrete_action = Some("ground");
                         }
                         if icon_text_btn(ui, SvgIcon::Stack, 13.0, "Apilar", [74.0, btn_h], false).clicked() {
@@ -2183,6 +2268,12 @@ impl StudioApp {
                         }
                         if ui.add_sized([84.0, btn_h], egui::Button::new("Ajustar 2m")).clicked() {
                             discrete_action = Some("normalize_2m");
+                        }
+                        if ui.add_sized([72.0, btn_h], egui::Button::new("Alinear X0")).clicked() {
+                            discrete_action = Some("align_x0");
+                        }
+                        if ui.add_sized([72.0, btn_h], egui::Button::new("Alinear Z0")).clicked() {
+                            discrete_action = Some("align_z0");
                         }
                     });
 
@@ -2946,17 +3037,28 @@ impl StudioApp {
                             }
                         }
                         "ground" => {
-                            if part_bounds.is_valid() {
-                                self.push_undo();
-                                self.scene.parts[sel_idx].position[1] -= part_bounds.min[1];
+                            self.push_undo();
+                            if self.scene.snap_part_to_ground(sel_idx) {
+                                self.status_note = String::from("Pieza apoyada sobre suelo/terreno");
                                 *dirty = true;
                             }
                         }
                         "stack" => self.stack_selected_on_below(),
                         "center_xz" => {
                             self.push_undo();
-                            self.scene.parts[sel_idx].position[0] = 0.0;
-                            self.scene.parts[sel_idx].position[2] = 0.0;
+                            self.scene.align_part_to_coord(sel_idx, 0, AlignMode::Center, 0.0);
+                            self.scene.align_part_to_coord(sel_idx, 2, AlignMode::Center, 0.0);
+                            self.status_note = String::from("Pieza centrada en X=0, Z=0");
+                            *dirty = true;
+                        }
+                        "align_x0" => {
+                            self.push_undo();
+                            self.scene.align_part_to_coord(sel_idx, 0, AlignMode::Center, 0.0);
+                            *dirty = true;
+                        }
+                        "align_z0" => {
+                            self.push_undo();
+                            self.scene.align_part_to_coord(sel_idx, 2, AlignMode::Center, 0.0);
                             *dirty = true;
                         }
                         "normalize_2m" => {
@@ -3241,6 +3343,9 @@ impl StudioApp {
                         if ui.add_sized([tab_w, btn_h], egui::Button::selectable(self.export_tab == ExportTab::GlbBinary, "Escena .glb")).clicked() {
                             self.export_tab = ExportTab::GlbBinary;
                         }
+                        if ui.add_sized([tab_w, btn_h], egui::Button::selectable(self.export_tab == ExportTab::Print3d, "Impresión .stl/.ply")).clicked() {
+                            self.export_tab = ExportTab::Print3d;
+                        }
                         if ui.add_sized([tab_w, btn_h], egui::Button::selectable(self.export_tab == ExportTab::F3dBinary, "Modelo .f3d")).clicked() {
                             self.export_tab = ExportTab::F3dBinary;
                         }
@@ -3349,6 +3454,55 @@ impl StudioApp {
                                             );
                                         }
                                         Err(err) => self.status_note = format!("Error GLB: {err}"),
+                                    }
+                                }
+                            });
+                        }
+                        ExportTab::Print3d => {
+                            let report = self.baked_model.validate_watertight();
+                            let stl_bytes = self.baked_model.to_stl_binary();
+                            let ply_bytes = self.baked_model.to_ply_ascii();
+                            let status_col = if report.is_watertight {
+                                egui::Color32::from_rgb(74, 222, 128)
+                            } else {
+                                egui::Color32::from_rgb(251, 191, 36)
+                            };
+                            let status_txt = if report.is_watertight {
+                                "Validador Watertight: MALLA ESTANCA (lista para impresión 3D)"
+                            } else {
+                                "Validador Watertight: Se detectaron incidencias de malla"
+                            };
+                            ui.label(egui::RichText::new(status_txt).color(status_col).strong());
+                            ui.label(format!(
+                                "{} piezas · {} triángulos · agujeros (bordes sueltos): {} · no-manifold: {} · normales invertidas: {} · degenerados: {} · vol: {:.3} m³",
+                                report.total_parts,
+                                report.total_triangles,
+                                report.boundary_edges,
+                                report.non_manifold_edges,
+                                report.inverted_edges,
+                                report.degenerate_triangles,
+                                report.signed_volume,
+                            ));
+                            ui.add_space(4.0);
+                            ui.horizontal_wrapped(|ui| {
+                                if icon_text_btn(ui, SvgIcon::Download, 14.0, "Descargar .stl", [140.0, btn_h], false)
+                                    .clicked()
+                                {
+                                    let file = format!("{}.stl", self.scene.model_name.to_lowercase());
+                                    match trigger_download(&file, &stl_bytes, "model/stl") {
+                                        Ok(Some(saved)) => self.status_note = format!("Guardado: {saved}"),
+                                        Ok(None) => self.status_note = format!("Exportado {file} ({} B)", stl_bytes.len()),
+                                        Err(err) => self.status_note = err,
+                                    }
+                                }
+                                if icon_text_btn(ui, SvgIcon::Download, 14.0, "Descargar .ply", [140.0, btn_h], false)
+                                    .clicked()
+                                {
+                                    let file = format!("{}.ply", self.scene.model_name.to_lowercase());
+                                    match trigger_download(&file, &ply_bytes, "text/plain") {
+                                        Ok(Some(saved)) => self.status_note = format!("Guardado: {saved}"),
+                                        Ok(None) => self.status_note = format!("Exportado {file} ({} B)", ply_bytes.len()),
+                                        Err(err) => self.status_note = err,
                                     }
                                 }
                             });
@@ -3625,6 +3779,9 @@ impl StudioApp {
         for idx in indices {
             let Some(start_part) = drag.start_parts.get(idx) else { continue };
             let Some(part) = self.scene.parts.get_mut(idx) else { continue };
+            if part.locked {
+                continue;
+            }
             match drag.mode {
                 GizmoMode::Translate => {
                     let mut v = start_part.position[axis_idx] + world_delta;
@@ -4000,6 +4157,15 @@ impl StudioApp {
                 selected: selected_sun_idx == Some(i),
             })
             .collect();
+        let part_visible_mask: Vec<bool> = self
+            .part_map
+            .iter()
+            .map(|&src_idx| match self.solo_part {
+                Some(solo_idx) => src_idx == solo_idx,
+                None => true,
+            })
+            .collect();
+        let viewport_overlay = self.viewport_overlay;
         let part_transforms = self.sim_part_transforms.clone();
         let aspect = rect.width() / rect.height().max(1.0);
 
@@ -4024,6 +4190,8 @@ impl StudioApp {
                                 &part_use_tex,
                                 &part_tex_indices,
                                 &part_alpha_cutoffs,
+                                &part_visible_mask,
+                                viewport_overlay,
                                 has_scene_suns,
                                 &sun_lights,
                                 &sun_markers,
@@ -4238,6 +4406,16 @@ impl StudioApp {
                                     } else {
                                         String::from("Cámara en perspectiva activada")
                                     };
+                                }
+                                ui.separator();
+                                for ov in ViewportOverlay::ALL {
+                                    if ui
+                                        .add_sized([62.0, bh], egui::Button::selectable(self.viewport_overlay == ov, ov.label()))
+                                        .on_hover_text("Overlay de diagnóstico en viewport")
+                                        .clicked()
+                                    {
+                                        self.viewport_overlay = ov;
+                                    }
                                 }
                             });
                         });

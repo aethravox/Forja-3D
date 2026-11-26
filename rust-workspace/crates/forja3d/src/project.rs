@@ -12,7 +12,7 @@ use crate::ui2d::UiDocument2D;
 
 /// Binary magic header for complete Forja3D Studio project files (.forja / .f3s).
 pub const F3S_MAGIC: [u8; 4] = *b"F3S1";
-pub const F3S_VERSION: u16 = 2;
+pub const F3S_VERSION: u16 = 3;
 /// Header flag indicating zlib/deflate compressed payload via `miniz_oxide`.
 pub const FLAG_PROJECT_ZLIB: u16 = 0x0001;
 
@@ -162,7 +162,7 @@ impl ForjaProject {
             return Err(DecodeError::InvalidMagic);
         }
         let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-        if version != 1 && version != F3S_VERSION {
+        if version != 1 && version != 2 && version != F3S_VERSION {
             return Err(DecodeError::UnsupportedVersion(version));
         }
         let flags = u16::from_le_bytes([bytes[6], bytes[7]]);
@@ -503,6 +503,8 @@ fn encode_part(buf: &mut Vec<u8>, part: &PartSpec) {
     buf.extend_from_slice(&part.uv_offset[0].to_le_bytes());
     buf.extend_from_slice(&part.uv_offset[1].to_le_bytes());
     buf.extend_from_slice(&part.alpha_cutoff.to_le_bytes());
+    // v3: lock flag
+    buf.push(if part.locked { 1 } else { 0 });
 }
 
 fn decode_part(cursor: &mut Cursor<'_>, version: u16) -> Result<PartSpec, DecodeError> {
@@ -652,6 +654,11 @@ fn decode_part(cursor: &mut Cursor<'_>, version: u16) -> Result<PartSpec, Decode
     } else {
         ([1.0, 1.0], [0.0, 0.0], 0.0)
     };
+    let locked = if version >= 3 {
+        read_bool(cursor)?
+    } else {
+        false
+    };
 
     Ok(PartSpec {
         name,
@@ -686,6 +693,7 @@ fn decode_part(cursor: &mut Cursor<'_>, version: u16) -> Result<PartSpec, Decode
         uv_scale,
         uv_offset,
         alpha_cutoff,
+        locked,
     })
 }
 

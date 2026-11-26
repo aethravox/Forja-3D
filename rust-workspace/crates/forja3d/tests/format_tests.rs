@@ -1,5 +1,5 @@
 use forja3d::{
-    default_extrude_profile, encode_texture_to_png, AnimationClip, AnimationProperty,
+    default_extrude_profile, encode_texture_to_png, AlignMode, AnimationClip, AnimationProperty,
     AnimationSet, AnimationTargetKind, AnimationTrack, ColliderShape, DecodeError, ForjaPack,
     ForjaProject, InterpolationMode, Keyframe, MaterialPreset, Model, PartSpec, PrimitiveKind,
     ProjectCameraState, ProjectViewportState, RigidBodyKind, RustExportTarget, SceneDocument,
@@ -595,6 +595,57 @@ fn glb_export_writes_valid_container_meshes_png_textures_and_lights() {
     // Embedded PNG sits at offset 0 of BIN chunk
     assert_eq!(&glb[bin_hdr + 8..bin_hdr + 16], b"\x89PNG\r\n\x1a\n");
 }
+
+#[test]
+fn stl_ply_exports_and_watertight_validator_work_correctly() {
+    let mut cube_scene = SceneDocument::new("Impresion3D");
+    cube_scene.parts.push(PartSpec::new("cubo_estanco", PrimitiveKind::Cube));
+    let cube_report = cube_scene.validate_watertight();
+    assert!(cube_report.is_watertight, "cube should be watertight: {cube_report:?}");
+    assert_eq!(cube_report.boundary_edges, 0);
+    assert_eq!(cube_report.non_manifold_edges, 0);
+    assert_eq!(cube_report.inverted_edges, 0);
+    assert!((cube_report.signed_volume - 1.0).abs() < 1e-3);
+
+    let stl = cube_scene.to_stl_binary();
+    assert_eq!(stl.len(), 84 + 12 * 50);
+    let tri_count = u32::from_le_bytes([stl[80], stl[81], stl[82], stl[83]]);
+    assert_eq!(tri_count, 12);
+
+    let ply = String::from_utf8(cube_scene.to_ply_ascii()).expect("valid ASCII PLY");
+    assert!(ply.starts_with("ply\nformat ascii 1.0\n"));
+    assert!(ply.contains("element face 12\n"));
+
+    let mut open_plane = SceneDocument::new("PlanoAbierto");
+    open_plane.parts.push(PartSpec::new("plano", PrimitiveKind::Plane));
+    let plane_report = open_plane.validate_watertight();
+    assert!(!plane_report.is_watertight);
+    assert!(plane_report.boundary_edges > 0);
+}
+
+#[test]
+fn ground_snapping_alignment_and_locked_flag_persist_in_forja_v3() {
+    let mut scene = SceneDocument::preset_terrain();
+    let mut box_part = PartSpec::new("caja", PrimitiveKind::Cube);
+    box_part.position = [0.25, 4.0, -0.3];
+    box_part.locked = true;
+    scene.parts.push(box_part);
+
+    let box_idx = scene.parts.len() - 1;
+    assert!(scene.snap_part_to_ground(box_idx));
+    let ground_y = scene.ground_height_at(0.25, -0.3, Some(box_idx));
+    let aabb = scene.part_world_aabb(box_idx).unwrap();
+    assert!((aabb.min[1] - ground_y).abs() < 1e-3);
+
+    assert!(scene.align_part_to_coord(box_idx, 0, AlignMode::Center, 0.0));
+    let aligned_aabb = scene.part_world_aabb(box_idx).unwrap();
+    assert!(((aligned_aabb.min[0] + aligned_aabb.max[0]) * 0.5).abs() < 1e-4);
+
+    let bytes = ForjaProject::new(scene).to_bytes();
+    let decoded = ForjaProject::from_bytes(&bytes).expect(".forja v3 should decode");
+    assert!(decoded.scene.parts[box_idx].locked);
+}
+
 
 
 

@@ -31,6 +31,33 @@ pub enum CameraViewPreset {
     Iso,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewportOverlay {
+    #[default]
+    Shaded = 0,
+    Normals = 1,
+    UvChecker = 2,
+    TriangleDensity = 3,
+}
+
+impl ViewportOverlay {
+    pub const ALL: [Self; 4] = [
+        Self::Shaded,
+        Self::Normals,
+        Self::UvChecker,
+        Self::TriangleDensity,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Shaded => "PBR",
+            Self::Normals => "Normales",
+            Self::UvChecker => "UV Check",
+            Self::TriangleDensity => "Densidad",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct OrbitCamera {
     pub yaw: f32,
@@ -241,6 +268,7 @@ struct GpuPart {
     roughness: f32,
     center: [f32; 3],
     base_has_alpha: bool,
+    tri_density: f32,
 }
 
 pub struct GlViewportRenderer {
@@ -316,6 +344,8 @@ impl GlViewportRenderer {
             uniform sampler2D u_tex;
             uniform float u_use_tex;
             uniform float u_alpha_cutoff;
+            uniform int u_overlay_mode;
+            uniform float u_tri_density;
             uniform float u_use_scene_suns;
             uniform int u_sun_count;
             uniform float u_scene_ambient;
@@ -429,6 +459,35 @@ impl GlViewportRenderer {
 
                 float rim = pow(1.0 - max(dot(n, v), 0.0), 2.5);
                 vec3 rim_col = mix(vec3(0.45, 0.55, 0.72), vec3(0.98, 0.65, 0.12), u_selected) * rim * mix(0.18, 0.85, u_selected);
+
+                if (u_overlay_mode == 1) {{
+                    vec3 vis_n = n * 0.5 + 0.5;
+                    frag_color = vec4(vis_n + rim_col * 0.35, 1.0);
+                    return;
+                }}
+                if (u_overlay_mode == 2) {{
+                    vec2 cell = floor(v_uv * 8.0);
+                    float checker = mod(cell.x + cell.y, 2.0);
+                    vec2 sub_uv = fract(v_uv * 8.0);
+                    float grid_line = (sub_uv.x < 0.06 || sub_uv.y < 0.06) ? 1.0 : 0.0;
+                    vec2 frac_uv = fract(v_uv);
+                    vec3 tint = mix(vec3(0.16, 0.19, 0.24), vec3(0.75 + 0.22 * frac_uv.x, 0.75 + 0.22 * frac_uv.y, 0.82), checker);
+                    vec3 final_uv = mix(tint, vec3(0.98, 0.62, 0.18), grid_line * 0.55);
+                    frag_color = vec4(final_uv * (0.65 + 0.35 * max(dot(n, v), 0.0)) + rim_col * 0.3, 1.0);
+                    return;
+                }}
+                if (u_overlay_mode == 3) {{
+                    float norm_d = clamp(log2(1.0 + u_tri_density) / 9.5, 0.0, 1.0);
+                    vec3 low_col = vec3(0.14, 0.56, 0.92);
+                    vec3 mid_col = vec3(0.24, 0.84, 0.42);
+                    vec3 high_col = vec3(0.95, 0.26, 0.18);
+                    vec3 heat = norm_d < 0.5
+                        ? mix(low_col, mid_col, norm_d * 2.0)
+                        : mix(mid_col, high_col, (norm_d - 0.5) * 2.0);
+                    float shade = 0.45 + 0.55 * max(dot(n, normalize(u_eye - v_world_pos)), 0.0);
+                    frag_color = vec4(heat * shade + rim_col * 0.4, 1.0);
+                    return;
+                }}
 
                 frag_color = vec4(srgb + rim_col, albedo_srgb.a);
             }}"
@@ -645,6 +704,16 @@ impl GlViewportRenderer {
                 [0.0; 3]
             };
             let base_has_alpha = part.material.has_alpha() || part.vertices.iter().any(|v| v.color[3] < 255);
+            let tri_count = (part.indices.len() / 3) as f32;
+            let area_approx = if part.bounds.is_valid() {
+                let dx = (part.bounds.max[0] - part.bounds.min[0]).abs();
+                let dy = (part.bounds.max[1] - part.bounds.min[1]).abs();
+                let dz = (part.bounds.max[2] - part.bounds.min[2]).abs();
+                (2.0 * (dx * dy + dy * dz + dx * dz)).max(0.05)
+            } else {
+                1.0
+            };
+            let tri_density = (tri_count / area_approx).clamp(0.0, 4096.0);
 
             self.parts.push(GpuPart {
                 vao,
@@ -657,6 +726,7 @@ impl GlViewportRenderer {
                 roughness: part.material.roughness,
                 center,
                 base_has_alpha,
+                tri_density,
             });
         }
     }
@@ -674,6 +744,8 @@ impl GlViewportRenderer {
         part_use_tex: &[bool],
         part_tex_indices: &[Option<usize>],
         part_alpha_cutoffs: &[f32],
+        part_visible_mask: &[bool],
+        overlay: ViewportOverlay,
         has_scene_suns: bool,
         sun_lights: &[RenderSunLight],
         sun_markers: &[RenderSunMarker],
@@ -726,6 +798,9 @@ impl GlViewportRenderer {
         }
         if let Some(loc) = gl.get_uniform_location(self.program, "u_use_scene_suns") {
             gl.uniform_1_f32(Some(&loc), if has_scene_suns { 1.0 } else { 0.0 });
+        }
+        if let Some(loc) = gl.get_uniform_location(self.program, "u_overlay_mode") {
+            gl.uniform_1_i32(Some(&loc), overlay as i32);
         }
         let sun_count = sun_lights.len().min(4);
         if let Some(loc) = gl.get_uniform_location(self.program, "u_sun_count") {
@@ -787,6 +862,9 @@ impl GlViewportRenderer {
         let mut opaque_indices = Vec::new();
         let mut transparent_indices: Vec<(usize, f32)> = Vec::new();
         for (idx, part) in self.parts.iter().enumerate() {
+            if !part_visible_mask.get(idx).copied().unwrap_or(true) {
+                continue;
+            }
             let (_, _, _, is_transparent) = resolve_part_draw(idx, part);
             if is_transparent {
                 let (_, _, offset) = part_transforms
@@ -836,6 +914,9 @@ impl GlViewportRenderer {
             if let Some(loc) = gl.get_uniform_location(self.program, "u_roughness") {
                 gl.uniform_1_f32(Some(&loc), part.roughness);
             }
+            if let Some(loc) = gl.get_uniform_location(self.program, "u_tri_density") {
+                gl.uniform_1_f32(Some(&loc), part.tri_density);
+            }
             if let Some(loc) = gl.get_uniform_location(self.program, "u_selected") {
                 gl.uniform_1_f32(Some(&loc), if is_sel { 1.0 } else { 0.0 });
             }
@@ -869,9 +950,13 @@ impl GlViewportRenderer {
         // Draw wireframe & selection outlines cleanly with depth writes enabled
         gl.disable(glow::BLEND);
         gl.depth_mask(true);
+        let draw_wire_overlay = wireframe || overlay == ViewportOverlay::TriangleDensity;
         for (idx, part) in self.parts.iter().enumerate() {
+            if !part_visible_mask.get(idx).copied().unwrap_or(true) {
+                continue;
+            }
             let is_sel = selected_mask.get(idx).copied().unwrap_or(false);
-            if wireframe || is_sel {
+            if draw_wire_overlay || is_sel {
                 let (pivot, quat, offset) = part_transforms
                     .get(idx)
                     .copied()

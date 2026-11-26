@@ -10,6 +10,7 @@ pub mod math;
 pub mod mesh_ops;
 pub mod pack;
 pub mod primitives;
+pub mod printing;
 pub mod project;
 pub mod skeleton;
 pub mod texture;
@@ -33,7 +34,8 @@ pub use mesh_ops::{
     TerrainSpec, TerrainStamp,
 };
 pub use pack::{ForjaPack, Pack, F3P_MAGIC, F3P_VERSION};
-pub use primitives::{PartSpec, PrimitiveKind, SceneDocument, SunLightSpec};
+pub use primitives::{AlignMode, PartSpec, PrimitiveKind, SceneDocument, SunLightSpec};
+pub use printing::{validate_part_watertight, MeshWatertightReport, PartWatertightReport};
 pub use project::{
     ForjaProject, ProjectCameraState, ProjectViewportState, F3S_MAGIC, F3S_VERSION,
     FLAG_PROJECT_ZLIB,

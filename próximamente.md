@@ -13,7 +13,7 @@ Hoja de ruta de mejoras planificadas para **Forja-3D** (`forja3d`, `forja3d-phys
 - [ ] **Oclusión ambiental en espacio de pantalla (SSAO)** para dar profundidad realista en esquinas y pliegues.
 - [ ] **Modos *MatCap*** (arcilla, metal pulido, cebra de curvatura) para esculpir y revisar topología sin luces complejas.
 - [ ] **Soporte de *Skybox* / mapa cúbico personalizado** además del cielo procedural.
-- [ ] **Overlays de diagnóstico**: visualizador de normales, cuadrícula *UV Checker* y mapa de densidad de triángulos.
+- [x] **Overlays de diagnóstico**: visualizador de normales, cuadrícula *UV Checker* y mapa de densidad de triángulos.
 - [ ] **Shader *Toon / Cel-Shading*** con contorno (*Outline*) activable por material o escena.
 - [ ] **Sistema de partículas ligero en Studio** (chispas, humo, fuego, estelas) exportable para juegos.
 - [ ] **Vista cuádruple (*Quad-View*)** simultánea (Perspectiva + Frontal + Lateral + Superior).
@@ -71,9 +71,9 @@ Hoja de ruta de mejoras planificadas para **Forja-3D** (`forja3d`, `forja3d-phys
 - [ ] **Edición de aristas y bucles (*Edge/Face Loop & Ring*)** con subdivisión localizada.
 - [ ] **Selección múltiple (`Shift` + clic y *Box Select*)** para transformar o agrupar varias piezas a la vez.
 - [ ] **Duplicado instanciado (*Linked Duplicate*)** para compartir geometría base entre varias piezas.
-- [ ] **Alineación y apoyo automático** (centros/bordes en X/Y/Z y sentar piezas sobre el suelo o terreno).
+- [x] **Alineación y apoyo automático** (centros/bordes en X/Y/Z y sentar piezas sobre el suelo o terreno).
 - [ ] **Regla / medidor 3D en vivo** de distancias, ángulos y dimensiones sobre el viewport.
-- [ ] **Buscador y filtro rápido en el árbol de escena** + modo **Aislar (*Solo*)** y **Bloqueo de piezas (*Lock*)**.
+- [x] **Buscador y filtro rápido en el árbol de escena** + modo **Aislar (*Solo*)** y **Bloqueo de piezas (*Lock*)**.
 - [ ] **Paleta de comandos rápida (`Ctrl+K` / `Espacio`)** para ejecutar herramientas o primitivas al instante.
 - [x] **Vistas rápidas de cámara** (Frontal, Lateral, Superior, Isométrica, Perspectiva / Ortográfica) *(pendiente: soporte de múltiples cámaras)*.
 
@@ -82,7 +82,7 @@ Hoja de ruta de mejoras planificadas para **Forja-3D** (`forja3d`, `forja3d-phys
 ## 6. Formatos, Codegen y Exportación
 - [x] **Exportador a `.glb` (glTF binario)** conservando mallas, texturas, materiales y luces.
 - [x] **Archivo de proyecto completo (`.forja` / `.f3s`)** que guarde y cargue escenas enteras con luces de Sol, texturas, estado de texturas por pieza, cámara y configuración física completa.
-- [ ] **Exportador `.stl` / `.ply` (impresión 3D) + validador *watertight*** que detecta agujeros, bordes sueltos y normales invertidas.
+- [x] **Exportador `.stl` / `.ply` (impresión 3D) + validador *watertight*** que detecta agujeros, bordes sueltos y normales invertidas.
 - [ ] **Plantillas de exportación `.rs` para motores Rust** (`bevy`, `macroquad`, `three-d`, `wgpu`) incluyendo luces, físicas y `.f3a`.
 - [ ] **Generador automático de LODs (`LOD0` / `LOD1` / `LOD2`)** mediante simplificación de triángulos al exportar `.f3d`/`.f3p`.
 

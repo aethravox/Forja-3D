@@ -10,8 +10,8 @@ use crate::{
     math::{sin_cos, Aabb, Mat4, Vec3},
     mesh_ops::{
         apply_shading, build_extruded_polygon, build_lathe_profile, build_terrain,
-        deduplicate_vertices, default_extrude_profile, default_lathe_profile, ShadingMode,
-        TerrainPreset, TerrainSpec,
+        deduplicate_vertices, default_extrude_profile, default_lathe_profile, terrain_height_at,
+        ShadingMode, TerrainPreset, TerrainSpec,
     },
     texture::Texture,
 };
@@ -100,6 +100,7 @@ pub struct PartSpec {
     pub uv_scale: [f32; 2],
     pub uv_offset: [f32; 2],
     pub alpha_cutoff: f32,
+    pub locked: bool,
 }
 
 impl PartSpec {
@@ -152,6 +153,7 @@ impl PartSpec {
             uv_scale: [1.0, 1.0],
             uv_offset: [0.0, 0.0],
             alpha_cutoff: 0.0,
+            locked: false,
         }
     }
 
@@ -337,6 +339,7 @@ impl PartSpec {
             uv_scale: [1.0, 1.0],
             uv_offset: [0.0, 0.0],
             alpha_cutoff: 0.0,
+            locked: false,
         }
     }
 
@@ -526,6 +529,13 @@ impl SunLightSpec {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlignMode {
+    Min,
+    Center,
+    Max,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SceneDocument {
     pub model_name: String,
@@ -685,6 +695,76 @@ impl SceneDocument {
             }
         }
         names
+    }
+
+    pub fn part_world_aabb(&self, idx: usize) -> Option<Aabb> {
+        self.parts.get(idx).map(|p| p.bake().bounds)
+    }
+
+    /// Computes ground elevation at `(x, z)` considering any visible `Terrain` part, falling back to `0.0`.
+    pub fn ground_height_at(&self, x: f32, z: f32, skip_idx: Option<usize>) -> f32 {
+        let mut best_y: Option<f32> = None;
+        for (i, part) in self.parts.iter().enumerate() {
+            if Some(i) == skip_idx || !part.visible || part.kind != PrimitiveKind::Terrain {
+                continue;
+            }
+            let sx = part.scale[0].abs().max(0.01);
+            let sz = part.scale[2].abs().max(0.01);
+            let nx = (x - part.position[0]) / sx;
+            let nz = (z - part.position[2]) / sz;
+            if nx.abs() <= 0.5 && nz.abs() <= 0.5 {
+                let h = part.position[1] + terrain_height_at(&part.terrain, nx, nz) * part.scale[1];
+                best_y = Some(match best_y {
+                    Some(prev) => prev.max(h),
+                    None => h,
+                });
+            }
+        }
+        best_y.unwrap_or(0.0)
+    }
+
+    /// Seats the specified part cleanly onto the terrain (if present) or `Y = 0.0`.
+    pub fn snap_part_to_ground(&mut self, idx: usize) -> bool {
+        let Some(part) = self.parts.get(idx) else {
+            return false;
+        };
+        let bounds = part.bake().bounds;
+        if !bounds.is_valid() {
+            return false;
+        }
+        let cx = (bounds.min[0] + bounds.max[0]) * 0.5;
+        let cz = (bounds.min[2] + bounds.max[2]) * 0.5;
+        let ground_y = self.ground_height_at(cx, cz, Some(idx));
+        let dy = ground_y - bounds.min[1];
+        self.parts[idx].position[1] += dy;
+        true
+    }
+
+    /// Aligns a part's world bounding box min, center, or max along `axis` (`0=X, 1=Y, 2=Z`) to `target`.
+    pub fn align_part_to_coord(
+        &mut self,
+        idx: usize,
+        axis: usize,
+        mode: AlignMode,
+        target: f32,
+    ) -> bool {
+        if axis > 2 {
+            return false;
+        }
+        let Some(part) = self.parts.get(idx) else {
+            return false;
+        };
+        let bounds = part.bake().bounds;
+        if !bounds.is_valid() {
+            return false;
+        }
+        let cur = match mode {
+            AlignMode::Min => bounds.min[axis],
+            AlignMode::Center => (bounds.min[axis] + bounds.max[axis]) * 0.5,
+            AlignMode::Max => bounds.max[axis],
+        };
+        self.parts[idx].position[axis] += target - cur;
+        true
     }
 
     pub fn preset_drone() -> Self {
