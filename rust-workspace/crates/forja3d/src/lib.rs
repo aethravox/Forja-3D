@@ -5,6 +5,7 @@ extern crate alloc;
 pub mod animation;
 pub mod codegen;
 pub mod format;
+pub mod glb;
 pub mod math;
 pub mod mesh_ops;
 pub mod pack;
@@ -20,9 +21,10 @@ pub use animation::{
 };
 pub use codegen::RustExportTarget;
 pub use format::{
-    fnv1a_32, ColliderShape, ColliderSpec, DecodeError, Material, MeshPart, Model, PhysicsSpec,
-    RigidBodyKind, Vertex, FLAG_COMPACT, FLAG_PHYSICS, FORMAT_VERSION, MAGIC,
+    fnv1a_32, ColliderShape, ColliderSpec, DecodeError, Material, MaterialPreset, MeshPart, Model,
+    PhysicsSpec, RigidBodyKind, Vertex, FLAG_COMPACT, FLAG_PHYSICS, FORMAT_VERSION, MAGIC,
 };
+pub use glb::{encode_texture_to_png, GlbExportOptions, GLB_MAGIC, GLB_VERSION};
 pub use math::{Aabb, Mat4, Vec3};
 pub use mesh_ops::{
     apply_shading, build_extruded_polygon, build_lathe_profile, build_terrain,

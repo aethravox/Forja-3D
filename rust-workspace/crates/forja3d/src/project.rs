@@ -12,7 +12,7 @@ use crate::ui2d::UiDocument2D;
 
 /// Binary magic header for complete Forja3D Studio project files (.forja / .f3s).
 pub const F3S_MAGIC: [u8; 4] = *b"F3S1";
-pub const F3S_VERSION: u16 = 1;
+pub const F3S_VERSION: u16 = 2;
 /// Header flag indicating zlib/deflate compressed payload via `miniz_oxide`.
 pub const FLAG_PROJECT_ZLIB: u16 = 0x0001;
 
@@ -162,7 +162,7 @@ impl ForjaProject {
             return Err(DecodeError::InvalidMagic);
         }
         let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-        if version != F3S_VERSION {
+        if version != 1 && version != F3S_VERSION {
             return Err(DecodeError::UnsupportedVersion(version));
         }
         let flags = u16::from_le_bytes([bytes[6], bytes[7]]);
@@ -186,7 +186,7 @@ impl ForjaProject {
         };
 
         let mut cursor = Cursor::new(raw_payload);
-        let scene = decode_scene(&mut cursor)?;
+        let scene = decode_scene(&mut cursor, version)?;
 
         let tex_count = cursor.read_u16()? as usize;
         let mut textures = Vec::with_capacity(tex_count.min(512));
@@ -342,13 +342,13 @@ fn encode_scene(buf: &mut Vec<u8>, scene: &SceneDocument) {
     encode_physics(buf, &scene.physics);
 }
 
-fn decode_scene(cursor: &mut Cursor<'_>) -> Result<SceneDocument, DecodeError> {
+fn decode_scene(cursor: &mut Cursor<'_>, version: u16) -> Result<SceneDocument, DecodeError> {
     let model_name = cursor.read_str()?;
 
     let part_count = cursor.read_u32()? as usize;
     let mut parts = Vec::with_capacity(part_count.min(4096));
     for _ in 0..part_count {
-        parts.push(decode_part(cursor)?);
+        parts.push(decode_part(cursor, version)?);
     }
 
     let sun_count = cursor.read_u16()? as usize;
@@ -496,9 +496,16 @@ fn encode_part(buf: &mut Vec<u8>, part: &PartSpec) {
     } else {
         buf.push(0);
     }
+
+    // v2: UV transform & alpha cutoff
+    buf.extend_from_slice(&part.uv_scale[0].to_le_bytes());
+    buf.extend_from_slice(&part.uv_scale[1].to_le_bytes());
+    buf.extend_from_slice(&part.uv_offset[0].to_le_bytes());
+    buf.extend_from_slice(&part.uv_offset[1].to_le_bytes());
+    buf.extend_from_slice(&part.alpha_cutoff.to_le_bytes());
 }
 
-fn decode_part(cursor: &mut Cursor<'_>) -> Result<PartSpec, DecodeError> {
+fn decode_part(cursor: &mut Cursor<'_>, version: u16) -> Result<PartSpec, DecodeError> {
     let name = cursor.read_str()?;
     let kind = primitive_from_u8(cursor.take(1)?[0])?;
     let position = read_f32_3(cursor)?;
@@ -636,6 +643,16 @@ fn decode_part(cursor: &mut Cursor<'_>) -> Result<PartSpec, DecodeError> {
         None
     };
 
+    let (uv_scale, uv_offset, alpha_cutoff) = if version >= 2 {
+        (
+            [cursor.read_f32()?, cursor.read_f32()?],
+            [cursor.read_f32()?, cursor.read_f32()?],
+            cursor.read_f32()?,
+        )
+    } else {
+        ([1.0, 1.0], [0.0, 0.0], 0.0)
+    };
+
     Ok(PartSpec {
         name,
         kind,
@@ -666,6 +683,9 @@ fn decode_part(cursor: &mut Cursor<'_>) -> Result<PartSpec, DecodeError> {
         gravity_scale,
         texture_enabled,
         texture_index,
+        uv_scale,
+        uv_offset,
+        alpha_cutoff,
     })
 }
 

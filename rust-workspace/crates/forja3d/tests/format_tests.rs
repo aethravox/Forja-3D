@@ -1,10 +1,11 @@
 use forja3d::{
-    default_extrude_profile, AnimationClip, AnimationProperty, AnimationSet,
-    AnimationTargetKind, AnimationTrack, ColliderShape, DecodeError, ForjaPack, ForjaProject,
-    InterpolationMode, Keyframe, Model, PartSpec, PrimitiveKind, ProjectCameraState,
-    ProjectViewportState, RigidBodyKind, RustExportTarget, SceneDocument, ShadingMode,
-    SunLightSpec, TerrainPreset, TerrainStamp, Texture, UiDocument2D, Widget2D, F2D_MAGIC,
-    F3A_MAGIC, F3P_MAGIC, F3S_MAGIC, F3T_MAGIC, FLAG_COMPACT, FLAG_PHYSICS, MAGIC,
+    default_extrude_profile, encode_texture_to_png, AnimationClip, AnimationProperty,
+    AnimationSet, AnimationTargetKind, AnimationTrack, ColliderShape, DecodeError, ForjaPack,
+    ForjaProject, InterpolationMode, Keyframe, MaterialPreset, Model, PartSpec, PrimitiveKind,
+    ProjectCameraState, ProjectViewportState, RigidBodyKind, RustExportTarget, SceneDocument,
+    ShadingMode, SunLightSpec, TerrainPreset, TerrainStamp, Texture, UiDocument2D, Widget2D,
+    F2D_MAGIC, F3A_MAGIC, F3P_MAGIC, F3S_MAGIC, F3T_MAGIC, FLAG_COMPACT, FLAG_PHYSICS, GLB_MAGIC,
+    GLB_VERSION, MAGIC,
 };
 
 #[test]
@@ -465,5 +466,135 @@ fn roundtrip_forja_project_preserves_scene_lights_textures_and_camera() {
     corrupted[0] = b'B';
     assert_eq!(ForjaProject::from_bytes(&corrupted), Err(DecodeError::InvalidMagic));
 }
+
+#[test]
+fn uv_tiling_and_offset_transform_baked_uvs_and_persist_in_forja() {
+    let mut plane = PartSpec::new("suelo_tiled", PrimitiveKind::Plane);
+    plane.uv_scale = [3.0, 2.0];
+    plane.uv_offset = [0.25, -0.5];
+    plane.alpha_cutoff = 0.45;
+
+    let baked = plane.bake();
+    assert_eq!(baked.vertices.len(), 4);
+    assert!((baked.vertices[0].uv[0] - 0.25).abs() < 1e-5);
+    assert!((baked.vertices[0].uv[1] - (-0.5)).abs() < 1e-5);
+    assert!((baked.vertices[2].uv[0] - 3.25).abs() < 1e-5);
+    assert!((baked.vertices[2].uv[1] - 1.5).abs() < 1e-5);
+
+    let mut scene = SceneDocument::new("UvScene");
+    scene.parts.push(plane);
+    let proj = ForjaProject::new(scene);
+    let bytes = proj.to_bytes();
+    let decoded = ForjaProject::from_bytes(&bytes).expect("v2 .forja project should decode");
+    assert_eq!(decoded.scene.parts[0].uv_scale, [3.0, 2.0]);
+    assert_eq!(decoded.scene.parts[0].uv_offset, [0.25, -0.5]);
+    assert!((decoded.scene.parts[0].alpha_cutoff - 0.45).abs() < 1e-5);
+}
+
+#[test]
+fn material_presets_cover_metals_and_transparent_materials() {
+    let mut part = PartSpec::new("ventana", PrimitiveKind::Cube);
+    let glass = MaterialPreset::ALL
+        .iter()
+        .find(|p| p.id == "glass")
+        .expect("glass preset");
+    part.apply_material_preset(*glass);
+    assert!(part.color[3] < 255);
+    assert!(part.bake().material.has_alpha());
+
+    let gold = MaterialPreset::ALL
+        .iter()
+        .find(|p| p.id == "gold")
+        .expect("gold preset");
+    part.apply_material_preset(*gold);
+    assert!(part.metallic > 0.9);
+    assert_eq!(part.color[3], 255);
+}
+
+#[test]
+fn glb_export_writes_valid_container_meshes_png_textures_and_lights() {
+    let mut scene = SceneDocument::new("EscenaGLB");
+    let mut gold_box = PartSpec::new("lingote", PrimitiveKind::Cube);
+    gold_box.apply_material_preset(
+        *MaterialPreset::ALL
+            .iter()
+            .find(|p| p.id == "gold")
+            .unwrap(),
+    );
+    gold_box.uv_scale = [2.0, 2.0];
+    gold_box.texture_index = Some(0);
+    gold_box.texture_enabled = true;
+
+    let mut glass = PartSpec::new("panel_vidrio", PrimitiveKind::Plane);
+    glass.apply_material_preset(
+        *MaterialPreset::ALL
+            .iter()
+            .find(|p| p.id == "glass")
+            .unwrap(),
+    );
+    glass.texture_enabled = false;
+
+    let mut foliage = PartSpec::new("hoja", PrimitiveKind::Plane);
+    foliage.alpha_cutoff = 0.5;
+    foliage.texture_enabled = false;
+
+    scene.parts.push(gold_box);
+    scene.parts.push(glass);
+    scene.parts.push(foliage);
+
+    let sun = SunLightSpec::new("SolMediodia");
+    scene.sun_lights.push(sun);
+
+    let tex = Texture::new_rgba(
+        "metal_tex",
+        2,
+        2,
+        vec![
+            255, 220, 120, 255, 240, 200, 100, 255, 210, 170, 80, 255, 255, 240, 150, 255,
+        ],
+    );
+    let png = encode_texture_to_png(&tex);
+    assert_eq!(&png[0..8], b"\x89PNG\r\n\x1a\n");
+
+    let glb = scene.to_glb(&[tex]);
+    assert!(glb.len() > 28);
+    assert_eq!(&glb[0..4], &GLB_MAGIC);
+    assert_eq!(u32::from_le_bytes([glb[4], glb[5], glb[6], glb[7]]), GLB_VERSION);
+    let total_len = u32::from_le_bytes([glb[8], glb[9], glb[10], glb[11]]) as usize;
+    assert_eq!(total_len, glb.len());
+
+    let json_len = u32::from_le_bytes([glb[12], glb[13], glb[14], glb[15]]) as usize;
+    assert_eq!(json_len % 4, 0);
+    let json_type = u32::from_le_bytes([glb[16], glb[17], glb[18], glb[19]]);
+    assert_eq!(json_type, 0x4E4F_534A);
+
+    let json_str = core::str::from_utf8(&glb[20..20 + json_len]).expect("valid utf8 JSON chunk");
+    assert!(json_str.contains(r#""KHR_lights_punctual""#));
+    assert!(json_str.contains(r#""type":"directional""#));
+    assert!(json_str.contains(r#""alphaMode":"BLEND""#));
+    assert!(json_str.contains(r#""alphaMode":"MASK""#));
+    assert!(json_str.contains(r#""mimeType":"image/png""#));
+    assert!(json_str.contains("SolMediodia"));
+
+    let bin_hdr = 20 + json_len;
+    let bin_len = u32::from_le_bytes([
+        glb[bin_hdr],
+        glb[bin_hdr + 1],
+        glb[bin_hdr + 2],
+        glb[bin_hdr + 3],
+    ]) as usize;
+    assert_eq!(bin_len % 4, 0);
+    let bin_type = u32::from_le_bytes([
+        glb[bin_hdr + 4],
+        glb[bin_hdr + 5],
+        glb[bin_hdr + 6],
+        glb[bin_hdr + 7],
+    ]);
+    assert_eq!(bin_type, 0x004E_4942);
+    assert_eq!(bin_hdr + 8 + bin_len, glb.len());
+    // Embedded PNG sits at offset 0 of BIN chunk
+    assert_eq!(&glb[bin_hdr + 8..bin_hdr + 16], b"\x89PNG\r\n\x1a\n");
+}
+
 
 

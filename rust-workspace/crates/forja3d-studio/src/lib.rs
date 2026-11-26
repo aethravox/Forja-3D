@@ -11,9 +11,9 @@ use forja3d::{
     subdivide_triangles, terrain_height_at, AnimationClip, AnimationProperty, AnimationSet,
     AnimationTrack, ColliderShape, F2D_MAGIC, F3A_MAGIC, F3P_MAGIC, F3S_MAGIC, F3T_MAGIC,
     FLAG_COMPACT, FLAG_PHYSICS, ForjaPack, ForjaProject, InterpolationMode, Keyframe, Mat4,
-    Material, MeshDeformKind, MeshPart, Model, PartSpec, PrimitiveKind, ProjectCameraState,
-    ProjectViewportState, RigidBodyKind, RustExportTarget, SceneDocument, ShadingMode,
-    SunLightSpec, TerrainPreset, TerrainStamp, Texture, UiDocument2D, Vec3, Vertex,
+    Material, MaterialPreset, MeshDeformKind, MeshPart, Model, PartSpec, PrimitiveKind,
+    ProjectCameraState, ProjectViewportState, RigidBodyKind, RustExportTarget, SceneDocument,
+    ShadingMode, SunLightSpec, TerrainPreset, TerrainStamp, Texture, UiDocument2D, Vec3, Vertex,
 };
 use forja3d_physics::{BodyHandle, PhysicsWorld, RigidBody};
 
@@ -51,6 +51,7 @@ enum ViewMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExportTab {
     ProjectForja,
+    GlbBinary,
     F3dBinary,
     AssetFormats,
     RustSource,
@@ -159,7 +160,7 @@ pub struct StudioApp {
     selected_profile_pt: Option<usize>,
     dragging_profile_pt: Option<usize>,
     copied_color: Option<[u8; 4]>,
-    copied_material: Option<([u8; 4], f32, f32)>,
+    copied_material: Option<([u8; 4], f32, f32, f32)>,
     terrain_sculpt_raise: bool,
     terrain_brush_radius: f32,
     terrain_brush_strength: f32,
@@ -1977,7 +1978,8 @@ impl StudioApp {
                 let mut fill_color_group: Option<[u8; 4]> = None;
                 let mut fill_color_all: Option<[u8; 4]> = None;
                 let mut copy_color_req: Option<[u8; 4]> = None;
-                let mut copy_mat_req: Option<([u8; 4], f32, f32)> = None;
+                let mut copy_mat_req: Option<([u8; 4], f32, f32, f32)> = None;
+                let mut discrete_mat_preset: Option<MaterialPreset> = None;
                 let copied_col_snapshot = self.copied_color;
                 let copied_mat_snapshot = self.copied_material;
                 let mut selected_pt = self.selected_profile_pt;
@@ -2195,7 +2197,7 @@ impl StudioApp {
                         }
                         if icon_text_btn(ui, SvgIcon::Copy, 13.0, "Copiar", [74.0, btn_h], false).clicked() {
                             copy_color_req = Some(part.color);
-                            copy_mat_req = Some((part.color, part.metallic, part.roughness));
+                            copy_mat_req = Some((part.color, part.metallic, part.roughness, part.alpha_cutoff));
                         }
                         if ui
                             .add_enabled(
@@ -2275,6 +2277,75 @@ impl StudioApp {
                         changed_continuous = true;
                         *dirty = true;
                     }
+                    let mut alpha_pct = part.color[3] as f32 / 255.0;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut alpha_pct, 0.05..=1.0)
+                                .fixed_decimals(2)
+                                .text("Opacidad"),
+                        )
+                        .changed()
+                    {
+                        part.color[3] = (alpha_pct * 255.0 + 0.5).clamp(12.0, 255.0) as u8;
+                        changed_continuous = true;
+                        *dirty = true;
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        let mut cutout_on = part.alpha_cutoff > 0.001;
+                        if ui
+                            .checkbox(&mut cutout_on, "Alpha Cutout")
+                            .on_hover_text("Recorta píxeles transparentes sin ordenamiento Alpha Blend")
+                            .changed()
+                        {
+                            part.alpha_cutoff = if cutout_on { 0.5 } else { 0.0 };
+                            changed_continuous = true;
+                            *dirty = true;
+                        }
+                        if part.alpha_cutoff > 0.001
+                            && ui
+                                .add(
+                                    egui::Slider::new(&mut part.alpha_cutoff, 0.05..=0.95)
+                                        .fixed_decimals(2)
+                                        .text("Umbral"),
+                                )
+                                .changed()
+                        {
+                            changed_continuous = true;
+                            *dirty = true;
+                        }
+                    });
+
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("Biblioteca de materiales PBR")
+                            .size(11.5)
+                            .color(egui::Color32::from_gray(190)),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                        for preset in MaterialPreset::ALL {
+                            let is_active = part.color == preset.material.base_color
+                                && (part.metallic - preset.material.metallic).abs() < 0.03
+                                && (part.roughness - preset.material.roughness).abs() < 0.03;
+                            let btn_w = if compact { 96.0 } else { 88.0 };
+                            let resp = ui.add_sized(
+                                [btn_w, btn_h],
+                                egui::Button::selectable(is_active, preset.label),
+                            );
+                            if resp
+                                .on_hover_text(format!(
+                                    "{} · Metálico {:.2} · Rugosidad {:.2} · Alpha {}",
+                                    preset.label,
+                                    preset.material.metallic,
+                                    preset.material.roughness,
+                                    preset.material.base_color[3]
+                                ))
+                                .clicked()
+                            {
+                                discrete_mat_preset = Some(preset);
+                            }
+                        }
+                    });
 
                     ui.add_space(6.0);
                     ui.separator();
@@ -2332,6 +2403,57 @@ impl StudioApp {
                             tex_action = Some("apply_tex_all");
                         }
                     });
+
+                    ui.add_space(4.0);
+                    egui::Grid::new("uv_transform_grid")
+                        .num_columns(4)
+                        .spacing([6.0, 4.0])
+                        .show(ui, |ui| {
+                            let uv_w = if compact { 66.0 } else { 58.0 };
+                            let uv_h = if compact { 28.0 } else { 22.0 };
+                            ui.label("Tiling UV");
+                            for axis in 0..2 {
+                                if ui
+                                    .add_sized(
+                                        [uv_w, uv_h],
+                                        egui::DragValue::new(&mut part.uv_scale[axis])
+                                            .speed(0.05)
+                                            .range(0.05..=32.0)
+                                            .fixed_decimals(2),
+                                    )
+                                    .changed()
+                                {
+                                    changed_continuous = true;
+                                    *dirty = true;
+                                }
+                            }
+                            if ui.add_sized([58.0, uv_h], egui::Button::new("Reset")).clicked() {
+                                part.uv_scale = [1.0, 1.0];
+                                part.uv_offset = [0.0, 0.0];
+                                changed_continuous = true;
+                                *dirty = true;
+                            }
+                            ui.end_row();
+
+                            ui.label("Offset UV");
+                            for axis in 0..2 {
+                                if ui
+                                    .add_sized(
+                                        [uv_w, uv_h],
+                                        egui::DragValue::new(&mut part.uv_offset[axis])
+                                            .speed(0.02)
+                                            .range(-16.0..=16.0)
+                                            .fixed_decimals(2),
+                                    )
+                                    .changed()
+                                {
+                                    changed_continuous = true;
+                                    *dirty = true;
+                                }
+                            }
+                            ui.label("");
+                            ui.end_row();
+                        });
 
                     ui.add_space(6.0);
                     ui.horizontal_wrapped(|ui| {
@@ -2803,11 +2925,12 @@ impl StudioApp {
                             }
                         }
                         "paste_material" => {
-                            if let Some((c, met, rough)) = self.copied_material {
+                            if let Some((c, met, rough, cutoff)) = self.copied_material {
                                 self.push_undo();
                                 self.scene.parts[sel_idx].color = c;
                                 self.scene.parts[sel_idx].metallic = met;
                                 self.scene.parts[sel_idx].roughness = rough;
+                                self.scene.parts[sel_idx].alpha_cutoff = cutoff;
                                 *dirty = true;
                             }
                         }
@@ -2874,6 +2997,12 @@ impl StudioApp {
                         }
                         _ => {}
                     }
+                }
+                if let Some(preset) = discrete_mat_preset {
+                    self.push_undo();
+                    self.scene.parts[sel_idx].apply_material_preset(preset);
+                    self.status_note = format!("Material '{}' aplicado", preset.label);
+                    *dirty = true;
                 }
                 if let Some(mode) = discrete_shading_change {
                     self.push_undo();
@@ -3109,6 +3238,9 @@ impl StudioApp {
                         if ui.add_sized([tab_w, btn_h], egui::Button::selectable(self.export_tab == ExportTab::ProjectForja, "Proyecto .forja")).clicked() {
                             self.export_tab = ExportTab::ProjectForja;
                         }
+                        if ui.add_sized([tab_w, btn_h], egui::Button::selectable(self.export_tab == ExportTab::GlbBinary, "Escena .glb")).clicked() {
+                            self.export_tab = ExportTab::GlbBinary;
+                        }
                         if ui.add_sized([tab_w, btn_h], egui::Button::selectable(self.export_tab == ExportTab::F3dBinary, "Modelo .f3d")).clicked() {
                             self.export_tab = ExportTab::F3dBinary;
                         }
@@ -3165,6 +3297,58 @@ impl StudioApp {
                                             );
                                         }
                                         Err(err) => self.status_note = format!("Error .forja: {err}"),
+                                    }
+                                }
+                            });
+                        }
+                        ExportTab::GlbBinary => {
+                            let active_textures: &[Texture] = if self.textures_enabled {
+                                &self.imported_textures
+                            } else {
+                                &[]
+                            };
+                            let glb_bytes = self.scene.to_glb(active_textures);
+                            let sun_count = self
+                                .scene
+                                .sun_lights
+                                .iter()
+                                .filter(|s| s.enabled && s.intensity > 0.0001)
+                                .count();
+                            ui.label(format!(
+                                "glTF 2.0 binario (.glb): {} mallas · {} texturas PNG · {} luces Sol · {} B",
+                                self.baked_model.parts.len(),
+                                active_textures.len(),
+                                sun_count,
+                                glb_bytes.len(),
+                            ));
+                            ui.label(
+                                egui::RichText::new("Incluye mallas, UVs (tiling/offset), materiales PBR, Alpha Blend/Cutout, texturas PNG y luces KHR_lights_punctual.")
+                                    .size(11.5)
+                                    .color(egui::Color32::from_gray(175)),
+                            );
+                            ui.add_space(4.0);
+                            ui.horizontal_wrapped(|ui| {
+                                if icon_text_btn(ui, SvgIcon::Download, 14.0, "Descargar .glb", [140.0, btn_h], false)
+                                    .clicked()
+                                {
+                                    let file = format!("{}.glb", self.scene.model_name.to_lowercase());
+                                    match trigger_download(&file, &glb_bytes, "model/gltf-binary") {
+                                        Ok(Some(saved)) => self.status_note = format!("Guardado: {saved}"),
+                                        Ok(None) => self.status_note = format!("Exportado {file} ({} B)", glb_bytes.len()),
+                                        Err(err) => self.status_note = err,
+                                    }
+                                }
+                                if ui.add_sized([148.0, btn_h], egui::Button::new("Verificar .glb")).clicked() {
+                                    match gltf::Gltf::from_slice(&glb_bytes) {
+                                        Ok(parsed) => {
+                                            let meshes = parsed.document.meshes().count();
+                                            let mats = parsed.document.materials().count();
+                                            let imgs = parsed.document.images().count();
+                                            self.status_note = format!(
+                                                "GLB válido: {meshes} mallas, {mats} materiales, {imgs} imágenes"
+                                            );
+                                        }
+                                        Err(err) => self.status_note = format!("Error GLB: {err}"),
                                     }
                                 }
                             });
@@ -3765,6 +3949,16 @@ impl StudioApp {
                     .and_then(|p| p.texture_index)
             })
             .collect();
+        let part_alpha_cutoffs: Vec<f32> = self
+            .part_map
+            .iter()
+            .map(|&src_idx| {
+                self.scene
+                    .parts
+                    .get(src_idx)
+                    .map_or(0.0, |p| p.alpha_cutoff)
+            })
+            .collect();
         let has_scene_suns = !self.scene.sun_lights.is_empty();
         let sun_lights: Vec<RenderSunLight> = self
             .scene
@@ -3829,6 +4023,7 @@ impl StudioApp {
                                 textures_enabled,
                                 &part_use_tex,
                                 &part_tex_indices,
+                                &part_alpha_cutoffs,
                                 has_scene_suns,
                                 &sun_lights,
                                 &sun_markers,

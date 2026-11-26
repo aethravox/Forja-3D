@@ -801,6 +801,61 @@ mod tests {
         let imported = import_gltf_or_glb_full(Some("tex.glb"), &glb, None)
             .expect("textured .glb should import");
         assert_eq!(imported.textures.len(), 1);
-        assert_eq!(imported.scene.parts[0].color, [20, 180, 90, 255]);
+        assert_eq!(imported.scene.parts[0].texture_index, Some(0));
+        assert!(imported.scene.parts[0].texture_enabled);
+        assert_eq!(imported.scene.parts[0].color, [255, 255, 255, 255]);
+        assert_eq!(&imported.textures[0].data[0..4], &[20, 180, 90, 255]);
+    }
+
+    #[test]
+    fn roundtrip_forja3d_scene_to_glb_and_back_with_textures_alpha_and_lights() {
+        use forja3d::{MaterialPreset, SunLightSpec};
+
+        let mut scene = SceneDocument::new("NaveForja");
+        let mut hull = PartSpec::new("casco", PrimitiveKind::Cube);
+        hull.apply_material_preset(
+            *MaterialPreset::ALL
+                .iter()
+                .find(|p| p.id == "gold")
+                .unwrap(),
+        );
+        hull.uv_scale = [2.5, 1.5];
+        hull.texture_index = Some(0);
+        hull.texture_enabled = true;
+
+        let mut canopy = PartSpec::new("cabina_vidrio", PrimitiveKind::Sphere);
+        canopy.apply_material_preset(
+            *MaterialPreset::ALL
+                .iter()
+                .find(|p| p.id == "glass")
+                .unwrap(),
+        );
+        canopy.position = [0.0, 0.8, 0.0];
+        canopy.texture_enabled = false;
+
+        scene.parts.push(hull);
+        scene.parts.push(canopy);
+        scene.sun_lights.push(SunLightSpec::new("SolOrbital"));
+
+        let tex = Texture::new_rgba("panel_albedo", 2, 2, [220u8, 180, 90, 255].repeat(4));
+        let glb_bytes = scene.to_glb(&[tex]);
+
+        let parsed = gltf::Gltf::from_slice(&glb_bytes).expect("gltf crate should parse exported .glb");
+        assert_eq!(parsed.document.meshes().count(), 2);
+        assert_eq!(parsed.document.materials().count(), 2);
+        assert_eq!(parsed.document.images().count(), 1);
+        assert!(parsed
+            .document
+            .extensions_used()
+            .any(|ext| ext == "KHR_lights_punctual"));
+        let mat_modes: Vec<_> = parsed.document.materials().map(|m| m.alpha_mode()).collect();
+        assert_eq!(mat_modes[0], gltf::material::AlphaMode::Opaque);
+        assert_eq!(mat_modes[1], gltf::material::AlphaMode::Blend);
+
+        let reimported = import_gltf_or_glb_full(Some("naveforja.glb"), &glb_bytes, None)
+            .expect("re-importing exported .glb should succeed");
+        assert_eq!(reimported.textures.len(), 1);
+        assert_eq!(reimported.scene.parts.len(), 2);
+        assert!(reimported.scene.parts[1].color[3] < 255);
     }
 }

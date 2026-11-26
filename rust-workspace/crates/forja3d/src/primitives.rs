@@ -3,15 +3,17 @@ use core::f32::consts::TAU;
 
 use crate::{
     format::{
-        fnv1a_32, ColliderShape, ColliderSpec, Material, MeshPart, Model, PhysicsSpec,
-        RigidBodyKind, Vertex,
+        fnv1a_32, ColliderShape, ColliderSpec, Material, MaterialPreset, MeshPart, Model,
+        PhysicsSpec, RigidBodyKind, Vertex,
     },
+    glb::GlbExportOptions,
     math::{sin_cos, Aabb, Mat4, Vec3},
     mesh_ops::{
         apply_shading, build_extruded_polygon, build_lathe_profile, build_terrain,
         deduplicate_vertices, default_extrude_profile, default_lathe_profile, ShadingMode,
         TerrainPreset, TerrainSpec,
     },
+    texture::Texture,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +97,9 @@ pub struct PartSpec {
     pub gravity_scale: f32,
     pub texture_enabled: bool,
     pub texture_index: Option<usize>,
+    pub uv_scale: [f32; 2],
+    pub uv_offset: [f32; 2],
+    pub alpha_cutoff: f32,
 }
 
 impl PartSpec {
@@ -144,7 +149,17 @@ impl PartSpec {
             gravity_scale: 1.0,
             texture_enabled: true,
             texture_index: None,
+            uv_scale: [1.0, 1.0],
+            uv_offset: [0.0, 0.0],
+            alpha_cutoff: 0.0,
         }
+    }
+
+    pub fn apply_material_preset(&mut self, preset: MaterialPreset) {
+        self.color = preset.material.base_color;
+        self.metallic = preset.material.metallic;
+        self.roughness = preset.material.roughness;
+        self.alpha_cutoff = 0.0;
     }
 
     /// Convert this primitive into an editable `CustomMesh` in local space (`position`, `rotation_deg`, `scale` preserved).
@@ -159,15 +174,21 @@ impl PartSpec {
             _ => generate_primitive(self.kind, self.segments.max(6), self.color),
         };
         let (shaded_verts, shaded_indices) = apply_shading(base_verts, base_indices, self.shading);
-        let (verts, indices) = if self.deduplicate && self.shading != ShadingMode::Flat {
+        let (mut verts, indices) = if self.deduplicate && self.shading != ShadingMode::Flat {
             deduplicate_vertices(shaded_verts, shaded_indices)
         } else {
             (shaded_verts, shaded_indices)
         };
         let mut bounds = Aabb::EMPTY;
-        for v in &verts {
+        for v in &mut verts {
+            v.uv = [
+                v.uv[0] * self.uv_scale[0] + self.uv_offset[0],
+                v.uv[1] * self.uv_scale[1] + self.uv_offset[1],
+            ];
             bounds.include_point(v.position);
         }
+        self.uv_scale = [1.0, 1.0];
+        self.uv_offset = [0.0, 0.0];
         self.kind = PrimitiveKind::CustomMesh;
         self.custom_mesh = Some(MeshPart {
             name: self.name.clone(),
@@ -313,6 +334,9 @@ impl PartSpec {
             gravity_scale: 1.0,
             texture_enabled: true,
             texture_index: None,
+            uv_scale: [1.0, 1.0],
+            uv_offset: [0.0, 0.0],
+            alpha_cutoff: 0.0,
         }
     }
 
@@ -362,7 +386,10 @@ impl PartSpec {
                     position,
                     normal,
                     color: v.color,
-                    uv: v.uv,
+                    uv: [
+                        v.uv[0] * self.uv_scale[0] + self.uv_offset[0],
+                        v.uv[1] * self.uv_scale[1] + self.uv_offset[1],
+                    ],
                 }
             })
             .collect();
@@ -619,6 +646,33 @@ impl SceneDocument {
         }
 
         (model, part_map)
+    }
+
+    /// Bake the entire scene (meshes, materials, textures, and sun lights) into a `.glb` binary.
+    pub fn to_glb(&self, textures: &[Texture]) -> Vec<u8> {
+        let (model, part_map) = self.bake_with_part_map();
+        let part_texture_indices: Vec<Option<usize>> = part_map
+            .iter()
+            .map(|&src_idx| {
+                self.parts.get(src_idx).and_then(|p| {
+                    if p.texture_enabled && !textures.is_empty() {
+                        Some(p.texture_index.unwrap_or(0).min(textures.len() - 1))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+        let part_alpha_cutoffs: Vec<f32> = part_map
+            .iter()
+            .map(|&src_idx| self.parts.get(src_idx).map_or(0.0, |p| p.alpha_cutoff))
+            .collect();
+        model.to_glb_with_options(&GlbExportOptions {
+            textures,
+            part_texture_indices: &part_texture_indices,
+            part_alpha_cutoffs: &part_alpha_cutoffs,
+            sun_lights: &self.sun_lights,
+        })
     }
 
     pub fn group_names(&self) -> Vec<String> {

@@ -239,6 +239,8 @@ struct GpuPart {
     wire_count: i32,
     metallic: f32,
     roughness: f32,
+    center: [f32; 3],
+    base_has_alpha: bool,
 }
 
 pub struct GlViewportRenderer {
@@ -253,6 +255,7 @@ pub struct GlViewportRenderer {
     sun_vao: glow::VertexArray,
     sun_vbo: glow::Buffer,
     gpu_textures: Vec<glow::Texture>,
+    gpu_tex_has_alpha: Vec<bool>,
     fallback_texture: glow::Texture,
     uploaded_tex_gen: u64,
     parts: Vec<GpuPart>,
@@ -312,6 +315,7 @@ impl GlViewportRenderer {
             uniform float u_selected;
             uniform sampler2D u_tex;
             uniform float u_use_tex;
+            uniform float u_alpha_cutoff;
             uniform float u_use_scene_suns;
             uniform int u_sun_count;
             uniform float u_scene_ambient;
@@ -383,6 +387,9 @@ impl GlViewportRenderer {
                 vec3 v = normalize(u_eye - v_world_pos);
                 vec4 tex_sample = texture(u_tex, v_uv);
                 vec4 albedo_srgb = mix(v_color, vec4(v_color.rgb * tex_sample.rgb, v_color.a * tex_sample.a), u_use_tex);
+                if (u_alpha_cutoff > 0.001 && albedo_srgb.a < u_alpha_cutoff) {{
+                    discard;
+                }}
                 vec3 albedo = pow(max(albedo_srgb.rgb, vec3(0.0)), vec3(2.2));
                 float roughness = clamp(u_roughness, 0.045, 1.0);
                 float metallic = clamp(u_metallic, 0.0, 1.0);
@@ -511,6 +518,7 @@ impl GlViewportRenderer {
             sun_vao,
             sun_vbo,
             gpu_textures: Vec::new(),
+            gpu_tex_has_alpha: Vec::new(),
             fallback_texture,
             uploaded_tex_gen: 0,
             parts: Vec::new(),
@@ -527,10 +535,13 @@ impl GlViewportRenderer {
         for tex in self.gpu_textures.drain(..) {
             gl.delete_texture(tex);
         }
+        self.gpu_tex_has_alpha.clear();
         for tex in textures {
             let rgba = decode_texture_rgba(tex);
+            let has_alpha = rgba.chunks_exact(4).any(|px| px[3] < 255);
             if let Ok(gl_tex) = create_rgba_texture(gl, tex.width as i32, tex.height as i32, &rgba) {
                 self.gpu_textures.push(gl_tex);
+                self.gpu_tex_has_alpha.push(has_alpha);
             }
         }
     }
@@ -624,6 +635,17 @@ impl GlViewportRenderer {
 
             gl.bind_vertex_array(None);
 
+            let center = if part.bounds.is_valid() {
+                [
+                    (part.bounds.min[0] + part.bounds.max[0]) * 0.5,
+                    (part.bounds.min[1] + part.bounds.max[1]) * 0.5,
+                    (part.bounds.min[2] + part.bounds.max[2]) * 0.5,
+                ]
+            } else {
+                [0.0; 3]
+            };
+            let base_has_alpha = part.material.has_alpha() || part.vertices.iter().any(|v| v.color[3] < 255);
+
             self.parts.push(GpuPart {
                 vao,
                 vbo,
@@ -633,6 +655,8 @@ impl GlViewportRenderer {
                 wire_count: wire_indices.len() as i32,
                 metallic: part.material.metallic,
                 roughness: part.material.roughness,
+                center,
+                base_has_alpha,
             });
         }
     }
@@ -649,6 +673,7 @@ impl GlViewportRenderer {
         textures_enabled: bool,
         part_use_tex: &[bool],
         part_tex_indices: &[Option<usize>],
+        part_alpha_cutoffs: &[f32],
         has_scene_suns: bool,
         sun_lights: &[RenderSunLight],
         sun_markers: &[RenderSunMarker],
@@ -736,30 +761,65 @@ impl GlViewportRenderer {
 
         gl.active_texture(glow::TEXTURE0);
 
+        let resolve_part_draw = |idx: usize, part: &GpuPart| {
+            let part_tex_on = textures_enabled && part_use_tex.get(idx).copied().unwrap_or(true);
+            let resolved_tex_slot = if part_tex_on {
+                part_tex_indices
+                    .get(idx)
+                    .copied()
+                    .flatten()
+                    .filter(|&ti| ti < self.gpu_textures.len())
+                    .or_else(|| (!self.gpu_textures.is_empty()).then_some(0))
+            } else {
+                None
+            };
+            let bound_tex = resolved_tex_slot
+                .and_then(|ti| self.gpu_textures.get(ti).copied())
+                .unwrap_or(self.fallback_texture);
+            let tex_has_alpha = resolved_tex_slot
+                .and_then(|ti| self.gpu_tex_has_alpha.get(ti).copied())
+                .unwrap_or(false);
+            let cutoff = part_alpha_cutoffs.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            let is_transparent = cutoff <= 0.001 && (part.base_has_alpha || tex_has_alpha);
+            (part_tex_on, bound_tex, cutoff, is_transparent)
+        };
+
+        let mut opaque_indices = Vec::new();
+        let mut transparent_indices: Vec<(usize, f32)> = Vec::new();
         for (idx, part) in self.parts.iter().enumerate() {
+            let (_, _, _, is_transparent) = resolve_part_draw(idx, part);
+            if is_transparent {
+                let (_, _, offset) = part_transforms
+                    .get(idx)
+                    .copied()
+                    .unwrap_or((zero_vec, id_quat, zero_vec));
+                let cx = part.center[0] + offset[0] - eye[0];
+                let cy = part.center[1] + offset[1] - eye[1];
+                let cz = part.center[2] + offset[2] - eye[2];
+                let dist_sq = cx * cx + cy * cy + cz * cz;
+                transparent_indices.push((idx, dist_sq));
+            } else {
+                opaque_indices.push(idx);
+            }
+        }
+        // Sort transparent parts back-to-front by distance from camera eye
+        transparent_indices.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+        let draw_mesh_part = |idx: usize| {
+            let part = &self.parts[idx];
             let is_sel = selected_mask.get(idx).copied().unwrap_or(false);
             let (pivot, quat, offset) = part_transforms
                 .get(idx)
                 .copied()
                 .unwrap_or((zero_vec, id_quat, zero_vec));
+            let (part_tex_on, bound_tex, cutoff, _) = resolve_part_draw(idx, part);
 
-            let part_tex_on = textures_enabled && part_use_tex.get(idx).copied().unwrap_or(true);
-            let bound_tex = if part_tex_on {
-                part_tex_indices
-                    .get(idx)
-                    .copied()
-                    .flatten()
-                    .and_then(|ti| self.gpu_textures.get(ti))
-                    .or_else(|| self.gpu_textures.first())
-                    .copied()
-                    .unwrap_or(self.fallback_texture)
-            } else {
-                self.fallback_texture
-            };
             gl.bind_texture(glow::TEXTURE_2D, Some(bound_tex));
-
             if let Some(loc) = gl.get_uniform_location(self.program, "u_use_tex") {
                 gl.uniform_1_f32(Some(&loc), if part_tex_on { 1.0 } else { 0.0 });
+            }
+            if let Some(loc) = gl.get_uniform_location(self.program, "u_alpha_cutoff") {
+                gl.uniform_1_f32(Some(&loc), cutoff);
             }
             if let Some(loc) = gl.get_uniform_location(self.program, "u_pivot") {
                 gl.uniform_3_f32_slice(Some(&loc), &pivot);
@@ -780,12 +840,42 @@ impl GlViewportRenderer {
                 gl.uniform_1_f32(Some(&loc), if is_sel { 1.0 } else { 0.0 });
             }
 
-            gl.bind_vertex_array(Some(part.vao));
             if !wireframe {
+                gl.bind_vertex_array(Some(part.vao));
                 gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(part.ebo));
                 gl.draw_elements(glow::TRIANGLES, part.index_count, glow::UNSIGNED_INT, 0);
             }
+        };
+
+        if !wireframe {
+            gl.disable(glow::BLEND);
+            gl.depth_mask(true);
+            for idx in opaque_indices {
+                draw_mesh_part(idx);
+            }
+
+            if !transparent_indices.is_empty() {
+                gl.enable(glow::BLEND);
+                gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+                gl.depth_mask(false);
+                for (idx, _) in transparent_indices {
+                    draw_mesh_part(idx);
+                }
+                gl.depth_mask(true);
+                gl.disable(glow::BLEND);
+            }
+        }
+
+        // Draw wireframe & selection outlines cleanly with depth writes enabled
+        gl.disable(glow::BLEND);
+        gl.depth_mask(true);
+        for (idx, part) in self.parts.iter().enumerate() {
+            let is_sel = selected_mask.get(idx).copied().unwrap_or(false);
             if wireframe || is_sel {
+                let (pivot, quat, offset) = part_transforms
+                    .get(idx)
+                    .copied()
+                    .unwrap_or((zero_vec, id_quat, zero_vec));
                 gl.use_program(Some(self.line_program));
                 if let Some(loc) = gl.get_uniform_location(self.line_program, "u_mvp") {
                     gl.uniform_matrix_4_f32_slice(Some(&loc), false, &mvp);
@@ -806,9 +896,9 @@ impl GlViewportRenderer {
                     let c = if is_sel { [0.96, 0.62, 0.04] } else { [0.82, 0.86, 0.92] };
                     gl.uniform_3_f32_slice(Some(&loc), &c);
                 }
+                gl.bind_vertex_array(Some(part.vao));
                 gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(part.wire_ebo));
                 gl.draw_elements(glow::LINES, part.wire_count, glow::UNSIGNED_INT, 0);
-                gl.use_program(Some(self.program));
             }
         }
         gl.bind_texture(glow::TEXTURE_2D, None);

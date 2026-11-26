@@ -183,6 +183,115 @@ impl Default for Material {
     }
 }
 
+impl Material {
+    pub const fn has_alpha(&self) -> bool {
+        self.base_color[3] < 255
+    }
+}
+
+/// Predefined PBR material preset for Forja3D Studio and scenes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MaterialPreset {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub material: Material,
+}
+
+impl MaterialPreset {
+    pub const ALL: [Self; 10] = [
+        Self {
+            id: "gold",
+            label: "Oro",
+            material: Material {
+                base_color: [246, 198, 72, 255],
+                metallic: 0.96,
+                roughness: 0.20,
+            },
+        },
+        Self {
+            id: "rusted_iron",
+            label: "Hierro oxidado",
+            material: Material {
+                base_color: [124, 70, 48, 255],
+                metallic: 0.44,
+                roughness: 0.84,
+            },
+        },
+        Self {
+            id: "silver",
+            label: "Plata",
+            material: Material {
+                base_color: [228, 232, 238, 255],
+                metallic: 0.98,
+                roughness: 0.14,
+            },
+        },
+        Self {
+            id: "copper",
+            label: "Cobre",
+            material: Material {
+                base_color: [216, 122, 86, 255],
+                metallic: 0.94,
+                roughness: 0.24,
+            },
+        },
+        Self {
+            id: "wood",
+            label: "Madera",
+            material: Material {
+                base_color: [138, 94, 56, 255],
+                metallic: 0.02,
+                roughness: 0.78,
+            },
+        },
+        Self {
+            id: "glass",
+            label: "Vidrio",
+            material: Material {
+                base_color: [176, 224, 246, 96],
+                metallic: 0.08,
+                roughness: 0.08,
+            },
+        },
+        Self {
+            id: "plastic",
+            label: "Plástico",
+            material: Material {
+                base_color: [56, 162, 232, 255],
+                metallic: 0.04,
+                roughness: 0.34,
+            },
+        },
+        Self {
+            id: "water",
+            label: "Agua",
+            material: Material {
+                base_color: [42, 148, 206, 148],
+                metallic: 0.06,
+                roughness: 0.10,
+            },
+        },
+        Self {
+            id: "rubber",
+            label: "Caucho",
+            material: Material {
+                base_color: [40, 44, 50, 255],
+                metallic: 0.0,
+                roughness: 0.92,
+            },
+        },
+        Self {
+            id: "ceramic",
+            label: "Cerámica",
+            material: Material {
+                base_color: [240, 238, 232, 255],
+                metallic: 0.02,
+                roughness: 0.18,
+            },
+        },
+    ];
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MeshPart {
     pub name: String,
